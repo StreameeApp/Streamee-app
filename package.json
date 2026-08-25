@@ -1,0 +1,47 @@
+{
+    "name": "streamee",
+    "version": "2.0.1",
+    "description": "A Windows desktop media application with user-configured stream add-ons and MPV playback",
+    "type": "module",
+    "scripts": {
+        "clean:mpv": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\clean-mpv.ps1",
+        "tauri:prepare": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\prepare-tauri-target.ps1",
+        "version:bump": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\bump-version.ps1",
+        "release": "npm run tauri:build",
+        "dev": "vite",
+        "build": "tsc && vite build",
+        "test:anime-filter": "node --experimental-strip-types --test tests/discovery-content.test.ts",
+        "test:xrel": "node --experimental-strip-types --test tests/xrel-quality.test.ts tests/xrel-queue.test.ts",
+        "test:logging": "node --experimental-strip-types --test tests/logger.test.ts",
+        "test:direct-failover": "node --experimental-strip-types --test tests/direct-startup-failover.test.ts",
+        "preview": "vite preview",
+        "tauri": "tauri",
+        "tauri:dev": "npm run tauri:prepare && tauri dev",
+        "tauri:dev:clean": "npm run tauri:prepare -- -ForceClean && tauri dev",
+        "tauri:build": "npm run version:bump -- patch && npm run tauri:prepare -- -ForceClean && tauri build"
+    },
+    "author": "",
+    "license": "MIT",
+    "dependencies": {
+        "@tauri-apps/api": "2.11.1",
+        "axios": "^1.6.0",
+        "buffer": "^6.0.3",
+        "fs-native-extensions": "1.5.0",
+        "react": "^18.2.0",
+        "react-dom": "^18.2.0",
+        "react-icons": "^5.0.0",
+        "uplot": "^1.6.32",
+        "vite-plugin-node-polyfills": "^0.25.0",
+        "webtorrent": "3.0.21",
+        "zustand": "^4.5.0"
+    },
+    "devDependencies": {
+        "@tauri-apps/cli": "2.11.4",
+        "@types/node": "^20.10.0",
+        "@types/react": "^18.2.0",
+        "@types/react-dom": "^18.2.0",
+        "@vitejs/plugin-react": "^4.2.0",
+        "typescript": "^5.3.0",
+        "vite": "^5.0.0"
+    }
+}

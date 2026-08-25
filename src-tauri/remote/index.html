@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#050608">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Streamee">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.ico">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <title>Streamee Remote</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #050608;
+      --panel: #0a0c10;
+      --line: #292d35;
+      --ink: #f5f6f8;
+      --muted: #8290aa;
+      --orange: #ff6b35;
+      --blue: #43bff2;
+      --green: #3de474;
+      --danger: #ef6680;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    html, body { width: 100%; max-width: 100%; }
+    html { background: var(--bg); overflow-x: hidden; overflow-y: auto; }
+    body {
+      margin: 0;
+      min-height: 100svh;
+      overflow-x: clip;
+      overflow-y: visible;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overscroll-behavior: none;
+    }
+    button, input { font: inherit; }
+    button { color: inherit; }
+    .app {
+      width: min(100%, 520px);
+      max-width: 100%;
+      min-height: 100svh;
+      margin: 0 auto;
+      padding: max(18px, env(safe-area-inset-top)) 18px max(22px, env(safe-area-inset-bottom));
+      overflow-x: clip;
+      background:
+        radial-gradient(circle at 20% 0%, rgba(255, 107, 53, .12), transparent 26%),
+        var(--bg);
+    }
+    .topbar, .brand, .connection, .statusline, .times, .volume-head, .footer, .queue-head {
+      display: flex;
+      align-items: center;
+    }
+    .topbar { justify-content: space-between; margin-bottom: 32px; }
+    .brand { min-width: 0; gap: 10px; }
+    .brand > div:last-child { min-width: 0; }
+    .brand-mark {
+      width: 38px; height: 38px; display: grid; place-items: center;
+      border-radius: 9px; background: var(--orange); font-weight: 900; box-shadow: 0 8px 24px rgba(255,107,53,.25);
+    }
+    .brand-name { font-weight: 760; line-height: 1.1; }
+    .connection { gap: 6px; color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex: 0 0 auto; }
+    .dot.off { background: var(--danger); }
+    .menu {
+      min-width: 46px; min-height: 46px; border: 1px solid var(--line); border-radius: 8px;
+      background: rgba(8,9,12,.7); font-size: 22px;
+    }
+    .statusline { justify-content: center; gap: 7px; color: var(--green); font: 700 11px/1.2 ui-monospace, monospace; letter-spacing: .14em; }
+    .hero { text-align: center; }
+    h1 { margin: 13px 0 4px; font-size: clamp(27px, 8vw, 38px); letter-spacing: -.04em; text-wrap: balance; overflow-wrap: anywhere; }
+    .filename { min-height: 20px; margin: 0; color: #c2c6cf; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .meta { margin: 10px 0 22px; color: var(--muted); font: 11px ui-monospace, monospace; }
+    input[type="range"] {
+      width: 100%; height: 30px; margin: 0; accent-color: var(--orange); background: transparent;
+    }
+    .times { justify-content: space-between; margin-top: -2px; color: var(--muted); font: 12px ui-monospace, monospace; }
+    .transport { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 7px; align-items: start; margin-top: 24px; }
+    .transport button, .quick, .picture, .step { touch-action: manipulation; }
+    .transport button { border: 0; background: transparent; padding: 0; min-width: 0; }
+    .circle {
+      width: 52px; height: 52px; margin: 0 auto; display: grid; place-items: center;
+      border: 1px solid var(--line); border-radius: 50%; font-size: 21px; background: rgba(7,8,11,.72);
+    }
+    .circle svg { width: 25px; height: 25px; }
+    .primary .circle { width: 66px; height: 66px; margin-top: -7px; border: 0; background: var(--orange); color: white; font-size: 26px; box-shadow: 0 12px 28px rgba(255,107,53,.2); }
+    .transport small { display: block; margin-top: 9px; color: var(--muted); font: 9px ui-monospace, monospace; letter-spacing: .08em; }
+    .ack { min-height: 31px; margin: 11px 0 3px; display: grid; place-items: center; }
+    .ack span { opacity: 0; transform: translateY(3px); transition: .18s ease; border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; color: #ced3db; font: 10px ui-monospace, monospace; }
+    .ack span.show { opacity: 1; transform: none; }
+    .volumes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+    .volume { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 7px; background: rgba(10,12,16,.75); }
+    .volume-head { justify-content: space-between; margin-bottom: 8px; font-size: 13px; font-weight: 800; }
+    .volume-head output { color: var(--orange); font: 800 14px ui-monospace, monospace; }
+    .volume.windows .volume-head output { color: var(--blue); }
+    .volume-controls { display: grid; grid-template-columns: 42px 1fr 42px; gap: 7px; align-items: center; }
+    .volume-controls input { min-width: 0; accent-color: var(--orange); }
+    .windows .volume-controls input { accent-color: var(--blue); }
+    .step { min-height: 42px; border: 1px solid var(--line); border-radius: 6px; background: #0b0d11; font-size: 21px; }
+    .section-label { margin: 17px 2px 8px; color: var(--muted); font: 10px ui-monospace, monospace; letter-spacing: .18em; }
+    .quick-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+    .quick { min-width: 0; min-height: 62px; padding: 8px 4px; border: 1px solid var(--line); border-radius: 7px; background: rgba(10,12,16,.75); }
+    .quick span, .quick strong { display: block; }
+    .quick span { color: #b8bec9; font-size: 9px; letter-spacing: .06em; }
+    .quick strong { margin-top: 7px; color: var(--orange); font: 700 11px ui-monospace, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .picture-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .picture { min-width: 0; min-height: 76px; padding: 10px; text-align: left; border: 1px solid var(--line); border-radius: 7px; background: rgba(10,12,16,.75); position: relative; }
+    .picture strong, .picture small { display: block; }
+    .picture strong { max-width: calc(100% - 34px); font-size: 11px; }
+    .picture .value { margin-top: 4px; color: var(--orange); font: 700 11px ui-monospace, monospace; }
+    .picture small { margin-top: 4px; color: var(--muted); font: 8px ui-monospace, monospace; letter-spacing: .07em; }
+    .switch { position: absolute; right: 9px; top: 10px; width: 32px; height: 19px; border-radius: 14px; background: #32353c; transition: .2s; }
+    .switch::after { content: ""; position: absolute; width: 14px; height: 14px; top: 2.5px; left: 3px; border-radius: 50%; background: white; transition: .2s; }
+    .picture[aria-pressed="true"] .switch { background: var(--orange); }
+    .picture[aria-pressed="true"] .switch::after { transform: translateX(12px); }
+    .restart-mark { position: absolute; right: 10px; top: 5px; color: var(--orange); font-size: 26px; }
+    details { min-width: 0; margin-top: 10px; border: 1px solid var(--line); border-radius: 7px; background: rgba(10,12,16,.75); overflow: hidden; }
+    summary { list-style: none; min-height: 56px; padding: 0 13px; cursor: pointer; }
+    summary::-webkit-details-marker { display: none; }
+    .queue-head { min-height: 56px; justify-content: space-between; }
+    .queue-head strong { font-size: 16px; font-weight: 600; }
+    .queue-head span { color: var(--muted); font: 10px ui-monospace, monospace; }
+    .queue-list { border-top: 1px solid var(--line); max-height: 220px; overflow: auto; }
+    .queue-item { padding: 11px 13px; border-bottom: 1px solid rgba(41,45,53,.65); color: #bac1cc; font-size: 12px; overflow-wrap: anywhere; }
+    .queue-item.current { color: var(--orange); }
+    .footer { justify-content: space-between; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted); font: 9px ui-monospace, monospace; letter-spacing: .05em; }
+    .footer .connection { margin: 0; font-size: inherit; }
+    .install-sheet { display: none; position: fixed; inset: 0; z-index: 10; background: rgba(0,0,0,.7); padding: 18px; align-items: flex-end; justify-content: center; }
+    .install-sheet.open { display: flex; }
+    .sheet { width: min(100%, 480px); max-width: 100%; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: #0b0d11; overflow-x: hidden; }
+    .sheet h2 { margin: 0 0 8px; font-size: 18px; }
+    .sheet p { color: #b4bac4; font-size: 13px; line-height: 1.5; }
+    .sheet button { width: 100%; min-height: 46px; margin-top: 7px; border: 1px solid var(--line); border-radius: 7px; background: #11141a; }
+    .sheet .install { background: var(--orange); border-color: var(--orange); color: white; font-weight: 700; }
+    .sheet-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .sheet-head h2 { margin: 0; }
+    .sheet-head button { width: 42px; min-height: 42px; margin: 0; font-size: 22px; }
+    .track-list { max-height: min(54svh, 430px); margin-top: 14px; overflow: auto; border-top: 1px solid var(--line); }
+    .track-option { width: 100%; min-height: 54px; margin: 0; padding: 10px 4px; display: flex; align-items: center; justify-content: space-between; gap: 12px; text-align: left; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; }
+    .track-option span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .track-option small { flex: 0 0 auto; color: var(--orange); font: 9px ui-monospace, monospace; letter-spacing: .08em; }
+    button:active { transform: scale(.97); }
+    button:disabled, input:disabled { opacity: .42; cursor: not-allowed; }
+    button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--orange); outline-offset: 2px; }
+    @media (max-width: 370px) {
+      .app { padding-inline: 12px; }
+      .volumes { grid-template-columns: 1fr; }
+      .circle { width: 47px; height: 47px; }
+      .quick-grid { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">▶</div>
+        <div><div class="brand-name">Streamee</div><div class="connection"><span id="topDot" class="dot off"></span><span id="device">Connecting…</span></div></div>
+      </div>
+      <button id="menu" class="menu" type="button" aria-label="Remote options">•••</button>
+    </header>
+
+    <section class="hero" aria-live="polite">
+      <div id="statusline" class="statusline"><span class="dot off"></span><span>WAITING FOR PLAYER</span></div>
+      <h1 id="title">Nothing playing</h1>
+      <p id="filename" class="filename">Start playback in Streamee</p>
+      <p id="meta" class="meta">LOCAL REMOTE</p>
+    </section>
+
+    <label class="sr-only" for="seek">Playback position</label>
+    <input id="seek" type="range" min="0" max="100" step="0.1" value="0" aria-label="Playback position">
+    <div class="times"><span id="elapsed">0:00</span><span id="remaining">−0:00</span></div>
+
+    <div class="transport">
+      <button type="button" data-command="previous" aria-label="Previous"><span class="circle">|◀</span><small>PREVIOUS</small></button>
+      <button type="button" data-command="seek_relative" data-value="-10" aria-label="Rewind 10 seconds"><span class="circle"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M11 6 4 12l7 6V6Zm9 0-7 6 7 6V6Z"/></svg></span><small>BACK</small></button>
+      <button id="playPause" class="primary" type="button" data-command="play_pause" aria-label="Play"><span class="circle">▶</span><small>PLAY</small></button>
+      <button type="button" data-command="seek_relative" data-value="30" aria-label="Forward 30 seconds"><span class="circle"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="m13 6 7 6-7 6V6ZM4 6l7 6-7 6V6Z"/></svg></span><small>FORWARD</small></button>
+      <button type="button" data-command="next" aria-label="Next"><span class="circle">▶|</span><small>NEXT</small></button>
+    </div>
+    <div class="ack"><span id="ack">READY</span></div>
+    <section class="volumes" aria-label="Volume controls">
+      <div class="volume">
+        <div class="volume-head"><span>MPV</span><output id="mpvValue">100</output></div>
+        <div class="volume-controls">
+          <button class="step" type="button" data-command="volume_step" data-value="-1" aria-label="Decrease MPV volume">−</button>
+          <input id="mpvVolume" type="range" min="0" max="130" step="1" value="100" aria-label="MPV volume">
+          <button class="step" type="button" data-command="volume_step" data-value="1" aria-label="Increase MPV volume">+</button>
+        </div>
+      </div>
+      <div class="volume windows">
+        <div class="volume-head"><span>WINDOWS</span><output id="windowsValue">100</output></div>
+        <div class="volume-controls">
+          <button class="step" type="button" data-command="windows_volume_step" data-value="-1" aria-label="Decrease Windows volume">−</button>
+          <input id="windowsVolume" type="range" min="0" max="100" step="1" value="100" aria-label="Windows volume">
+          <button class="step" type="button" data-command="windows_volume_step" data-value="1" aria-label="Increase Windows volume">+</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="quick-grid" aria-label="Playback options">
+      <button class="quick" type="button" data-track-picker="sub"><span>SUBTITLES</span><strong id="subtitle">OFF</strong></button>
+      <button class="quick" type="button" data-track-picker="audio"><span>AUDIO</span><strong id="audio">DEFAULT</strong></button>
+      <button class="quick" type="button" data-command="speed_cycle"><span>SPEED</span><strong id="speed">1.0×</strong></button>
+      <button class="quick" type="button" data-command="fullscreen_toggle"><span>FULLSCREEN</span><strong id="fullscreen">OFF</strong></button>
+    </section>
+
+    <div class="section-label">PLAYBACK TOOLS</div>
+    <section class="picture-grid">
+      <button id="hdr" class="picture" type="button" data-command="hdr_toggle" aria-pressed="false"><strong>HDR</strong><span id="hdrValue" class="value">OFF</span><small>DISPLAY</small><span class="switch"></span></button>
+      <button id="svp" class="picture" type="button" data-command="svp_toggle" aria-pressed="false"><strong>SVP</strong><span id="svpValue" class="value">OFF</span><small>MOTION</small><span class="switch"></span></button>
+      <button id="normalizer" class="picture" type="button" data-command="normalizer_restart"><strong>NORMALIZER</strong><span id="normalizerValue" class="value">OFF</span><small>RESTART</small><span class="restart-mark">↻</span></button>
+      <button id="whisper" class="picture" type="button" data-command="use_whisper"><strong>WHISPER</strong><span class="value">USE NOW</span><small>FORCE SUBTITLES</small><span class="restart-mark">↻</span></button>
+    </section>
+
+    <details>
+      <summary><span class="queue-head"><strong>☷ &nbsp; Open queue</strong><span id="queueCount">0 ITEMS</span></span></summary>
+      <div id="queue" class="queue-list"><div class="queue-item">Queue unavailable</div></div>
+    </details>
+
+    <footer class="footer"><span class="connection"><span id="footerDot" class="dot off"></span><span id="footerStatus">RECONNECTING</span></span><span id="host"></span></footer>
+  </main>
+
+  <div id="installSheet" class="install-sheet" role="dialog" aria-modal="true" aria-labelledby="installTitle">
+    <div class="sheet"><h2 id="installTitle">Streamee Remote</h2><p id="installCopy">Install this remote from your browser menu using “Add to Home Screen.” Keep your phone and PC on the same network.</p><button id="install" class="install" type="button" hidden>Install app</button><button id="closeSheet" type="button">Close</button></div>
+  </div>
+
+  <div id="trackSheet" class="install-sheet" role="dialog" aria-modal="true" aria-labelledby="trackTitle">
+    <div class="sheet"><div class="sheet-head"><h2 id="trackTitle">Select track</h2><button id="closeTracks" type="button" aria-label="Close track list">×</button></div><div id="trackList" class="track-list"></div></div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let latest = null;
+    let deferredInstall = null;
+    let ackTimer = null;
+    let editingSeek = false;
+    let editingMpvVolume = false;
+    let editingWindowsVolume = false;
+
+    const formatTime = (seconds) => {
+      const value = Math.max(0, Math.round(Number(seconds) || 0));
+      const hours = Math.floor(value / 3600);
+      const minutes = Math.floor((value % 3600) / 60);
+      const secs = String(value % 60).padStart(2, '0');
+      return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${secs}` : `${minutes}:${secs}`;
+    };
+
+    const showAck = (message, failed = false) => {
+      const el = $('ack');
+      el.textContent = failed ? `FAILED · ${message}` : message;
+      el.style.color = failed ? 'var(--danger)' : '#ced3db';
+      el.classList.add('show');
+      clearTimeout(ackTimer);
+      ackTimer = setTimeout(() => el.classList.remove('show'), 1600);
+      if (navigator.vibrate && !failed) navigator.vibrate(12);
+    };
+
+    const commandLabel = (command, value) => ({
+      play_pause: latest?.paused ? 'PLAYING' : 'PAUSED', previous: 'PREVIOUS', next: 'NEXT',
+      seek_relative: `${Number(value) > 0 ? 'SKIPPED +' : 'REWOUND '}${Math.abs(Number(value))} SEC`,
+      volume_step: 'MPV VOLUME UPDATED', windows_volume_step: 'WINDOWS VOLUME UPDATED',
+      fullscreen_toggle: 'FULLSCREEN UPDATED', subtitle_set: 'SUBTITLES UPDATED', audio_set: 'AUDIO UPDATED',
+      speed_cycle: 'SPEED UPDATED', hdr_toggle: 'HDR UPDATED', svp_toggle: 'SVP UPDATED',
+      normalizer_restart: 'AUDIO NORMALIZER RESTARTED', use_whisper: 'WHISPER SUBTITLES REQUESTED'
+    }[command] || 'UPDATED');
+
+    async function sendCommand(command, value) {
+      try {
+        const response = await fetch('/api/command', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command, value })
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) throw new Error(payload.error || 'Command failed');
+        showAck(commandLabel(command, value));
+        setTimeout(refresh, 120);
+      } catch (error) {
+        showAck(error.message || 'Command failed', true);
+      }
+    }
+
+    function render(state) {
+      latest = state;
+      const connected = !!state.connected;
+      $('topDot').classList.toggle('off', !connected);
+      $('footerDot').classList.toggle('off', !connected);
+      $('device').textContent = connected ? 'Living Room PC' : 'Player not running';
+      $('statusline').innerHTML = `<span class="dot ${connected ? '' : 'off'}"></span><span>${connected ? `${state.paused ? 'PAUSED' : 'PLAYING'} · QUEUE ${Math.min(state.playlist_pos + 1, state.playlist_count || 0)} OF ${state.playlist_count}` : 'WAITING FOR PLAYER'}</span>`;
+      $('title').textContent = state.title || 'Nothing playing';
+      $('filename').textContent = connected ? (state.filename || 'MPV playback') : 'Start playback in Streamee';
+      $('meta').textContent = connected ? `${state.audio} · SUB ${state.subtitle}` : 'LOCAL REMOTE';
+      if (!editingSeek) $('seek').value = state.percent || 0;
+      $('seek').disabled = !connected;
+      $('mpvVolume').disabled = !connected;
+      document.querySelectorAll('[data-track-picker]').forEach((control) => control.disabled = !connected);
+      document.querySelectorAll('[data-command]').forEach((control) => {
+        const alwaysAvailable = ['windows_volume_step', 'svp_toggle', 'normalizer_restart'].includes(control.dataset.command);
+        if (control.id !== 'hdr') control.disabled = !connected && !alwaysAvailable;
+      });
+      $('elapsed').textContent = formatTime(state.position);
+      $('remaining').textContent = `−${formatTime(Math.max(0, state.duration - state.position))}`;
+      const play = $('playPause');
+      play.querySelector('.circle').textContent = state.paused ? '▶' : 'Ⅱ';
+      play.querySelector('small').textContent = state.paused ? 'PLAY' : 'PAUSE';
+      play.setAttribute('aria-label', state.paused ? 'Play' : 'Pause');
+      if (!editingMpvVolume) $('mpvVolume').value = state.mpv_volume ?? 100;
+      $('mpvValue').textContent = Math.round(state.mpv_volume ?? 100);
+      if (!editingWindowsVolume) $('windowsVolume').value = state.windows_volume ?? 100;
+      $('windowsValue').textContent = Math.round(state.windows_volume ?? 100);
+      $('subtitle').textContent = state.subtitle || 'OFF';
+      $('audio').textContent = state.audio || 'DEFAULT';
+      $('speed').textContent = `${Number(state.speed || 1).toFixed(Number(state.speed || 1) % 1 ? 2 : 1)}×`;
+      $('fullscreen').textContent = state.fullscreen ? 'ON' : 'OFF';
+      $('normalizerValue').textContent = state.normalizer_enabled ? (state.normalizer_active ? 'ACTIVE' : 'READY') : 'OFF';
+      $('hdr').setAttribute('aria-pressed', String(!!state.hdr_enabled));
+      $('hdr').disabled = !connected || !state.hdr_supported;
+      $('hdrValue').textContent = state.hdr_supported ? (state.hdr_enabled ? 'ON' : 'OFF') : 'UNAVAILABLE';
+      $('svp').setAttribute('aria-pressed', String(!!state.svp_running));
+      $('svpValue').textContent = state.svp_running ? 'ON' : 'OFF';
+      $('queueCount').textContent = `${state.playlist_count || 0} ITEMS`;
+      $('queue').innerHTML = state.playlist?.length
+        ? state.playlist.map((item) => `<div class="queue-item ${item.current ? 'current' : ''}">${item.current ? 'NOW · ' : ''}${item.title}</div>`).join('')
+        : '<div class="queue-item">Queue unavailable</div>';
+      $('footerStatus').textContent = connected ? `CONNECTED · LOCAL · ${state.latency_ms || 0} ms` : 'RECONNECTING';
+    }
+
+    async function refresh() {
+      const started = performance.now();
+      try {
+        const response = await fetch('/api/state', { cache: 'no-store' });
+        if (!response.ok) throw new Error('Remote unavailable');
+        const state = await response.json();
+        state.latency_ms = Math.max(1, Math.round(performance.now() - started));
+        render(state);
+      } catch {
+        render({ connected: false, title: 'Connection lost', filename: 'Reconnecting to Streamee…', playlist: [] });
+      } finally {
+        scheduleRefresh(document.hidden ? 10000 : 2000);
+      }
+    }
+
+    let refreshTimer;
+    function scheduleRefresh(delay) {
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(refresh, delay);
+    }
+
+    document.querySelectorAll('[data-command]').forEach((button) => button.addEventListener('click', () => {
+      sendCommand(button.dataset.command, button.dataset.value == null ? undefined : Number(button.dataset.value));
+    }));
+    const trackLabel = (track) => [track.lang?.toUpperCase(), track.title].filter(Boolean).join(' · ') || `Track ${track.id}`;
+    const closeTrackPicker = () => $('trackSheet').classList.remove('open');
+    const openTrackPicker = (type) => {
+      const tracks = (latest?.tracks || []).filter((track) => track.type === type);
+      const choices = type === 'sub'
+        ? [{ id: -1, type: 'sub', title: 'Off', lang: '', selected: !tracks.some((track) => track.selected) }, ...tracks]
+        : tracks;
+      $('trackTitle').textContent = type === 'sub' ? 'Select subtitles' : 'Select audio';
+      $('trackList').replaceChildren();
+      if (!choices.length) {
+        const empty = document.createElement('div');
+        empty.className = 'track-option';
+        empty.textContent = 'No tracks available';
+        $('trackList').append(empty);
+      }
+      choices.forEach((track) => {
+        const option = document.createElement('button');
+        option.type = 'button';
+        option.className = 'track-option';
+        const label = document.createElement('span');
+        label.textContent = trackLabel(track);
+        const status = document.createElement('small');
+        status.textContent = track.selected ? 'SELECTED' : '';
+        option.append(label, status);
+        option.addEventListener('click', () => {
+          closeTrackPicker();
+          sendCommand(type === 'sub' ? 'subtitle_set' : 'audio_set', track.id);
+        });
+        $('trackList').append(option);
+      });
+      $('trackSheet').classList.add('open');
+    };
+    document.querySelectorAll('[data-track-picker]').forEach((button) => button.addEventListener('click', () => openTrackPicker(button.dataset.trackPicker)));
+    $('closeTracks').addEventListener('click', closeTrackPicker);
+    $('trackSheet').addEventListener('click', (event) => { if (event.target === $('trackSheet')) closeTrackPicker(); });
+    $('seek').addEventListener('pointerdown', () => editingSeek = true);
+    $('seek').addEventListener('change', (event) => { editingSeek = false; sendCommand('seek_percent', Number(event.target.value)); });
+    $('mpvVolume').addEventListener('pointerdown', () => editingMpvVolume = true);
+    $('mpvVolume').addEventListener('input', (event) => $('mpvValue').textContent = Math.round(event.target.value));
+    $('mpvVolume').addEventListener('change', (event) => { editingMpvVolume = false; sendCommand('volume_set', Number(event.target.value)); });
+    $('windowsVolume').addEventListener('pointerdown', () => editingWindowsVolume = true);
+    $('windowsVolume').addEventListener('input', (event) => $('windowsValue').textContent = Math.round(event.target.value));
+    $('windowsVolume').addEventListener('change', (event) => { editingWindowsVolume = false; sendCommand('windows_volume_set', Number(event.target.value)); });
+    $('host').textContent = location.host;
+    if (!window.isSecureContext) $('installCopy').textContent = 'This local HTTP address can be saved as a shortcut, but Android keeps the browser bar. A standalone install without browser controls requires trusted HTTPS.';
+    $('menu').addEventListener('click', () => $('installSheet').classList.add('open'));
+    $('closeSheet').addEventListener('click', () => $('installSheet').classList.remove('open'));
+    $('installSheet').addEventListener('click', (event) => { if (event.target === $('installSheet')) $('installSheet').classList.remove('open'); });
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) scheduleRefresh(10000);
+      else refresh();
+    });
+    window.addEventListener('beforeinstallprompt', (event) => { event.preventDefault(); deferredInstall = event; $('install').hidden = false; });
+    $('install').addEventListener('click', async () => { if (!deferredInstall) return; deferredInstall.prompt(); await deferredInstall.userChoice; deferredInstall = null; $('install').hidden = true; });
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+    refresh();
+  </script>
+</body>
+</html>

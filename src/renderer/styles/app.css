@@ -1,0 +1,56 @@
+.app {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  height: 100vh;
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+}
+
+.app > .sidebar,
+.app > .main-content {
+  position: relative;
+  z-index: 1;
+}
+
+.main-content {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: linear-gradient(180deg, rgba(9, 12, 17, 0.88), rgba(7, 9, 13, 0.94));
+  border: 1px solid var(--border-subtle);
+  border-radius: 0;
+  box-shadow: var(--shadow-xl);
+  backdrop-filter: blur(18px);
+}
+
+.main-content::before {
+  content: '';
+  position: sticky;
+  top: 0;
+  display: block;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.16), transparent);
+  z-index: 3;
+}
+
+.main-content-inner {
+  position: relative;
+  min-height: 100%;
+}
+
+.app-view-player .main-content {
+  overflow: hidden;
+}
+
+.app-view-player .main-content-inner {
+  height: 100%;
+}
+
+.main-content-inner > * {
+  animation: fadeUpSoft var(--duration-page) var(--ease-out);
+}

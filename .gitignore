@@ -1,0 +1,79 @@
+node_modules/
+dist/
+release/
+*.log
+.DS_Store
+Thumbs.db
+__pycache__/
+*.py[cod]
+
+# Local environment, test, and temporary artifacts
+.env
+.env.*
+!.env.example
+coverage/
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+
+# Rust/Tauri
+src-tauri/target/
+src-tauri/Cargo.lock
+
+# Build outputs
+mpv/*
+!mpv/input.conf
+!mpv/mpv.conf
+!mpv/shaders/
+!mpv/shaders/*.glsl
+!mpv/fonts/
+!mpv/fonts/Material-Design-Iconic-Font.ttf
+!mpv/scripts/
+!mpv/vs-plugins/
+mpv/vs-plugins/*
+!mpv/vs-plugins/bm3dcuda.dll
+!mpv/vs-plugins/BM3DCUDA-LICENSE.txt
+!mpv/vs-plugins/BM3DCUDA-NOTICE.md
+!mpv/vs-plugins/VapourSynth-BM3DCUDA-R2.16-source.tar.gz
+# Keep reusable Streamee scripts, but not local menu copies, Python launchers,
+# backups, or machine-specific video-processing state.
+mpv/scripts/*.backup
+mpv/scripts/*.disable
+mpv/scripts/*.dll
+mpv/scripts/pip*.exe
+mpv/scripts/dialog.lua
+mpv/scripts/dyn_menu.lua
+mpv/scripts/streamee_sharpen_settings.json
+mpv/scripts/streamee_video_processing_season.json
+nul
+
+# Local design QA artifacts
+design-qa.md
+design/
+output/
+.playwright-cli/
+
+# Local log shortcut
+streamee_logs - Shortcut.lnk
+msi - Shortcut.lnk
+com.streamee.app - Shortcut.lnk
+
+# IDE
+.vscode/
+.idea/
+.claude/
+.codex/
+
+# Local agent and planning state
+.agents/
+.codex-lock-regenerate/
+AGENTS.md
+PLANS.md
+
+# Local Mallee project setup
+.mallee/
+
+# Local DeeBugee project setup
+.deebugee/
