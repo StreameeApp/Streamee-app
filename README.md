@@ -11,6 +11,12 @@ Streamee combines a polished discovery library with a highly tuned desktop playb
 > [!IMPORTANT]
 > Streamee does not include media, source-provider accounts, or preconfigured stream add-ons. Install only services you trust and play only media you are authorized to access.
 
+## Screenshots
+
+![Streamee discovery interface](assets/Streamee1.png)
+
+![Streamee playback interface](assets/Streamee2.png)
+
 ## Highlights
 
 - Rich movie and TV discovery backed by TMDB, with optional OMDb ratings and Trakt sync

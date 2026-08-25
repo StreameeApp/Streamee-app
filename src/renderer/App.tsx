@@ -23,6 +23,7 @@ import {
   recordTransferredBytes,
 } from './services/statistics';
 import { openAudioNormalizerWindow } from './services/audio-normalizer-window';
+import { checkForUpdates } from './services/updater';
 import './styles/app.css';
 
 type ActiveEpisodeInfo = { season: number; episode: number; title: string };
@@ -665,6 +666,8 @@ const App: React.FC = () => {
     let traktSyncTimeout: number | null = null;
 
     const initApp = async () => {
+      void checkForUpdates();
+
       const connected = await checkTraktConnection();
       if (!isDisposed) {
         setTraktConnected(connected);

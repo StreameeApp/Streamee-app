@@ -18,12 +18,13 @@
         "tauri": "tauri",
         "tauri:dev": "npm run tauri:prepare && tauri dev",
         "tauri:dev:clean": "npm run tauri:prepare -- -ForceClean && tauri dev",
-        "tauri:build": "npm run version:bump -- patch && npm run tauri:prepare -- -ForceClean && tauri build"
+        "tauri:build": "npm run tauri:prepare -- -ForceClean && tauri build"
     },
     "author": "",
     "license": "MIT",
     "dependencies": {
         "@tauri-apps/api": "2.11.1",
+        "@tauri-apps/plugin-updater": "2.10.1",
         "axios": "^1.6.0",
         "buffer": "^6.0.3",
         "fs-native-extensions": "1.5.0",

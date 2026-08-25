@@ -33,6 +33,13 @@ import { useStore } from '../../store';
 import TraktConnect from '../trakt/TraktConnect';
 import AddonSettings from './AddonSettings';
 import { openAudioNormalizerWindow } from '../../services/audio-normalizer-window';
+import {
+  checkForUpdates,
+  downloadUpdate,
+  getUpdaterSnapshot,
+  installUpdate,
+  subscribeUpdater,
+} from '../../services/updater';
 import './Settings.css';
 
 const TMDB_API_URL = 'https://www.themoviedb.org/settings/api';
@@ -358,6 +365,11 @@ const Settings: React.FC = () => {
     getXrelQualitySnapshot,
     getXrelQualitySnapshot,
   );
+  const updaterSnapshot = useSyncExternalStore(
+    subscribeUpdater,
+    getUpdaterSnapshot,
+    getUpdaterSnapshot,
+  );
   const hasLoadedSettingsRef = useRef(false);
   const settingsRootRef = useRef<HTMLDivElement>(null);
   const settingsSearchTargetsRef = useRef(new Map<string, HTMLElement>());
@@ -371,6 +383,46 @@ const Settings: React.FC = () => {
       .filter((entry) => entry.searchText.includes(normalizedSettingsSearchQuery))
       .slice(0, 8)
     : [];
+
+  const updaterActionLabel = (() => {
+    switch (updaterSnapshot.status) {
+      case 'checking': return 'Checking...';
+      case 'available': return `Download v${updaterSnapshot.version}`;
+      case 'downloading': {
+        if (!updaterSnapshot.totalBytes) return 'Downloading...';
+        const percent = Math.min(100, Math.round(
+          (updaterSnapshot.downloadedBytes / updaterSnapshot.totalBytes) * 100,
+        ));
+        return `Downloading ${percent}%`;
+      }
+      case 'ready': return 'Install and restart';
+      case 'installing': return 'Installing...';
+      default: return 'Check for updates';
+    }
+  })();
+
+  const updaterMessage = (() => {
+    switch (updaterSnapshot.status) {
+      case 'checking': return 'Checking the latest signed GitHub release.';
+      case 'up-to-date': return 'Streamee is up to date.';
+      case 'available': return `Streamee v${updaterSnapshot.version} is available.`;
+      case 'downloading': return 'Downloading and verifying the signed installer.';
+      case 'ready': return 'The signed installer is ready. Streamee will close while Windows installs it.';
+      case 'installing': return 'Starting the Windows installer.';
+      case 'error': return updaterSnapshot.error || 'The update operation failed.';
+      default: return 'Updates are checked quietly when Streamee starts.';
+    }
+  })();
+
+  const handleUpdaterAction = () => {
+    if (updaterSnapshot.status === 'available') {
+      void downloadUpdate();
+    } else if (updaterSnapshot.status === 'ready') {
+      void installUpdate();
+    } else {
+      void checkForUpdates(true);
+    }
+  };
 
   const scrollSettingsContainerTo = (targetTop: number, behavior: ScrollBehavior = 'smooth') => {
     const scrollContainer = settingsRootRef.current?.closest<HTMLElement>('.main-content');
@@ -2687,6 +2739,29 @@ const Settings: React.FC = () => {
         id="about"
       >
         <h2><FiInfo /> About</h2>
+        <div className="settings-data-actions">
+          <div className="settings-data-card">
+            <div>
+              <h3>Application updates</h3>
+              <p>{updaterMessage}</p>
+              {updaterSnapshot.notes && updaterSnapshot.status !== 'idle' && (
+                <p>{updaterSnapshot.notes}</p>
+              )}
+            </div>
+            <button
+              className="settings-btn settings-btn-test"
+              type="button"
+              onClick={handleUpdaterAction}
+              disabled={
+                updaterSnapshot.status === 'checking'
+                || updaterSnapshot.status === 'downloading'
+                || updaterSnapshot.status === 'installing'
+              }
+            >
+              <FiDownload /> {updaterActionLabel}
+            </button>
+          </div>
+        </div>
         <div className="settings-about">
           <p><strong>Streamee</strong> {appVersion ? `v${appVersion}` : 'v—'}</p>
           <p>A media application powered by MPV and user-configured source providers.</p>
