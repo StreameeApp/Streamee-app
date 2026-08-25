@@ -1,6 +1,6 @@
 [package]
 name = "streamee"
-version = "2.0.1"
+version = "2.0.2"
 description = "A Windows desktop media application with user-configured stream add-ons and MPV playback"
 authors = [""]
 edition = "2021"
