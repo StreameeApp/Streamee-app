@@ -223,3 +223,7 @@ mpv/
 ## Responsible use
 
 Streamee is a general-purpose media discovery and playback client. It is designed for local files, personal media, public-domain works, freely licensed media, and remote sources that the user is authorized to access. The project does not bundle content, accounts, add-ons, or instructions for bypassing access controls.
+
+## License
+
+Streamee is licensed under the GNU General Public License, version 3 or later. See [LICENSE](LICENSE) for the full terms.

@@ -21,7 +21,7 @@
         "tauri:build": "npm run tauri:prepare -- -ForceClean && tauri build"
     },
     "author": "",
-    "license": "MIT",
+    "license": "GPL-3.0-or-later",
     "dependencies": {
         "@tauri-apps/api": "2.11.1",
         "@tauri-apps/plugin-updater": "2.10.1",
