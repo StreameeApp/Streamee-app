@@ -40,6 +40,7 @@ const EMPTY_DAY: DailyStatistics = {
     addon: 0,
     local: 0,
   },
+  addonSourceBytes: {},
   sessions: 0,
   moviesCompleted: 0,
   episodesCompleted: 0,
@@ -338,10 +339,40 @@ const Statistics: React.FC = () => {
   const hasPeriodSourceData = Object.values(periodSourceBytes).some((bytes) => bytes > 0);
   const visibleSourceBytes =
     range === 'lifetime' && !hasPeriodSourceData ? ledger.sourceBytes : periodSourceBytes;
-  const sourceEntries = Object.entries(visibleSourceBytes)
-    .filter(([, bytes]) => bytes > 0)
-    .sort(([, left], [, right]) => right - left);
-  const topSource = sourceEntries[0]?.[0] || 'No data yet';
+  const periodAddonSourceBytes = filteredDays.reduce(
+    (totals, [, day]) => {
+      Object.entries(day.addonSourceBytes).forEach(([installationId, source]) => {
+        const current = totals[installationId] || { name: source.name, bytes: 0 };
+        current.name = source.name;
+        current.bytes += source.bytes;
+        totals[installationId] = current;
+      });
+      return totals;
+    },
+    {} as StatisticsLedger['addonSourceBytes']
+  );
+  const visibleAddonSourceBytes =
+    range === 'lifetime' && !hasPeriodSourceData
+      ? ledger.addonSourceBytes
+      : periodAddonSourceBytes;
+  const namedAddonBytes = Object.values(visibleAddonSourceBytes)
+    .reduce((total, source) => total + source.bytes, 0);
+  const sourceEntries = [
+    { name: 'WebTorrent', bytes: visibleSourceBytes.webtorrent },
+    { name: 'External playback service', bytes: visibleSourceBytes.qbittorrent },
+    { name: 'Local', bytes: visibleSourceBytes.local },
+    ...Object.entries(visibleAddonSourceBytes).map(([installationId, source]) => ({
+      name: ledger.addonSourceBytes[installationId]?.name || source.name,
+      bytes: source.bytes,
+    })),
+    {
+      name: 'Add-on',
+      bytes: Math.max(0, visibleSourceBytes.addon - namedAddonBytes),
+    },
+  ]
+    .filter((source) => source.bytes > 0)
+    .sort((left, right) => right.bytes - left.bytes);
+  const topSource = sourceEntries[0]?.name || 'No data yet';
   const averageSession = filteredSessions > 0 ? filteredSeconds / filteredSessions : 0;
   const activityRangeLabel =
     range === 'month'

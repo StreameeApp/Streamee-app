@@ -16,7 +16,6 @@ import './MetaDetails.css';
 
 type SortBy = 'seeds' | 'size' | 'quality';
 type SortOrder = 'desc' | 'asc';
-type SearchMode = 'episode';
 type ActorCreditFilter = 'all' | 'movie' | 'series';
 const TORRENT_PAGE_SIZE = 20;
 const TORRENT_ACTION_STATE_STORAGE_KEY = 'streamee-torrent-action-state';
@@ -172,7 +171,6 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   const [seasons, setSeasons] = useState<Season[]>([]);
   const [selectedSeason, setSelectedSeason] = useState<Season | null>(null);
   const [selectedEpisode, setSelectedEpisode] = useState<EpisodeDetail | null>(null);
-  const [searchMode, setSearchMode] = useState<SearchMode>('episode');
   const [seasonsLoading, setSeasonsLoading] = useState(false);
   const torrentSearchIdRef = useRef(0);
   const torrentSearchAbortRef = useRef<AbortController | null>(null);
@@ -425,7 +423,6 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
 
   const handleSeasonSelect = async (season: Season) => {
     setSelectedSeason(season);
-    setSearchMode('episode');
     setShowTorrents(false);
     setTorrents([]);
     setVisibleTorrentCount(TORRENT_PAGE_SIZE);
@@ -449,7 +446,6 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   const handleEpisodeClick = (episode: EpisodeDetail, season: Season) => {
     setSelectedEpisode(episode);
     setSelectedSeason(season);
-    setSearchMode('episode');
     setShowTorrents(false);
     setTorrents([]);
     setVisibleTorrentCount(TORRENT_PAGE_SIZE);
@@ -688,12 +684,12 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       return releaseYear ? `${detailTitle} ${releaseYear}` : detailTitle;
     }
 
-    if (selectedEpisode && searchMode === 'episode') {
+    if (selectedEpisode) {
       return `${detailTitle} S${selectedEpisode.season_number.toString().padStart(2, '0')}E${selectedEpisode.episode_number.toString().padStart(2, '0')}`;
     }
 
     return `${detailTitle} Next episode`;
-  }, [detailTitle, isTvShow, releaseYear, searchMode, selectedEpisode, selectedSeason]);
+  }, [detailTitle, isTvShow, releaseYear, selectedEpisode]);
   const availableSearchAddons = useMemo(() => {
     const imdbId = details?.imdbId || meta.imdbId || '';
     if (!/^tt\d+$/i.test(imdbId)) return [];
@@ -985,7 +981,6 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
 
             setSeasons(seasonsData);
             setSelectedSeason(preferredSeason || seasonsData[0] || null);
-            setSearchMode('episode');
           }
         }
         setSeasonsLoading(false);
@@ -1242,7 +1237,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
         handleSearchTorrents();
       }
     }
-  }, [details, secondaryMetadataReady, selectedEpisode, selectedSeason, searchMode]);
+  }, [details, secondaryMetadataReady, selectedEpisode, selectedSeason]);
 
   useEffect(() => () => {
     torrentSearchAbortRef.current?.abort();
@@ -1261,44 +1256,19 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     setVisibleTorrentCount(TORRENT_PAGE_SIZE);
     setSelectedIndexer('all');
     
-    const searchName = details?.name || meta.name;
-    const searchOriginalName = details?.originalName || meta.originalName;
-    const searchAliases = [...new Set([...(details?.aliases || []), ...(meta.aliases || [])])];
-    const searchYear = releaseYear || details?.year || meta.year;
-    const knownSeasonCount = seasons.reduce(
-      (highest, season) => season.season_number > 0 ? Math.max(highest, season.season_number) : highest,
-      0,
-    ) || null;
-    const effectiveMode = searchMode;
-    let searchQuery = '';
-    
-    if (isTvShow && selectedEpisode && effectiveMode === 'episode') {
-      searchQuery = `${searchName} S${selectedEpisode.season_number.toString().padStart(2, '0')}E${selectedEpisode.episode_number.toString().padStart(2, '0')}`;
-    } else {
-      searchQuery = searchYear ? `${searchName} ${searchYear}` : searchName;
-    }
-    
-    console.log('Searching for:', searchQuery);
+    console.log('Searching for:', activeSearchLabel);
     
     try {
       const outcome = await searchEnabledSourceProviders({
-        name: searchName,
-        originalName: searchOriginalName,
-        aliases: searchAliases,
-        year: searchYear,
-        knownSeasonCount,
         imdbId: details?.imdbId || meta.imdbId,
         isTvShow,
-        mode: effectiveMode,
         season: selectedEpisode?.season_number ?? selectedSeason?.season_number,
         episode: selectedEpisode?.episode_number,
         onlyAddonInstallationId,
-        query: searchQuery,
         signal: searchController.signal,
         onProgress: (progressiveOutcome) => {
           if (!isCurrentSearch()) return;
           setTorrents(progressiveOutcome.results);
-          setTorrentsLoading(false);
         },
       });
       if (!isCurrentSearch()) return;
@@ -1345,7 +1315,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       ? playbackTarget?.season ?? selectedSeason?.season_number
       : undefined;
     const preferredEpisode = isTvShow
-      ? playbackTarget?.episode ?? (searchMode === 'episode' ? selectedEpisode?.episode_number : undefined)
+      ? playbackTarget?.episode ?? selectedEpisode?.episode_number
       : undefined;
 
     useStore.setState((state) => ({
@@ -1415,13 +1385,13 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       torrent,
       sourceType: 'qbittorrent',
       preferredSeason: isTvShow ? selectedSeason?.season_number : undefined,
-      preferredEpisode: isTvShow && searchMode === 'episode' ? selectedEpisode?.episode_number : undefined,
+      preferredEpisode: isTvShow ? selectedEpisode?.episode_number : undefined,
     });
 
     rememberLastSource(torrent.magnetUri, {
       sourceType: 'qbittorrent',
       preferredSeason: isTvShow ? selectedSeason?.season_number : undefined,
-      preferredEpisode: isTvShow && searchMode === 'episode' ? selectedEpisode?.episode_number : undefined,
+      preferredEpisode: isTvShow ? selectedEpisode?.episode_number : undefined,
     });
   };
 
@@ -1445,7 +1415,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       ? playbackTarget?.season ?? selectedSeason?.season_number
       : undefined;
     const preferredEpisode = isTvShow
-      ? playbackTarget?.episode ?? (searchMode === 'episode' ? selectedEpisode?.episode_number : undefined)
+      ? playbackTarget?.episode ?? selectedEpisode?.episode_number
       : undefined;
     const sourceUrl = localFiles[0].path;
     const sourceTitle = localFiles.length > 1
@@ -1693,24 +1663,11 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       if (shouldUseAddon) {
         try {
           const imdbId = lastSourceMeta.addonImdbId || details?.imdbId || meta.imdbId || '';
-          const resumeName = details?.name || meta.name;
-          const resumeYear = releaseYear || details?.year || meta.year;
-          const resumeQuery = isTvShow && playbackTarget
-            ? `${resumeName} S${String(playbackTarget.season).padStart(2, '0')}E${String(playbackTarget.episode).padStart(2, '0')}`
-            : resumeYear
-              ? `${resumeName} ${resumeYear}`
-              : resumeName;
           const outcome = await searchEnabledSourceProviders({
-            name: resumeName,
-            originalName: details?.originalName || meta.originalName,
-            aliases: [...new Set([...(details?.aliases || []), ...(meta.aliases || [])])],
-            year: resumeYear,
             imdbId,
             isTvShow,
-            mode: 'episode',
             season: playbackTarget?.season,
             episode: playbackTarget?.episode,
-            query: resumeQuery,
           });
           const results = outcome.results;
           const currentState = useStore.getState();
@@ -2365,7 +2322,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
                   </div>
                 </div>
               </div>
-              {torrentsLoading ? (
+              {torrentsLoading && torrents.length === 0 ? (
                 <div className="torrents-loading">
                   <div className="loading-spinner" />
                   <span>Searching...</span>
@@ -2662,7 +2619,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
                         </div>
                       </div>
                     </div>
-                    {torrentsLoading ? (
+                    {torrentsLoading && torrents.length === 0 ? (
                       <div className="torrents-loading">
                         <div className="loading-spinner" />
                         <span>Searching...</span>

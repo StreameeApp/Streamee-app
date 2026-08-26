@@ -414,6 +414,10 @@ const Settings: React.FC = () => {
       default: return 'Updates are checked quietly when Streamee starts.';
     }
   })();
+  const updaterNotes = updaterSnapshot.notes?.trim() || null;
+  const showUpdaterNotes = !!updaterNotes
+    && updaterSnapshot.status !== 'idle'
+    && updaterNotes.toLocaleLowerCase() !== `streamee v${updaterSnapshot.version}`.toLocaleLowerCase();
 
   const handleUpdaterAction = () => {
     if (updaterSnapshot.status === 'available') {
@@ -2745,8 +2749,8 @@ const Settings: React.FC = () => {
             <div>
               <h3>Application updates</h3>
               <p>{updaterMessage}</p>
-              {updaterSnapshot.notes && updaterSnapshot.status !== 'idle' && (
-                <p>{updaterSnapshot.notes}</p>
+              {showUpdaterNotes && (
+                <p>{updaterNotes}</p>
               )}
             </div>
             <button

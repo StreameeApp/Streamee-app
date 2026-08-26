@@ -1,4 +1,5 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState, useSyncExternalStore } from 'react';
+import { FiDownload, FiX } from 'react-icons/fi';
 import { useShallow } from 'zustand/react/shallow';
 import { MetaPreview, useStore } from './store';
 import Board from './features/board/Board';
@@ -23,7 +24,12 @@ import {
   recordTransferredBytes,
 } from './services/statistics';
 import { openAudioNormalizerWindow } from './services/audio-normalizer-window';
-import { checkForUpdates } from './services/updater';
+import {
+  checkForUpdates,
+  downloadUpdate,
+  getUpdaterSnapshot,
+  subscribeUpdater,
+} from './services/updater';
 import './styles/app.css';
 
 type ActiveEpisodeInfo = { season: number; episode: number; title: string };
@@ -37,6 +43,7 @@ type PlayerProgressPayload = {
 
 const PLAYBACK_SNAPSHOT_INTERVAL_MS = 20_000;
 const DISCORD_PRESENCE_UPDATE_INTERVAL_MS = 30_000;
+const DISMISSED_UPDATE_VERSION_KEY = 'streamee-dismissed-update-version';
 
 let currentPlayingMeta: {
   type: 'movie' | 'show';
@@ -637,6 +644,23 @@ const App: React.FC = () => {
     setDownloadStats: state.setDownloadStats,
     resetDownloadStats: state.resetDownloadStats,
   })));
+  const updaterSnapshot = useSyncExternalStore(
+    subscribeUpdater,
+    getUpdaterSnapshot,
+    getUpdaterSnapshot,
+  );
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(() =>
+    localStorage.getItem(DISMISSED_UPDATE_VERSION_KEY),
+  );
+  const showUpdateToast = updaterSnapshot.status === 'available'
+    && !!updaterSnapshot.version
+    && updaterSnapshot.version !== dismissedUpdateVersion;
+
+  const dismissUpdateToast = () => {
+    if (!updaterSnapshot.version) return;
+    localStorage.setItem(DISMISSED_UPDATE_VERSION_KEY, updaterSnapshot.version);
+    setDismissedUpdateVersion(updaterSnapshot.version);
+  };
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
@@ -973,7 +997,12 @@ const App: React.FC = () => {
 
     window.electronAPI.statisticsEvents.onTransfer((payload) => {
       if (isDisposed) return;
-      recordTransferredBytes(payload.bytes, payload.source_type);
+      recordTransferredBytes(
+        payload.bytes,
+        payload.source_type,
+        payload.source_id || undefined,
+        payload.source_name || undefined,
+      );
     }).then((unlisten) => {
       statisticsTransferUnlisten = unlisten;
     }).catch((error) => {
@@ -1054,6 +1083,29 @@ const App: React.FC = () => {
           {renderContent()}
         </div>
       </main>
+      {showUpdateToast && (
+        <aside className="update-toast" role="status" aria-live="polite">
+          <div className="update-toast-copy">
+            <strong>Streamee v{updaterSnapshot.version} is available</strong>
+            <span>A signed update is ready to download.</span>
+          </div>
+          <button
+            className="update-toast-action"
+            type="button"
+            onClick={() => void downloadUpdate()}
+          >
+            <FiDownload /> Download
+          </button>
+          <button
+            className="update-toast-dismiss"
+            type="button"
+            onClick={dismissUpdateToast}
+            aria-label={`Dismiss update v${updaterSnapshot.version}`}
+          >
+            <FiX />
+          </button>
+        </aside>
+      )}
     </div>
   );
 };

@@ -1735,40 +1735,6 @@ pub fn set_media_title(title: &str) -> Result<(), String> {
     }
 }
 
-pub fn seek_absolute_percent(percent: f64) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        let pipe = connect_to_mpv_pipe().ok_or_else(|| "MPV not connected".to_string())?;
-        let cmd = MpvCommand {
-            command: vec![
-                serde_json::json!("seek"),
-                serde_json::json!(percent),
-                serde_json::json!("absolute-percent"),
-            ],
-            request_id: None,
-        };
-
-        let result = send_command(pipe, &cmd);
-        unsafe {
-            let _ = CloseHandle(pipe);
-        }
-
-        match result {
-            Some(resp) if resp.error.as_deref().unwrap_or("success") == "success" => Ok(()),
-            Some(resp) => Err(resp
-                .error
-                .unwrap_or_else(|| "Failed to seek player".to_string())),
-            None => Err("No response from MPV".to_string()),
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = percent;
-        Err("Not implemented for this platform".to_string())
-    }
-}
-
 pub fn seek_absolute_time(seconds: f64, expected_filename: &str) -> Result<(), String> {
     if !seconds.is_finite() || seconds < 0.0 {
         return Err("Invalid absolute seek time".to_string());

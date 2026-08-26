@@ -1,5 +1,6 @@
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use regex::Regex;
 use reqwest::{redirect::Policy, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
@@ -22,6 +23,10 @@ struct AddonStreamHandle {
 
 static STREAM_HANDLES: Lazy<Mutex<HashMap<String, AddonStreamHandle>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static ADDON_STREAM_SIZE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB)\b")
+        .expect("add-on stream size regex must compile")
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +135,46 @@ struct StremioStream {
 struct StremioStreamResponse {
     #[serde(default)]
     streams: Vec<StremioStream>,
+}
+
+fn parse_addon_stream_size(values: impl IntoIterator<Item = impl AsRef<str>>) -> Option<u64> {
+    for value in values {
+        let Some(captures) = ADDON_STREAM_SIZE_RE.captures(value.as_ref()) else {
+            continue;
+        };
+        let amount = captures.get(1)?.as_str().parse::<f64>().ok()?;
+        let multiplier = match captures.get(2)?.as_str().to_ascii_uppercase().as_str() {
+            "KB" => 1024_u64,
+            "MB" => 1024_u64.pow(2),
+            "GB" => 1024_u64.pow(3),
+            "TB" => 1024_u64.pow(4),
+            _ => continue,
+        };
+        let bytes = amount * multiplier as f64;
+        if amount > 0.0 && bytes.is_finite() && bytes <= u64::MAX as f64 {
+            return Some(bytes.round() as u64);
+        }
+    }
+    None
+}
+
+fn addon_stream_size(stream: &StremioStream) -> Option<u64> {
+    stream
+        .behavior_hints
+        .video_size
+        .filter(|size| *size > 0)
+        .or_else(|| {
+            parse_addon_stream_size(
+                [
+                    stream.title.as_deref(),
+                    stream.name.as_deref(),
+                    stream.description.as_deref(),
+                    stream.behavior_hints.filename.as_deref(),
+                ]
+                .into_iter()
+                .flatten(),
+            )
+        })
 }
 
 #[derive(Debug, Serialize)]
@@ -477,6 +522,7 @@ pub async fn fetch_addon_streams(request: AddonStreamRequest) -> Result<Vec<Addo
     remove_expired_stream_handles(&mut handles);
 
     for (index, stream) in response.streams.into_iter().enumerate() {
+        let size = addon_stream_size(&stream);
         let title = stream
             .behavior_hints
             .filename
@@ -517,7 +563,7 @@ pub async fn fetch_addon_streams(request: AddonStreamRequest) -> Result<Vec<Addo
                 info_hash: stream.info_hash,
                 file_index: stream.file_idx,
                 filename,
-                size: stream.behavior_hints.video_size,
+                size,
             });
         } else if let Some(info_hash) = stream.info_hash.filter(|value| !value.trim().is_empty()) {
             results.push(AddonStreamResult {
@@ -529,7 +575,7 @@ pub async fn fetch_addon_streams(request: AddonStreamRequest) -> Result<Vec<Addo
                 info_hash: Some(info_hash),
                 file_index: stream.file_idx,
                 filename,
-                size: stream.behavior_hints.video_size,
+                size,
             });
         }
     }
@@ -583,6 +629,34 @@ mod tests {
             stream.as_str(),
             "https://example.com/config/stream/series/tt123:1:2.json?token=opaque"
         );
+    }
+
+    #[test]
+    fn derives_stream_size_from_original_title_before_using_filename() {
+        let stream = StremioStream {
+            title: Some("Provider metadata 💾 1.63 GB".to_string()),
+            behavior_hints: StremioStreamBehaviorHints {
+                filename: Some("Example.2160p.WEB-DL.mkv".to_string()),
+                video_size: None,
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(addon_stream_size(&stream), Some(1_750_199_173));
+    }
+
+    #[test]
+    fn prefers_structured_video_size_over_rounded_text_metadata() {
+        let stream = StremioStream {
+            title: Some("Provider metadata 💾 4.5 GB".to_string()),
+            behavior_hints: StremioStreamBehaviorHints {
+                filename: Some("Example.2160p.WEB-DL.mkv".to_string()),
+                video_size: Some(4_830_585_325),
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(addon_stream_size(&stream), Some(4_830_585_325));
     }
 
     #[test]

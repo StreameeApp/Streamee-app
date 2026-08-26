@@ -3,12 +3,20 @@ type StatisticsSourceType = 'webtorrent' | 'qbittorrent' | 'addon' | 'local';
 
 type SourceBytes = Record<StatisticsSourceType, number>;
 
+export interface AddonSourceStatistics {
+  name: string;
+  bytes: number;
+}
+
+type AddonSourceBytes = Record<string, AddonSourceStatistics>;
+
 export interface DailyStatistics {
   secondsWatched: number;
   movieSeconds: number;
   seriesSeconds: number;
   bytesDownloaded: number;
   sourceBytes: SourceBytes;
+  addonSourceBytes: AddonSourceBytes;
   sessions: number;
   moviesCompleted: number;
   episodesCompleted: number;
@@ -21,6 +29,7 @@ export interface StatisticsLedger {
   totalBytesDownloaded: number;
   totalSessions: number;
   sourceBytes: SourceBytes;
+  addonSourceBytes: AddonSourceBytes;
   days: Record<string, DailyStatistics>;
 }
 
@@ -57,6 +66,7 @@ const createEmptyDay = (): DailyStatistics => ({
   seriesSeconds: 0,
   bytesDownloaded: 0,
   sourceBytes: createSourceBytes(),
+  addonSourceBytes: {},
   sessions: 0,
   moviesCompleted: 0,
   episodesCompleted: 0,
@@ -69,6 +79,7 @@ const createEmptyLedger = (): StatisticsLedger => ({
   totalBytesDownloaded: 0,
   totalSessions: 0,
   sourceBytes: createSourceBytes(),
+  addonSourceBytes: {},
   days: {},
 });
 
@@ -94,12 +105,23 @@ const normalizeSourceBytes = (sourceBytes?: Partial<SourceBytes>): SourceBytes =
   local: Math.max(0, sourceBytes?.local || 0),
 });
 
+const normalizeAddonSourceBytes = (sourceBytes?: AddonSourceBytes): AddonSourceBytes =>
+  Object.fromEntries(
+    Object.entries(sourceBytes || {}).flatMap(([installationId, source]) => {
+      const id = installationId.trim();
+      const name = typeof source?.name === 'string' ? source.name.trim() : '';
+      const bytes = Math.max(0, Number(source?.bytes) || 0);
+      return id && name && bytes > 0 ? [[id, { name, bytes }]] : [];
+    })
+  );
+
 const normalizeDay = (day?: Partial<DailyStatistics>): DailyStatistics => ({
   secondsWatched: Math.max(0, day?.secondsWatched || 0),
   movieSeconds: Math.max(0, day?.movieSeconds || 0),
   seriesSeconds: Math.max(0, day?.seriesSeconds || 0),
   bytesDownloaded: Math.max(0, day?.bytesDownloaded || 0),
   sourceBytes: normalizeSourceBytes(day?.sourceBytes),
+  addonSourceBytes: normalizeAddonSourceBytes(day?.addonSourceBytes),
   sessions: Math.max(0, day?.sessions || 0),
   moviesCompleted: Math.max(0, day?.moviesCompleted || 0),
   episodesCompleted: Math.max(0, day?.episodesCompleted || 0),
@@ -118,6 +140,7 @@ const loadStatisticsLedger = (): StatisticsLedger => {
       totalBytesDownloaded: Math.max(0, stored.totalBytesDownloaded || 0),
       totalSessions: Math.max(0, stored.totalSessions || 0),
       sourceBytes: normalizeSourceBytes(stored.sourceBytes),
+      addonSourceBytes: normalizeAddonSourceBytes(stored.addonSourceBytes),
       days: Object.fromEntries(
         Object.entries(stored.days || {}).map(([key, day]) => [key, normalizeDay(day)])
       ),
@@ -138,10 +161,19 @@ export const readStatisticsLedger = (): StatisticsLedger => {
   return {
     ...ledger,
     sourceBytes: { ...ledger.sourceBytes },
+    addonSourceBytes: Object.fromEntries(
+      Object.entries(ledger.addonSourceBytes).map(([id, source]) => [id, { ...source }])
+    ),
     days: Object.fromEntries(
       Object.entries(ledger.days).map(([key, day]) => [
         key,
-        { ...day, sourceBytes: { ...day.sourceBytes } },
+        {
+          ...day,
+          sourceBytes: { ...day.sourceBytes },
+          addonSourceBytes: Object.fromEntries(
+            Object.entries(day.addonSourceBytes).map(([id, source]) => [id, { ...source }])
+          ),
+        },
       ])
     ),
   };
@@ -263,15 +295,31 @@ export const recordMediaCompleted = (
 export const recordTransferredBytes = (
   bytes: number,
   sourceType: StatisticsSourceType,
+  sourceId?: string,
+  sourceName?: string,
   recordedAt = Date.now()
 ) => {
   if (!Number.isFinite(bytes) || bytes <= 0) return;
+  const addonId = sourceType === 'addon' ? sourceId?.trim() : undefined;
+  const addonName = sourceType === 'addon' ? sourceName?.trim() : undefined;
   updateLedger((ledger) => {
     ledger.totalBytesDownloaded += bytes;
     ledger.sourceBytes[sourceType] += bytes;
+    if (addonId && addonName) {
+      const source = ledger.addonSourceBytes[addonId] || { name: addonName, bytes: 0 };
+      source.name = addonName;
+      source.bytes += bytes;
+      ledger.addonSourceBytes[addonId] = source;
+    }
     updateDay(ledger, recordedAt, (day) => {
       day.bytesDownloaded += bytes;
       day.sourceBytes[sourceType] += bytes;
+      if (addonId && addonName) {
+        const source = day.addonSourceBytes[addonId] || { name: addonName, bytes: 0 };
+        source.name = addonName;
+        source.bytes += bytes;
+        day.addonSourceBytes[addonId] = source;
+      }
     });
   });
 };

@@ -20,7 +20,7 @@ use introdb::fetch_introdb_segments;
 use mpv_ipc::{
     ack_smart_next_request, fetch_player_tracks, get_pending_smart_next_request, get_player_info,
     get_playlist_info, load_file_replace_with_title, load_subtitle_file, playlist_add,
-    playlist_next, playlist_prev, seek_absolute_percent, seek_absolute_time,
+    playlist_next, playlist_prev, seek_absolute_time,
     set_media_title as set_mpv_media_title, set_player_track as set_mpv_player_track,
     set_smart_next_available, show_player_message, start_player_observing, stop_player_observing,
 };
@@ -515,17 +515,6 @@ pub struct TrackerInfo {
     pub url: String,
     pub status: String,
     pub peers: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PlayerStatus {
-    pub playing: bool,
-    pub paused: bool,
-    pub position: f64,
-    pub duration: f64,
-    pub volume: f64,
-    pub muted: bool,
-    pub filename: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1621,7 +1610,7 @@ fn spawn_qbittorrent_transfer_monitor(app: AppHandle, info_hash: String, initial
             match find_qbittorrent_torrent(&client, &base_url, &info_hash).await {
                 Ok(Some(torrent)) => {
                     let delta = torrent.downloaded.saturating_sub(last_downloaded);
-                    emit_statistics_transfer(&app, "qbittorrent", delta);
+                    emit_statistics_transfer(&app, "qbittorrent", delta, None, None);
                     last_downloaded = torrent.downloaded;
                     if torrent.progress >= 1.0 {
                         break;
@@ -3544,7 +3533,13 @@ fn write_cache_only_head(stream: &mut TcpStream, total_size: u64) -> Result<(), 
     .map_err(|error| format!("Failed to write cache-only HEAD response: {error}"))
 }
 
-fn emit_statistics_transfer(app: &AppHandle, source_type: &str, bytes: u64) {
+fn emit_statistics_transfer(
+    app: &AppHandle,
+    source_type: &str,
+    bytes: u64,
+    source_id: Option<&str>,
+    source_name: Option<&str>,
+) {
     if bytes == 0 {
         return;
     }
@@ -3552,6 +3547,8 @@ fn emit_statistics_transfer(app: &AppHandle, source_type: &str, bytes: u64) {
         "statistics://transfer",
         serde_json::json!({
             "source_type": source_type,
+            "source_id": source_id,
+            "source_name": source_name,
             "bytes": bytes,
         }),
     );
@@ -3813,6 +3810,8 @@ fn safe_stream_display_name(name: Option<&str>) -> Option<String> {
 struct AddonProxyEntry {
     app_handle: AppHandle,
     session_id: String,
+    addon_installation_id: Option<String>,
+    addon_name: Option<String>,
     source_url: Arc<Mutex<Option<String>>>,
     resolved_source_url: Arc<Mutex<Option<String>>>,
     http_clients: Arc<Mutex<HashMap<String, reqwest::blocking::Client>>>,
@@ -4108,7 +4107,13 @@ fn emit_addon_transfer_progress(
     };
 
     if added_bytes > 0 {
-        emit_statistics_transfer(&entry.app_handle, "addon", added_bytes);
+        emit_statistics_transfer(
+            &entry.app_handle,
+            "addon",
+            added_bytes,
+            entry.addon_installation_id.as_deref(),
+            entry.addon_name.as_deref(),
+        );
     }
     let _ = entry.app_handle.emit(
         "addon://transfer-progress",
@@ -4902,6 +4907,8 @@ async fn prepare_addon_stream_url(
     stream_handle: Option<String>,
     total_size: u64,
     display_name: Option<String>,
+    addon_installation_id: Option<String>,
+    addon_name: Option<String>,
     cache_identity: Option<String>,
     cache_whole_file_enabled: Option<bool>,
     whisper_deduplication_enabled: Option<bool>,
@@ -4983,6 +4990,8 @@ async fn prepare_addon_stream_url(
     let entry = AddonProxyEntry {
         app_handle: app,
         session_id: id.clone(),
+        addon_installation_id: safe_stream_display_name(addon_installation_id.as_deref()),
+        addon_name: safe_stream_display_name(addon_name.as_deref()),
         source_url: Arc::new(Mutex::new(Some(source_url))),
         resolved_source_url: Arc::new(Mutex::new(None)),
         http_clients: Arc::new(Mutex::new(HashMap::new())),
@@ -6058,12 +6067,6 @@ async fn resume_torrent() -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn start_player(file_url: String) -> Result<(), String> {
-    info!("Starting player with: {}", file_url);
-    Ok(())
-}
-
-#[tauri::command]
 async fn stop_player() -> Result<(), String> {
     info!("Stopping player");
     mpv_ipc::stop_player_session()
@@ -6112,55 +6115,12 @@ async fn stop_mpv_process(pid: u32) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn pause_player() -> Result<(), String> {
-    info!("Pausing player");
-    Ok(())
-}
-
-#[tauri::command]
-async fn resume_player() -> Result<(), String> {
-    info!("Resuming player");
-    Ok(())
-}
-
-#[tauri::command]
-async fn seek_player(position: f64) -> Result<(), String> {
-    info!("Seeking to: {}", position);
-    seek_absolute_percent(position)
-}
-
-#[tauri::command]
 async fn seek_player_time(position: f64, expected_filename: String) -> Result<(), String> {
     info!(
         "Seeking to absolute time: {}, expected_filename={:?}",
         position, expected_filename
     );
     seek_absolute_time(position, &expected_filename)
-}
-
-#[tauri::command]
-async fn set_volume(volume: f64) -> Result<(), String> {
-    info!("Setting volume to: {}", volume);
-    Ok(())
-}
-
-#[tauri::command]
-async fn set_mute(muted: bool) -> Result<(), String> {
-    info!("Setting mute to: {}", muted);
-    Ok(())
-}
-
-#[tauri::command]
-async fn get_player_status() -> Result<PlayerStatus, String> {
-    Ok(PlayerStatus {
-        playing: false,
-        paused: false,
-        position: 0.0,
-        duration: 0.0,
-        volume: 100.0,
-        muted: false,
-        filename: String::new(),
-    })
 }
 
 #[tauri::command]
@@ -8031,8 +7991,6 @@ pub fn run() {
     tauri::Builder::default()
         .manage(app_state)
         .manage(wl_state)
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -8172,16 +8130,9 @@ pub fn run() {
             prepare_and_open_local_stream,
             pause_torrent,
             resume_torrent,
-            start_player,
             stop_player,
             stop_mpv_process,
-            pause_player,
-            resume_player,
-            seek_player,
             seek_player_time,
-            set_volume,
-            set_mute,
-            get_player_status,
             get_player_tracks,
             set_player_track,
             set_player_media_title,
@@ -9001,10 +8952,8 @@ mod stream_cache_tests {
             "https://tracker.test/dl?PassKey=<redacted>&id=1"
         );
         assert_eq!(
-            redact_sensitive_url(
-                "http://127.0.0.1:9117/api/v2.0/indexers/all/results?apikey=secret&Query=test"
-            ),
-            "http://127.0.0.1:9117/api/v2.0/indexers/all/results?apikey=<redacted>&Query=test"
+            redact_sensitive_url("https://api.example.test/search?apikey=secret&query=test"),
+            "https://api.example.test/search?apikey=<redacted>&query=test"
         );
     }
 

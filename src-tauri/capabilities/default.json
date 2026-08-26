@@ -14,9 +14,6 @@
     "core:window:allow-set-focus",
     "core:window:allow-set-fullscreen",
     "core:webview:allow-create-webview-window",
-    "shell:default",
-    "shell:allow-open",
-    "fs:default",
     "store:default",
     "updater:default"
   ]

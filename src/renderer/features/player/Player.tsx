@@ -2130,16 +2130,10 @@ const Player: React.FC = () => {
             trace.sourceSearchStartedAt = Date.now();
           }
           const outcome = await searchEnabledSourceProviders({
-            name: selectedMeta.name,
-            originalName: selectedMeta.originalName,
-            aliases: selectedMeta.aliases,
-            year: selectedMeta.year,
             imdbId: selectedMeta.imdbId,
             isTvShow: true,
-            mode: 'episode',
             season: target.season,
             episode: target.episode,
-            query: `${selectedMeta.name} S${String(target.season).padStart(2, '0')}E${String(target.episode).padStart(2, '0')}`,
           });
           const candidates = outcome.results;
 
@@ -2215,6 +2209,8 @@ const Player: React.FC = () => {
                   candidate.streamHandle,
                   candidate.size,
                   displayName,
+                  candidate.addonInstallationId,
+                  candidate.addonName,
                   directCacheIdentity,
                   false,
                   false,
@@ -2223,6 +2219,8 @@ const Player: React.FC = () => {
                   candidate.streamUrl!,
                   candidate.size,
                   displayName,
+                  candidate.addonInstallationId,
+                  candidate.addonName,
                   directCacheIdentity,
                   false,
                   false,
@@ -4995,6 +4993,8 @@ const Player: React.FC = () => {
                     effectiveStreamHandle,
                     directStreamSize,
                     addonDisplayName,
+                    selectedStream.torrent.addonInstallationId,
+                    selectedStream.torrent.addonName,
                     directCacheIdentity,
                     mpvLaunchSettings.cacheWholeFileEnabled,
                     addonSubtitlePrefs.autoFallback || addonSubtitlePrefs.alwaysUseWhisper,
@@ -5003,6 +5003,8 @@ const Player: React.FC = () => {
                     selectedStream.url,
                     selectedStream.torrent.size,
                     addonDisplayName,
+                    selectedStream.torrent.addonInstallationId,
+                    selectedStream.torrent.addonName,
                     directCacheIdentity,
                     mpvLaunchSettings.cacheWholeFileEnabled,
                     addonSubtitlePrefs.autoFallback || addonSubtitlePrefs.alwaysUseWhisper,

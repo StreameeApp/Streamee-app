@@ -6,9 +6,6 @@ import {
   type InstalledAddon,
   type InstalledAddonStream,
 } from './installed-addons';
-import { runPrioritizedFallback } from './prioritized-fallback';
-
-const ADDON_FALLBACK_STAGGER_MS = 800;
 
 export interface AddonSourceSearchRequest {
   imdbId: string;
@@ -18,6 +15,7 @@ export interface AddonSourceSearchRequest {
   onlyInstallationId?: string;
   skipInstallationIds?: string[];
   signal?: AbortSignal;
+  onProgress?: (outcome: AddonSourceSearchOutcome) => void;
 }
 
 export interface AddonSourceSearchOutcome {
@@ -168,25 +166,38 @@ export async function searchInstalledStreamAddons(
     };
   }
 
-  const fallback = await runPrioritizedFallback(addons, {
-    staggerMs: ADDON_FALLBACK_STAGGER_MS,
-    signal: request.signal,
-    run: (addon, signal) => searchAddon(addon, request, contentId, signal),
-    accepts: (results) => results.length > 0,
-  });
-  const failedInstallations = fallback.attempts.flatMap((attempt) => {
-    if (attempt.error === undefined) return [];
-    return [{
-      installationId: attempt.item.installationId,
-      addonName: attempt.item.manifest.name,
-      message: attempt.error instanceof Error ? attempt.error.message : String(attempt.error),
-    }];
+  const controller = new AbortController();
+  const abortFromCaller = () => controller.abort();
+  if (request.signal?.aborted) controller.abort();
+  else request.signal?.addEventListener('abort', abortFromCaller, { once: true });
+
+  const results: TorrentResult[] = [];
+  const attemptedInstallationIds = addons.map((addon) => addon.installationId);
+  const failedInstallations: AddonSourceSearchOutcome['failedInstallations'] = [];
+  const currentOutcome = (): AddonSourceSearchOutcome => ({
+    results: [...results],
+    attemptedInstallationIds: [...attemptedInstallationIds],
+    failedInstallations: [...failedInstallations],
+    hasCompatibleAddons: true,
   });
 
-  return {
-    results: fallback.winner?.value || [],
-    attemptedInstallationIds: fallback.startedItems.map((addon) => addon.installationId),
-    failedInstallations,
-    hasCompatibleAddons: true,
-  };
+  try {
+    await Promise.all(addons.map(async (addon) => {
+      controller.signal.throwIfAborted();
+      try {
+        results.push(...await searchAddon(addon, request, contentId, controller.signal));
+      } catch (error) {
+        controller.signal.throwIfAborted();
+        failedInstallations.push({
+          installationId: addon.installationId,
+          addonName: addon.manifest.name,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      request.onProgress?.(currentOutcome());
+    }));
+    return currentOutcome();
+  } finally {
+    request.signal?.removeEventListener('abort', abortFromCaller);
+  }
 }

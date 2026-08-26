@@ -54,3 +54,113 @@
 .main-content-inner > * {
   animation: fadeUpSoft var(--duration-page) var(--ease-out);
 }
+
+.update-toast {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 30;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 14px;
+  width: min(460px, calc(100vw - 44px));
+  padding: 15px 14px 15px 17px;
+  color: var(--text-primary);
+  background: rgba(17, 21, 29, 0.96);
+  border: 1px solid rgba(255, 107, 53, 0.42);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xl), 0 0 28px rgba(255, 107, 53, 0.12);
+  backdrop-filter: blur(20px);
+  animation: updateToastIn 220ms var(--ease-out);
+}
+
+.update-toast-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.update-toast-copy strong {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-toast-copy span {
+  color: var(--text-tertiary);
+  font-size: 12.5px;
+}
+
+.update-toast-action,
+.update-toast-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: inherit;
+  border: 0;
+  cursor: pointer;
+}
+
+.update-toast-action {
+  gap: 7px;
+  min-height: 36px;
+  padding: 0 13px;
+  color: #fff;
+  background: var(--accent);
+  border-radius: var(--radius-md);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.update-toast-action:hover {
+  background: var(--accent-hover);
+}
+
+.update-toast-dismiss {
+  width: 32px;
+  height: 32px;
+  color: var(--text-tertiary);
+  background: transparent;
+  border-radius: 50%;
+  font-size: 18px;
+}
+
+.update-toast-dismiss:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+@keyframes updateToastIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (max-width: 640px) {
+  .update-toast {
+    right: 14px;
+    bottom: 14px;
+    left: 14px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    width: auto;
+  }
+
+  .update-toast-action {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .update-toast-dismiss {
+    grid-column: 2;
+    grid-row: 1;
+  }
+}

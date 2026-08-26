@@ -144,16 +144,6 @@ export interface AudioNormalizerDebugInfo {
   }>;
 }
 
-interface PlayerStatus {
-  playing: boolean;
-  paused: boolean;
-  position: number;
-  duration: number;
-  volume: number;
-  mute: boolean;
-  filename: string;
-}
-
 interface Track {
   id: number;
   type: 'audio' | 'sub';
@@ -382,6 +372,8 @@ export interface IntroSkipperDetectionResult {
 
 interface StatisticsTransferEvent {
   source_type: 'webtorrent' | 'qbittorrent' | 'addon' | 'local';
+  source_id?: string | null;
+  source_name?: string | null;
   bytes: number;
 }
 
@@ -607,26 +599,8 @@ const tauriAPI = {
         throw e;
       }
     },
-    pause: async () => {},
-    resume: async () => {},
-    seek: async (position: number) => {
-      await invoke('seek_player', { position });
-    },
     seekTime: async (position: number, expectedFilename: string) => {
       await invoke('seek_player_time', { position, expectedFilename });
-    },
-    volume: async (_volume: number) => {},
-    mute: async (_muted: boolean) => {},
-    getStatus: async () => {
-      return {
-        playing: false,
-        paused: false,
-        position: 0,
-        duration: 0,
-        volume: 100,
-        mute: false,
-        filename: '',
-      } as PlayerStatus;
     },
     getTracks: async () => {
       try {
@@ -926,6 +900,8 @@ const tauriAPI = {
     sourceUrl: string,
     totalSize: number,
     displayName?: string,
+    addonInstallationId?: string,
+    addonName?: string,
     cacheIdentity?: string,
     cacheWholeFileEnabled = false,
     whisperDeduplicationEnabled = false,
@@ -935,6 +911,8 @@ const tauriAPI = {
       streamHandle: null,
       totalSize,
       displayName: displayName ?? null,
+      addonInstallationId: addonInstallationId ?? null,
+      addonName: addonName ?? null,
       cacheIdentity: cacheIdentity ?? null,
       cacheWholeFileEnabled,
       whisperDeduplicationEnabled,
@@ -943,6 +921,8 @@ const tauriAPI = {
     streamHandle: string,
     totalSize: number,
     displayName?: string,
+    addonInstallationId?: string,
+    addonName?: string,
     cacheIdentity?: string,
     cacheWholeFileEnabled = false,
     whisperDeduplicationEnabled = false,
@@ -952,6 +932,8 @@ const tauriAPI = {
       streamHandle,
       totalSize,
       displayName: displayName ?? null,
+      addonInstallationId: addonInstallationId ?? null,
+      addonName: addonName ?? null,
       cacheIdentity: cacheIdentity ?? null,
       cacheWholeFileEnabled,
       whisperDeduplicationEnabled,

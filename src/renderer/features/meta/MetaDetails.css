@@ -234,7 +234,6 @@
  .rating-badge,
  .meta-btn,
  .season-watched-count,
- .season-pack-btn,
  .season-watched-btn,
  .search-info {
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -1163,8 +1162,7 @@
   opacity: 0.55;
 }
 
-.torrents-sort,
-.seasons-actions {
+.torrents-sort {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1470,29 +1468,6 @@
   margin: 0;
 }
 
-.seasons-actions .meta-btn,
-.season-complete-btn {
-  min-height: 34px;
-  padding: 0 12px;
-  border-radius: var(--radius-lg);
-  font-size: 12px;
-}
-
-.season-complete-btn {
-  background: rgba(89, 51, 32, 0.42);
-  color: #ff9b68;
-  border-color: rgba(255, 107, 53, 0.16);
-  box-shadow: none;
-}
-
-.season-complete-btn:hover,
-.season-complete-btn.active {
-  background: rgba(89, 51, 32, 0.56);
-  color: #ffb28c;
-  border-color: rgba(255, 107, 53, 0.26);
-  box-shadow: none;
-}
-
 .seasons-browser {
   display: flex;
   flex-direction: column;
@@ -1601,7 +1576,6 @@
   flex-shrink: 0;
 }
 
-.season-pack-btn,
 .season-watched-btn,
 .season-watched-count {
   display: inline-flex;
@@ -1616,22 +1590,9 @@
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-.season-pack-btn,
 .season-watched-btn,
 .episode-watched-btn {
   transition: transform 180ms ease, background 180ms ease, border-color 180ms ease, color 180ms ease;
-}
-
-.season-pack-btn {
-  background: rgba(89, 51, 32, 0.42);
-  color: #ff9b68;
-  cursor: pointer;
-}
-
-.season-pack-btn:hover {
-  transform: translateY(-1px);
-  background: rgba(89, 51, 32, 0.56);
-  border-color: rgba(255, 107, 53, 0.24);
 }
 
 .season-watched-btn {
