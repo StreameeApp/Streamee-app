@@ -1555,7 +1555,9 @@ async function fetchQueuedXrelQuality(
 ): Promise<number> {
   let releases: XrelRelease[] = [];
   const searchedReleases: XrelRelease[] = [];
-  const searchNames = lookupNames(item).slice(0, 2);
+  const searchNames = lookupNames(item)
+    .filter((name) => normalizeXrelTitle(name).length >= 2)
+    .slice(0, 2);
   for (let index = 0; index < searchNames.length; index += 1) {
     if (index > 0) {
       if (!canRunBackgroundLookup()) break;
@@ -1869,7 +1871,10 @@ async function fetchReleasesForExtInfo(
 async function fetchXrelQualityForItem(
   item: XrelLookupItem
 ): Promise<number> {
-  for (const searchName of lookupNames(item).slice(0, 2)) {
+  const searchNames = lookupNames(item)
+    .filter((name) => normalizeXrelTitle(name).length >= 2)
+    .slice(0, 2);
+  for (const searchName of searchNames) {
     await waitForSearchSlot();
     const response = await xrelGet<XrelSearchResponse>('/search/ext_info.json', {
       q: searchName,

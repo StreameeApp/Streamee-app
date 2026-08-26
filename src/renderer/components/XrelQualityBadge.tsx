@@ -111,22 +111,30 @@ export default function XrelQualityBadge({
       register(queuePriority === 'library' ? 'library' : 'visible');
       return unregister;
     }
-    const observer = new IntersectionObserver((entries) => {
-      const entry = entries[0];
-      if (!entry?.isIntersecting) {
+    let isNearby = false;
+    let isVisible = false;
+    const syncRegistration = () => {
+      if (isVisible) {
+        register(queuePriority === 'library' ? 'library' : 'visible');
+      } else if (isNearby) {
+        register(queuePriority === 'library' ? 'library' : 'nearby');
+      } else {
         unregister();
-        return;
       }
-      const bounds = entry.boundingClientRect;
-      const isActuallyVisible = bounds.bottom >= 0
-        && bounds.top <= window.innerHeight
-        && bounds.right >= 0
-        && bounds.left <= window.innerWidth;
-      register(queuePriority === 'library' ? 'library' : isActuallyVisible ? 'visible' : 'nearby');
+    };
+    const nearbyObserver = new IntersectionObserver((entries) => {
+      isNearby = entries[0]?.isIntersecting ?? false;
+      syncRegistration();
     }, { rootMargin: '240px 0px' });
-    observer.observe(anchor);
+    const visibleObserver = new IntersectionObserver((entries) => {
+      isVisible = entries[0]?.isIntersecting ?? false;
+      syncRegistration();
+    });
+    nearbyObserver.observe(anchor);
+    visibleObserver.observe(anchor);
     return () => {
-      observer.disconnect();
+      nearbyObserver.disconnect();
+      visibleObserver.disconnect();
       unregister();
     };
   }, [badge, item.aliases, item.id, item.imdbId, item.name, item.originalName, item.type, item.year, queuePriority, snapshot.enabled, variant]);

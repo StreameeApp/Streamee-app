@@ -138,3 +138,11 @@ export const installUpdate = async () => {
     publish({ status: 'error', error: messageFromError(error) });
   }
 };
+
+export const downloadAndInstallUpdate = async () => {
+  await downloadUpdate();
+
+  if (snapshot.status === 'ready') {
+    await installUpdate();
+  }
+};

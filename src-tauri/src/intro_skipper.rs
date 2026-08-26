@@ -25,6 +25,7 @@ const SECONDARY_INTRO_OVERLAP_SECONDS: u64 = 60;
 const MIN_OUTRO_ANALYSIS_SECONDS: f64 = 2.0 * 60.0;
 const MAX_OUTRO_ANALYSIS_SECONDS: f64 = 12.0 * 60.0;
 const MIN_OUTRO_MATCH_SECONDS: f64 = 10.0;
+const MIN_CHAPTER_OUTRO_LEAD_SECONDS: f64 = 10.0;
 const MIN_INTRO_SECONDS: f64 = 15.0;
 const MIN_FUZZY_INTRO_SECONDS: f64 = 25.0;
 const MAX_INTRO_SECONDS: f64 = 2.0 * 60.0;
@@ -1401,7 +1402,7 @@ fn chapter_kind(title: &str) -> Option<ChapterKind> {
     }
     if matches!(
         title.as_str(),
-        "credits" | "ending" | "end credits" | "closing credits" | "ed"
+        "credits" | "outro" | "ending" | "end credits" | "closing credits" | "ed"
     ) || title.ends_with(" credits")
     {
         return Some(ChapterKind::Outro);
@@ -1460,7 +1461,11 @@ fn detect_chapter_segments(chapters: &[MpvChapter], duration: f64) -> PlayerChap
             {
                 result.recap = Some(segment)
             }
-            ChapterKind::Outro if result.outro.is_none() && segment.start_sec >= duration * 0.5 => {
+            ChapterKind::Outro
+                if result.outro.is_none()
+                    && segment.start_sec >= duration * 0.5
+                    && duration - segment.start_sec >= MIN_CHAPTER_OUTRO_LEAD_SECONDS =>
+            {
                 result.outro = Some(segment)
             }
             _ => {}
@@ -2535,6 +2540,29 @@ mod tests {
         assert_eq!(segments.recap.expect("recap").end_sec, 75.0);
         assert_eq!(segments.intro.expect("intro").end_sec, 135.0);
         assert_eq!(segments.outro.expect("outro").end_sec, 2_400.0);
+    }
+
+    #[test]
+    fn credits_chapter_must_start_at_least_ten_seconds_before_eof() {
+        for title in ["Credits", "Outro"] {
+            let accepted = detect_chapter_segments(
+                &[MpvChapter {
+                    title: title.to_string(),
+                    time: 590.0,
+                }],
+                600.0,
+            );
+            assert_eq!(accepted.outro.expect("outro at threshold").start_sec, 590.0);
+
+            let rejected = detect_chapter_segments(
+                &[MpvChapter {
+                    title: title.to_string(),
+                    time: 595.0,
+                }],
+                600.0,
+            );
+            assert!(rejected.outro.is_none());
+        }
     }
 
     #[test]

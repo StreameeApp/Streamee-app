@@ -26,7 +26,7 @@ import {
 import { openAudioNormalizerWindow } from './services/audio-normalizer-window';
 import {
   checkForUpdates,
-  downloadUpdate,
+  downloadAndInstallUpdate,
   getUpdaterSnapshot,
   subscribeUpdater,
 } from './services/updater';
@@ -1087,14 +1087,14 @@ const App: React.FC = () => {
         <aside className="update-toast" role="status" aria-live="polite">
           <div className="update-toast-copy">
             <strong>Streamee v{updaterSnapshot.version} is available</strong>
-            <span>A signed update is ready to download.</span>
+            <span>A signed update is ready to download and install.</span>
           </div>
           <button
             className="update-toast-action"
             type="button"
-            onClick={() => void downloadUpdate()}
+            onClick={() => void downloadAndInstallUpdate()}
           >
-            <FiDownload /> Download
+            <FiDownload /> Download and install
           </button>
           <button
             className="update-toast-dismiss"

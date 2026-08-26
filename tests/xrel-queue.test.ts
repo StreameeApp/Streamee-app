@@ -202,6 +202,12 @@ test('background queue handles priority, freshness, retries, offline recovery, q
     if (url.endsWith('/search/releases.json')) {
       const title = String(params.q ?? 'Unknown');
       backgroundQueries.push(title);
+      if (title.trim().length < 2) {
+        throw Object.assign(new Error(`invalid query ${title}`), {
+          isAxiosError: true,
+          response: { status: 400, data: { error: 'invalid_argument' }, headers },
+        });
+      }
       const throttleFailuresRemaining = searchThrottleFailures.get(title) ?? 0;
       if (throttleFailuresRemaining > 0) {
         searchThrottleFailures.set(title, throttleFailuresRemaining - 1);
@@ -398,6 +404,28 @@ test('background queue handles priority, freshness, retries, offline recovery, q
   await runNextTimer();
   assert.equal(backgroundQueries.at(-1), 'Duplicate Movie');
   assert.equal(service.getXrelQualitySnapshot().backgroundQueued, 0);
+
+  const shortTitlePoster = {
+    type: 'movie' as const,
+    name: 'V',
+    year: '2026',
+    imdbId: 'tt0000005',
+  };
+  const shortTitleQueryStart = backgroundQueries.length;
+  service.registerXrelQualityLookup(shortTitlePoster, 'visible');
+  await runTimersUntil(
+    () => service.getXrelQualitySnapshot().backgroundQueued === 0,
+    'invalid one-character xREL search did not complete as a negative lookup',
+  );
+  assert.deepEqual(
+    backgroundQueries.slice(shortTitleQueryStart),
+    [],
+    'one-character titles do not call the xREL search endpoint',
+  );
+  await runTimersUntil(
+    () => service.getXrelQualityBadge(shortTitlePoster)?.provider === 'srrdb',
+    'IMDb-based srrDB enrichment did not remain available for a one-character title',
+  );
 
   const priorityQueryStart = backgroundQueries.length;
   service.registerXrelQualityLookup({ type: 'movie', name: 'Nearby Movie', year: '2026' }, 'nearby');
