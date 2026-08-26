@@ -81,7 +81,10 @@ pub struct AddonManifestSnapshot {
 
 impl AddonManifestSnapshot {
     fn validate(&self) -> Result<(), String> {
-        if self.id.trim().is_empty() || self.version.trim().is_empty() || self.name.trim().is_empty() {
+        if self.id.trim().is_empty()
+            || self.version.trim().is_empty()
+            || self.name.trim().is_empty()
+        {
             return Err("The add-on manifest is missing its id, version, or name".to_string());
         }
         if self.resources.is_empty() {
@@ -205,112 +208,21 @@ fn secret_ref(installation_id: &str) -> String {
     format!("addon-manifest-url:{installation_id}")
 }
 
-#[cfg(windows)]
 fn vault_write(installation_id: &str, value: &str) -> Result<(), String> {
-    use windows::core::PWSTR;
-    use windows::Win32::Security::Credentials::{
-        CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
-    };
-
-    let mut target = credential_target(installation_id)
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut username = "Streamee"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut blob = value.as_bytes().to_vec();
-    let credential = CREDENTIALW {
-        Type: CRED_TYPE_GENERIC,
-        TargetName: PWSTR(target.as_mut_ptr()),
-        CredentialBlobSize: blob.len() as u32,
-        CredentialBlob: blob.as_mut_ptr(),
-        Persist: CRED_PERSIST_LOCAL_MACHINE,
-        UserName: PWSTR(username.as_mut_ptr()),
-        ..Default::default()
-    };
-    unsafe { CredWriteW(&credential, 0) }
+    crate::credential_vault::write(&credential_target(installation_id), value)
         .map_err(|error| format!("Windows Credential Manager rejected the add-on URL: {error}"))
 }
 
-#[cfg(windows)]
 fn vault_read(installation_id: &str) -> Result<Option<String>, String> {
-    use std::ptr::null_mut;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::ERROR_NOT_FOUND;
-    use windows::Win32::Security::Credentials::{
-        CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
-    };
-
-    let target = credential_target(installation_id)
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut credential: *mut CREDENTIALW = null_mut();
-    let result = unsafe {
-        CredReadW(
-            PCWSTR(target.as_ptr()),
-            CRED_TYPE_GENERIC,
-            None,
-            &mut credential,
-        )
-    };
-    if let Err(error) = result {
-        if error.code() == ERROR_NOT_FOUND.to_hresult() {
-            return Ok(None);
-        }
-        return Err(format!(
-            "Windows Credential Manager could not read the add-on URL: {error}"
-        ));
-    }
-    if credential.is_null() {
-        return Ok(None);
-    }
-    let value = unsafe {
-        let record = &*credential;
-        let bytes =
-            std::slice::from_raw_parts(record.CredentialBlob, record.CredentialBlobSize as usize);
-        let value = String::from_utf8(bytes.to_vec())
-            .map_err(|_| "The stored add-on URL is not valid UTF-8".to_string());
-        CredFree(credential.cast());
-        value
-    }?;
-    Ok(Some(value))
+    crate::credential_vault::read(&credential_target(installation_id)).map_err(|error| {
+        format!("Windows Credential Manager could not read the add-on URL: {error}")
+    })
 }
 
-#[cfg(windows)]
 fn vault_delete(installation_id: &str) -> Result<(), String> {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::ERROR_NOT_FOUND;
-    use windows::Win32::Security::Credentials::{CredDeleteW, CRED_TYPE_GENERIC};
-
-    let target = credential_target(installation_id)
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    match unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, None) } {
-        Ok(()) => Ok(()),
-        Err(error) if error.code() == ERROR_NOT_FOUND.to_hresult() => Ok(()),
-        Err(error) => Err(format!(
-            "Windows Credential Manager could not delete the add-on URL: {error}"
-        )),
-    }
-}
-
-#[cfg(not(windows))]
-fn vault_write(_installation_id: &str, _value: &str) -> Result<(), String> {
-    Err("Secure add-on URL storage is available only on Windows".to_string())
-}
-
-#[cfg(not(windows))]
-fn vault_read(_installation_id: &str) -> Result<Option<String>, String> {
-    Err("Secure add-on URL storage is available only on Windows".to_string())
-}
-
-#[cfg(not(windows))]
-fn vault_delete(_installation_id: &str) -> Result<(), String> {
-    Err("Secure add-on URL storage is available only on Windows".to_string())
+    crate::credential_vault::delete(&credential_target(installation_id)).map_err(|error| {
+        format!("Windows Credential Manager could not delete the add-on URL: {error}")
+    })
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -361,7 +273,9 @@ fn normalize_manifest_url(value: &str) -> Result<Url, String> {
         .ok_or_else(|| "The add-on manifest URL has no host".to_string())?;
     let loopback = is_loopback_host(host);
     if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-        return Err("Add-on URLs must use HTTPS; HTTP is allowed only for loopback add-ons".to_string());
+        return Err(
+            "Add-on URLs must use HTTPS; HTTP is allowed only for loopback add-ons".to_string(),
+        );
     }
     if host.eq_ignore_ascii_case("localhost") {
         url.set_host(Some("127.0.0.1"))
@@ -401,7 +315,9 @@ async fn client_for_url(url: &Url) -> Result<reqwest::Client, String> {
                 .iter()
                 .any(|address| is_forbidden_remote_address(address.ip()))
         {
-            return Err("The remote add-on resolved to a private or unsafe network address".to_string());
+            return Err(
+                "The remote add-on resolved to a private or unsafe network address".to_string(),
+            );
         }
         builder = builder.resolve_to_addrs(&host, &addresses);
     }
@@ -426,10 +342,15 @@ async fn fetch_json<T: DeserializeOwned>(url: &Url) -> Result<T, String> {
             }
         })?;
     if response.status().is_redirection() {
-        return Err("The add-on redirected to another address; install its final manifest URL".to_string());
+        return Err(
+            "The add-on redirected to another address; install its final manifest URL".to_string(),
+        );
     }
     if !response.status().is_success() {
-        return Err(format!("The add-on returned HTTP {}", response.status().as_u16()));
+        return Err(format!(
+            "The add-on returned HTTP {}",
+            response.status().as_u16()
+        ));
     }
     if response.content_length().unwrap_or(0) > MAX_JSON_BYTES as u64 {
         return Err("The add-on response is too large".to_string());
@@ -449,7 +370,11 @@ async fn fetch_json<T: DeserializeOwned>(url: &Url) -> Result<T, String> {
     serde_json::from_slice(&body).map_err(|_| "The add-on returned invalid JSON".to_string())
 }
 
-fn stream_resource_url(manifest_url: &Url, media_type: &str, content_id: &str) -> Result<Url, String> {
+fn stream_resource_url(
+    manifest_url: &Url,
+    media_type: &str,
+    content_id: &str,
+) -> Result<Url, String> {
     if media_type != "movie" && media_type != "series" {
         return Err("The add-on media type must be movie or series".to_string());
     }
@@ -466,8 +391,9 @@ fn stream_resource_url(manifest_url: &Url, media_type: &str, content_id: &str) -
 }
 
 fn read_manifest_url(installation_id: &str) -> Result<Url, String> {
-    let value = vault_read(installation_id)?
-        .ok_or_else(|| "The installed add-on URL is unavailable; reinstall the add-on".to_string())?;
+    let value = vault_read(installation_id)?.ok_or_else(|| {
+        "The installed add-on URL is unavailable; reinstall the add-on".to_string()
+    })?;
     normalize_manifest_url(&value)
 }
 
@@ -505,7 +431,9 @@ pub async fn install_addon(manifest_url: String) -> Result<InstalledAddonRecord,
 }
 
 #[tauri::command]
-pub async fn refresh_addon_manifest(installation_id: String) -> Result<AddonManifestSnapshot, String> {
+pub async fn refresh_addon_manifest(
+    installation_id: String,
+) -> Result<AddonManifestSnapshot, String> {
     let manifest_url = read_manifest_url(&installation_id)?;
     let manifest: AddonManifestSnapshot = fetch_json(&manifest_url).await?;
     manifest.validate()?;
@@ -513,7 +441,9 @@ pub async fn refresh_addon_manifest(installation_id: String) -> Result<AddonMani
 }
 
 #[tauri::command]
-pub async fn fetch_addon_streams(request: AddonStreamRequest) -> Result<Vec<AddonStreamResult>, String> {
+pub async fn fetch_addon_streams(
+    request: AddonStreamRequest,
+) -> Result<Vec<AddonStreamResult>, String> {
     let manifest_url = read_manifest_url(&request.installation_id)?;
     let stream_url = stream_resource_url(&manifest_url, &request.media_type, &request.content_id)?;
     let response: StremioStreamResponse = fetch_json(&stream_url).await?;
@@ -607,8 +537,10 @@ mod tests {
 
     #[test]
     fn normalizes_stremio_urls_without_discarding_configuration() {
-        let url = normalize_manifest_url("stremio://example.com/config-token/manifest.json?mode=one#ignored")
-            .unwrap();
+        let url = normalize_manifest_url(
+            "stremio://example.com/config-token/manifest.json?mode=one#ignored",
+        )
+        .unwrap();
         assert_eq!(
             url.as_str(),
             "https://example.com/config-token/manifest.json?mode=one"
@@ -623,7 +555,9 @@ mod tests {
 
     #[test]
     fn builds_stream_urls_from_configured_manifest_paths() {
-        let manifest = normalize_manifest_url("https://example.com/config/manifest.json?token=opaque").unwrap();
+        let manifest =
+            normalize_manifest_url("https://example.com/config/manifest.json?token=opaque")
+                .unwrap();
         let stream = stream_resource_url(&manifest, "series", "tt123:1:2").unwrap();
         assert_eq!(
             stream.as_str(),

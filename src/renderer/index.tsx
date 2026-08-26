@@ -3,6 +3,7 @@ import './services/logger';
 import './services/tauri';
 import './styles/global.css';
 import { initializeSharedRendererStorage } from './services/shared-storage';
+import { migrateLegacyApiKeys } from './services/api-keys';
 
 import { Buffer } from 'buffer';
 if (typeof window !== 'undefined') {
@@ -10,6 +11,11 @@ if (typeof window !== 'undefined') {
 }
 
 const bootstrap = async () => {
+  try {
+    await migrateLegacyApiKeys();
+  } catch (error) {
+    console.error('Failed to migrate legacy API keys to secure storage:', error);
+  }
   await initializeSharedRendererStorage();
   const container = document.getElementById('root');
 

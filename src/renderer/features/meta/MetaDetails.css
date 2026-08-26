@@ -1263,6 +1263,38 @@
   flex: 1;
 }
 
+.watch-provider-summary {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 12px;
+  flex: 1;
+}
+
+.watch-provider-logo {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  border-radius: 10px;
+  object-fit: cover;
+}
+
+.watch-provider-attribution {
+  align-self: flex-start;
+  margin-top: 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.watch-provider-attribution:hover {
+  color: var(--text-secondary);
+  text-decoration: underline;
+}
+
 .torrent-item-title {
   display: block;
   max-width: 100%;

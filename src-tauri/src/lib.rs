@@ -1,5 +1,7 @@
 mod addons;
+mod api_keys;
 mod audio_normalizer;
+mod credential_vault;
 mod discord_presence;
 mod intro_skipper;
 mod introdb;
@@ -20,9 +22,9 @@ use introdb::fetch_introdb_segments;
 use mpv_ipc::{
     ack_smart_next_request, fetch_player_tracks, get_pending_smart_next_request, get_player_info,
     get_playlist_info, load_file_replace_with_title, load_subtitle_file, playlist_add,
-    playlist_next, playlist_prev, seek_absolute_time,
-    set_media_title as set_mpv_media_title, set_player_track as set_mpv_player_track,
-    set_smart_next_available, show_player_message, start_player_observing, stop_player_observing,
+    playlist_next, playlist_prev, seek_absolute_time, set_media_title as set_mpv_media_title,
+    set_player_track as set_mpv_player_track, set_smart_next_available, show_player_message,
+    start_player_observing, stop_player_observing,
 };
 use sha1::{Digest, Sha1};
 use tauri_plugin_store::StoreExt;
@@ -8097,6 +8099,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             write_renderer_log_batch,
+            api_keys::get_api_key,
+            api_keys::has_api_key,
+            api_keys::set_api_key,
+            api_keys::clear_api_keys,
             addons::install_addon,
             addons::refresh_addon_manifest,
             addons::fetch_addon_streams,

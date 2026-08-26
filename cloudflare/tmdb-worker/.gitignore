@@ -1,0 +1,14 @@
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.secrets
+.secrets.*
+.wrangler/
+*.cpuprofile
+secrets.json
+*.private.pem
+*.private.key
+*.p12
+*.pfx
+node_modules/
+worker-configuration.d.ts

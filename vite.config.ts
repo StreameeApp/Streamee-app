@@ -1,6 +1,5 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import { nodePolyfills } from 'vite-plugin-node-polyfills';
 import { copyFileSync, existsSync, mkdirSync, rmSync, statSync, watch } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -61,31 +60,6 @@ export default defineConfig(async () => ({
   plugins: [
     mpvDevSyncPlugin(),
     react(),
-    nodePolyfills({
-      include: [
-        'buffer',
-        'process',
-        'util',
-        'stream',
-        'path',
-        'fs',
-        'os',
-        'crypto',
-        'events',
-        'querystring',
-        'url',
-        'zlib',
-        'net',
-        'tls',
-        'http',
-        'https',
-        'assert',
-        'buffer',
-        'constants',
-        'domain',
-        'sys',
-      ],
-    }),
   ],
   define: {
     global: 'globalThis',

@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { getCachedRequest, invalidateRequestCache } from './request-cache';
+import { getApiKey, setApiKey } from './api-keys';
 
 const OMDB_BASE = 'https://www.omdbapi.com/';
 const OMDB_RATING_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -13,21 +14,9 @@ interface OmdbResponse {
   Error?: string;
 }
 
-function getOmdbSettings(): { apiKey: string } {
-  try {
-    const stored = localStorage.getItem('streamee-omdb');
-    if (stored) {
-      return JSON.parse(stored);
-    }
-  } catch (e) {
-    console.error('Failed to load OMDB settings:', e);
-  }
-  return { apiKey: '' };
-}
-
 export async function getOmdbRating(imdbId: string): Promise<number | null> {
-  const settings = getOmdbSettings();
-  if (!settings.apiKey) {
+  const apiKey = await getApiKey('omdb');
+  if (!apiKey) {
     return null;
   }
 
@@ -35,7 +24,7 @@ export async function getOmdbRating(imdbId: string): Promise<number | null> {
     return await getCachedRequest(`omdb:rating:${imdbId}`, OMDB_RATING_CACHE_TTL_MS, async () => {
       const response = await axios.get<OmdbResponse>(OMDB_BASE, {
         params: {
-          apikey: settings.apiKey,
+          apikey: apiKey,
           i: imdbId,
           plot: 'short'
         }
@@ -50,12 +39,12 @@ export async function getOmdbRating(imdbId: string): Promise<number | null> {
       return null;
     });
   } catch (error) {
-    console.error('Failed to fetch OMDB rating:', error);
+    console.error('Failed to fetch OMDb rating:', error);
     return null;
   }
 }
 
-export function setOmdbSettings(settings: { apiKey: string }): void {
-  localStorage.setItem('streamee-omdb', JSON.stringify(settings));
+export async function setOmdbSettings(settings: { apiKey: string }): Promise<void> {
+  await setApiKey('omdb', settings.apiKey);
   invalidateRequestCache('omdb:');
 }

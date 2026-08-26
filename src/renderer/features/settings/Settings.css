@@ -1824,6 +1824,18 @@
   display: none;
 }
 
+.settings-api-controls {
+  grid-column: 2;
+  justify-self: end;
+  width: min(100%, 410px);
+  min-width: 0;
+}
+
+.settings-api-controls .settings-field,
+.settings-api-controls input {
+  width: 100%;
+}
+
 .settings-api-block > .settings-field input {
   width: min(100%, 410px);
   align-self: flex-end;
@@ -1838,11 +1850,16 @@
 }
 
 .settings-trakt-field .trakt-connect.connected {
-  flex-wrap: nowrap;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  width: min(100%, 410px);
+  margin-left: auto;
 }
 
 .settings-trakt-field .trakt-connected-actions {
   flex-wrap: nowrap;
+  justify-content: flex-start;
 }
 
 .settings-field input,
@@ -2092,6 +2109,27 @@
 
 #about .settings-about p {
   margin: 0;
+}
+
+.settings-attribution {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 7px 0 3px;
+}
+
+.settings-attribution-logo {
+  width: 78px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.settings-attribution-logo img {
+  display: block;
+  width: 100%;
+  height: auto;
 }
 
 .settings-legal {
@@ -2401,13 +2439,32 @@
   }
 
   .settings-api-copy,
-  .settings-api-block > .settings-field {
+  .settings-api-block > .settings-field,
+  .settings-api-controls {
     grid-column: auto;
     grid-row: auto;
+  }
+
+  .settings-api-controls {
+    width: 100%;
+  }
+
+  .settings-trakt-field .trakt-connect.connected {
+    width: 100%;
+    margin-left: 0;
   }
 }
 
 @media (max-width: 600px) {
+  .settings-trakt-field .trakt-connected-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .settings-trakt-field .trakt-btn {
+    width: 100%;
+  }
+
   .settings-header {
     position: relative;
     align-items: stretch;

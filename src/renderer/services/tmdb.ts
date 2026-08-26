@@ -7,9 +7,9 @@ import {
   type DiscoveryContentMode,
   type DiscoverySourcePage,
 } from './discovery-content';
-import { deleteCachedRequest, getCachedRequest, invalidateRequestCache } from './request-cache';
+import { deleteCachedRequest, getCachedRequest } from './request-cache';
+import { isTmdbServiceConfigured, tmdbClient } from './tmdb-api';
 
-const TMDB_BASE = 'https://api.themoviedb.org/3';
 const TMDB_DETAIL_CONCURRENCY = 4;
 const TMDB_DETAIL_MAX_RETRIES = 3;
 const TMDB_CATALOG_CACHE_TTL_MS = 15 * 60 * 1000;
@@ -19,6 +19,7 @@ const TMDB_CATALOG_PAGE_SIZE = 20;
 const TMDB_MAX_RESULT_PAGES = 500;
 const TMDB_ANIMATION_GENRE_ID = 16;
 const TMDB_JAPANESE_LANGUAGE_CODE = 'ja';
+const TMDB_DEFAULT_WATCH_REGION = 'US';
 let activeTmdbDetailRequests = 0;
 const tmdbDetailRequestQueue: Array<() => void> = [];
 
@@ -40,26 +41,35 @@ const waitForTmdbRetry = (attempt: number) => new Promise<void>((resolve) => {
   window.setTimeout(resolve, 300 * 2 ** attempt);
 });
 
-function getTmdbSettings(): { apiKey: string } {
+export function isTmdbConfigured(): boolean {
+  return isTmdbServiceConfigured;
+}
+
+export function detectSystemTmdbWatchRegion(): string {
   try {
-    const stored = localStorage.getItem('streamee-tmdb');
-    if (stored) {
-      return JSON.parse(stored);
-    }
-  } catch (e) {
-    console.error('Failed to load TMDB settings:', e);
+    const region = new Intl.Locale(Intl.DateTimeFormat().resolvedOptions().locale).region?.toUpperCase();
+    if (region && /^[A-Z]{2}$/.test(region)) return region;
+  } catch (error) {
+    console.warn('Failed to detect the system streaming region:', error);
   }
-  return { apiKey: '' };
+
+  return TMDB_DEFAULT_WATCH_REGION;
 }
 
-export function setTmdbSettings(settings: { apiKey: string }): void {
-  localStorage.setItem('streamee-tmdb', JSON.stringify(settings));
-  invalidateRequestCache('tmdb:');
-}
+export function getTmdbWatchRegion(): string {
+  try {
+    const stored = localStorage.getItem('streamee-settings');
+    if (stored) {
+      const region = JSON.parse(stored)?.watchRegion;
+      if (typeof region === 'string' && /^[A-Z]{2}$/i.test(region.trim())) {
+        return region.trim().toUpperCase();
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to load the streaming region:', error);
+  }
 
-export async function getTmdbApiKey(): Promise<string> {
-  const settings = getTmdbSettings();
-  return settings.apiKey;
+  return detectSystemTmdbWatchRegion();
 }
 
 interface TmdbSearchResult {
@@ -148,7 +158,6 @@ interface TmdbDetail {
 }
 
 interface TmdbDiscoverParams {
-  api_key: string;
   page: number;
   with_genres?: string;
   primary_release_year?: number;
@@ -178,6 +187,26 @@ export interface TmdbPerson {
 export interface TmdbPersonCreditPreview extends MetaPreview {
   character?: string;
   popularity?: number;
+}
+
+export interface TmdbWatchProvider {
+  id: number;
+  name: string;
+  logoUrl: string;
+  availability: Array<'Subscription' | 'Free' | 'With ads'>;
+}
+
+interface TmdbWatchProviderResult {
+  provider_id: number;
+  provider_name: string;
+  logo_path: string | null;
+  display_priority: number;
+}
+
+interface TmdbWatchProviderRegion {
+  flatrate?: TmdbWatchProviderResult[];
+  free?: TmdbWatchProviderResult[];
+  ads?: TmdbWatchProviderResult[];
 }
 
 function buildPosterUrl(path: string | null, size: string = 'w342'): string {
@@ -226,7 +255,6 @@ function mapTmdbItemToPreview(
 }
 
 function buildDiscoverParams(
-  settingsApiKey: string,
   page: number,
   options: TmdbDiscoverOptions,
   yearParamName: 'primary_release_year' | 'first_air_date_year',
@@ -243,7 +271,6 @@ function buildDiscoverParams(
     : options.language;
 
   return {
-    api_key: settingsApiKey,
     page,
     ...(genreIds.length > 0 ? { with_genres: genreIds.join(',') } : {}),
     ...(options.year !== null && options.year !== undefined ? { [yearParamName]: options.year } : {}),
@@ -256,12 +283,6 @@ async function fetchDiscoverMovies(
   options: TmdbDiscoverOptions,
   contentMode: DiscoveryContentMode = getDiscoveryContentMode()
 ): Promise<MetaPreview[]> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    console.warn('TMDB API key not configured');
-    return [];
-  }
-
   const sourceMode = contentMode === 'exclude-anime' ? 'all' : contentMode;
   const fetchSourcePage = (sourcePage: number): Promise<DiscoverySourcePage<MetaPreview>> => {
     const cacheKey = [
@@ -274,8 +295,8 @@ async function fetchDiscoverMovies(
     ].join(':');
 
     return getCachedRequest(cacheKey, TMDB_CATALOG_CACHE_TTL_MS, async () => {
-      const response = await axios.get<TmdbResponse<TmdbMovie>>(TMDB_BASE + '/discover/movie', {
-        params: buildDiscoverParams(settings.apiKey, sourcePage, options, 'primary_release_year', sourceMode)
+      const response = await tmdbClient.get<TmdbResponse<TmdbMovie>>('/discover/movie', {
+        params: buildDiscoverParams(sourcePage, options, 'primary_release_year', sourceMode)
       });
 
       return {
@@ -310,12 +331,6 @@ async function fetchDiscoverTv(
   options: TmdbDiscoverOptions,
   contentMode: DiscoveryContentMode = getDiscoveryContentMode()
 ): Promise<MetaPreview[]> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    console.warn('TMDB API key not configured');
-    return [];
-  }
-
   const sourceMode = contentMode === 'exclude-anime' ? 'all' : contentMode;
   const fetchSourcePage = (sourcePage: number): Promise<DiscoverySourcePage<MetaPreview>> => {
     const cacheKey = [
@@ -328,8 +343,8 @@ async function fetchDiscoverTv(
     ].join(':');
 
     return getCachedRequest(cacheKey, TMDB_CATALOG_CACHE_TTL_MS, async () => {
-      const response = await axios.get<TmdbResponse<TmdbTv>>(TMDB_BASE + '/discover/tv', {
-        params: buildDiscoverParams(settings.apiKey, sourcePage, options, 'first_air_date_year', sourceMode)
+      const response = await tmdbClient.get<TmdbResponse<TmdbTv>>('/discover/tv', {
+        params: buildDiscoverParams(sourcePage, options, 'first_air_date_year', sourceMode)
       });
 
       return {
@@ -360,22 +375,13 @@ async function fetchDiscoverTv(
 }
 
 async function fetchTmdbMovieCatalogPage(list: string, page: number): Promise<DiscoverySourcePage<MetaPreview>> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    console.warn('TMDB API key not configured');
-    return { items: [], hasMore: false };
-  }
-
   try {
     const url = list === 'trending'
-      ? `${TMDB_BASE}/trending/movie/week`
-      : `${TMDB_BASE}/movie/${list}`;
+      ? '/trending/movie/week'
+      : `/movie/${list}`;
     return await getCachedRequest(`tmdb:catalog:raw:movie:${list}:${page}`, TMDB_CATALOG_CACHE_TTL_MS, async () => {
-      const response = await axios.get<TmdbResponse<TmdbMovie>>(url, {
-        params: {
-          api_key: settings.apiKey,
-          page
-        }
+      const response = await tmdbClient.get<TmdbResponse<TmdbMovie>>(url, {
+        params: { page }
       });
 
       return {
@@ -390,22 +396,13 @@ async function fetchTmdbMovieCatalogPage(list: string, page: number): Promise<Di
 }
 
 async function fetchTmdbTvCatalogPage(list: string, page: number): Promise<DiscoverySourcePage<MetaPreview>> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    console.warn('TMDB API key not configured');
-    return { items: [], hasMore: false };
-  }
-
   try {
     const url = list === 'trending'
-      ? `${TMDB_BASE}/trending/tv/week`
-      : `${TMDB_BASE}/tv/${list}`;
+      ? '/trending/tv/week'
+      : `/tv/${list}`;
     return await getCachedRequest(`tmdb:catalog:raw:tv:${list}:${page}`, TMDB_CATALOG_CACHE_TTL_MS, async () => {
-      const response = await axios.get<TmdbResponse<TmdbTv>>(url, {
-        params: {
-          api_key: settings.apiKey,
-          page
-        }
+      const response = await tmdbClient.get<TmdbResponse<TmdbTv>>(url, {
+        params: { page }
       });
 
       return {
@@ -434,18 +431,8 @@ export async function getTmdbTvDiscover(
 }
 
 export async function getTmdbLanguages(): Promise<TmdbLanguage[]> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    console.warn('TMDB API key not configured');
-    return [];
-  }
-
   try {
-    const response = await axios.get<TmdbLanguage[]>(TMDB_BASE + '/configuration/languages', {
-      params: {
-        api_key: settings.apiKey
-      }
-    });
+    const response = await tmdbClient.get<TmdbLanguage[]>('/configuration/languages');
 
     return response.data;
   } catch (error) {
@@ -501,17 +488,10 @@ async function fetchTmdbSearchPage(
   page: number,
   signal?: AbortSignal,
 ): Promise<DiscoverySourcePage<MetaPreview>> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    console.warn('TMDB API key not configured');
-    return { items: [], hasMore: false };
-  }
-
   try {
     return await getCachedRequest(`tmdb:search:raw:${query.toLowerCase()}:${page}`, TMDB_CATALOG_CACHE_TTL_MS, async () => {
-      const response = await axios.get<TmdbResponse<TmdbSearchResult>>(TMDB_BASE + '/search/multi', {
+      const response = await tmdbClient.get<TmdbResponse<TmdbSearchResult>>('/search/multi', {
         params: {
-          api_key: settings.apiKey,
           query,
           page
         },
@@ -601,16 +581,9 @@ export async function searchTmdbPeople(
   page: number = 1,
   signal?: AbortSignal,
 ): Promise<TmdbPerson[]> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    console.warn('TMDB API key not configured');
-    return [];
-  }
-
   try {
-    const response = await axios.get<TmdbResponse<TmdbPersonSearchResult>>(TMDB_BASE + '/search/person', {
+    const response = await tmdbClient.get<TmdbResponse<TmdbPersonSearchResult>>('/search/person', {
       params: {
-        api_key: settings.apiKey,
         query,
         page
       },
@@ -631,18 +604,8 @@ export async function searchTmdbPeople(
 }
 
 export async function getTmdbPersonCredits(personId: number): Promise<TmdbPersonCreditPreview[]> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    console.warn('TMDB API key not configured');
-    return [];
-  }
-
   try {
-    const response = await axios.get<{ cast?: TmdbPersonCredit[] }>(`${TMDB_BASE}/person/${personId}/combined_credits`, {
-      params: {
-        api_key: settings.apiKey
-      }
-    });
+    const response = await tmdbClient.get<{ cast?: TmdbPersonCredit[] }>(`/person/${personId}/combined_credits`);
 
     const seen = new Set<string>();
     return (response.data.cast || [])
@@ -677,21 +640,14 @@ async function getTmdbItemById(
   tmdbId: number,
   overrides?: Partial<MetaPreview>
 ): Promise<MetaPreview | null> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    console.warn('TMDB API key not configured');
-    return null;
-  }
-
   const cacheKey = `${mediaType}:${tmdbId}`;
   const requestCacheKey = `tmdb:preview:${cacheKey}`;
   const detail = await getCachedRequest(requestCacheKey, TMDB_DETAIL_CACHE_TTL_MS, () =>
     withTmdbDetailSlot(async () => {
       for (let attempt = 0; attempt < TMDB_DETAIL_MAX_RETRIES; attempt += 1) {
         try {
-          const response = await axios.get<TmdbDetail>(`${TMDB_BASE}/${mediaType}/${tmdbId}`, {
+          const response = await tmdbClient.get<TmdbDetail>(`/${mediaType}/${tmdbId}`, {
             params: {
-              api_key: settings.apiKey,
               append_to_response: 'external_ids',
             }
           });
@@ -737,17 +693,11 @@ export async function enrichTmdbItemsById(
 }
 
 export async function getTmdbMeta(type: 'movie' | 'series', tmdbId: number) {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    return null;
-  }
-
   try {
     const endpoint = type === 'movie' ? 'movie' : 'tv';
     return await getCachedRequest(`tmdb:meta:${type}:${tmdbId}`, TMDB_DETAIL_CACHE_TTL_MS, async () => {
-      const response = await axios.get(`${TMDB_BASE}/${endpoint}/${tmdbId}`, {
+      const response = await tmdbClient.get(`/${endpoint}/${tmdbId}`, {
         params: {
-          api_key: settings.apiKey,
           append_to_response: type === 'series'
             ? 'credits,aggregate_credits,external_ids,alternative_titles,videos,images'
             : 'credits,external_ids,alternative_titles,videos,images',
@@ -836,6 +786,62 @@ export interface TrailerSource {
   url: string;
   embedUrl: string | null;
   source: 'tmdb' | 'kinocheck';
+}
+
+export async function getTmdbWatchProviders(
+  type: 'movie' | 'series',
+  tmdbId: number,
+  watchRegion: string = getTmdbWatchRegion(),
+): Promise<TmdbWatchProvider[]> {
+  const endpoint = type === 'movie' ? 'movie' : 'tv';
+  const normalizedRegion = /^[A-Z]{2}$/i.test(watchRegion.trim())
+    ? watchRegion.trim().toUpperCase()
+    : detectSystemTmdbWatchRegion();
+
+  try {
+    return await getCachedRequest(
+      `tmdb:watch-providers:${type}:${tmdbId}:${normalizedRegion}`,
+      TMDB_DETAIL_CACHE_TTL_MS,
+      async () => {
+        const response = await tmdbClient.get<{ results?: Record<string, TmdbWatchProviderRegion> }>(
+          `/${endpoint}/${tmdbId}/watch/providers`,
+        );
+        const providers = new Map<number, TmdbWatchProvider & { displayPriority: number }>();
+        const availabilityGroups = [
+          ['flatrate', 'Subscription'],
+          ['free', 'Free'],
+          ['ads', 'With ads'],
+        ] as const;
+
+        const region = response.data.results?.[normalizedRegion];
+        availabilityGroups.forEach(([key, label]) => {
+          (region?.[key] ?? []).forEach((provider) => {
+            const existing = providers.get(provider.provider_id);
+            if (existing) {
+              if (!existing.availability.includes(label)) existing.availability.push(label);
+              existing.displayPriority = Math.min(existing.displayPriority, provider.display_priority);
+              return;
+            }
+
+            providers.set(provider.provider_id, {
+              id: provider.provider_id,
+              name: provider.provider_name,
+              logoUrl: buildPosterUrl(provider.logo_path, 'original'),
+              availability: [label],
+              displayPriority: provider.display_priority,
+            });
+          });
+        });
+
+        return [...providers.values()]
+          .sort((a, b) => a.displayPriority - b.displayPriority || a.name.localeCompare(b.name))
+          .map(({ displayPriority: _displayPriority, ...provider }) => provider);
+      },
+    );
+  } catch (error) {
+    console.error('Failed to fetch TMDB watch providers:', error);
+    return [];
+  }
 }
 
 function getTrailerUrl(provider: TrailerProvider, key: string): string {
@@ -954,18 +960,13 @@ export async function getTrailerSources(
   initialTmdbSources: TrailerSource[] = []
 ): Promise<TrailerSource[]> {
   return getCachedRequest(`tmdb:trailers:${type}:${tmdbId}`, TMDB_DETAIL_CACHE_TTL_MS, async () => {
-    const settings = getTmdbSettings();
     const tmdbSources: TrailerSource[] = [...initialTmdbSources];
     const kinoCheckSourcesPromise = getKinoCheckTrailer(type, tmdbId);
 
-    if (settings.apiKey && tmdbSources.length === 0) {
+    if (tmdbSources.length === 0) {
       try {
         const endpoint = type === 'movie' ? 'movie' : 'tv';
-        const response = await axios.get(`${TMDB_BASE}/${endpoint}/${tmdbId}/videos`, {
-          params: {
-            api_key: settings.apiKey
-          }
-        });
+        const response = await tmdbClient.get(`/${endpoint}/${tmdbId}/videos`);
         tmdbSources.push(...mapTmdbVideosToTrailers(response.data.results ?? []));
       } catch (error) {
         console.error('Failed to fetch TMDB trailer:', error);
@@ -988,15 +989,8 @@ export async function getTrailerSources(
 }
 
 export async function getTmdbPoster(type: 'movie' | 'tv', tmdbId: number): Promise<string | null> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) return null;
-
   try {
-    const response = await axios.get(`${TMDB_BASE}/${type}/${tmdbId}`, {
-      params: {
-        api_key: settings.apiKey
-      }
-    });
+    const response = await tmdbClient.get(`/${type}/${tmdbId}`);
 
     const posterPath = response.data.poster_path;
     if (posterPath) {
@@ -1054,19 +1048,9 @@ function mapTmdbSeasons(seasons: Array<{
 }
 
 export async function getTmdbSeasons(tmdbId: number): Promise<Season[]> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    console.warn('TMDB API key not configured');
-    return [];
-  }
-
   try {
     return await getCachedRequest(`tmdb:seasons:${tmdbId}`, TMDB_EPISODE_CACHE_TTL_MS, async () => {
-      const response = await axios.get(`${TMDB_BASE}/tv/${tmdbId}`, {
-        params: {
-          api_key: settings.apiKey
-        }
-      });
+      const response = await tmdbClient.get(`/tv/${tmdbId}`);
 
       return mapTmdbSeasons(response.data.seasons || []);
     });
@@ -1077,19 +1061,9 @@ export async function getTmdbSeasons(tmdbId: number): Promise<Season[]> {
 }
 
 export async function getTmdbEpisodes(tmdbId: number, seasonNumber: number): Promise<EpisodeDetail[]> {
-  const settings = getTmdbSettings();
-  if (!settings.apiKey) {
-    console.warn('TMDB API key not configured');
-    return [];
-  }
-
   try {
     return await getCachedRequest(`tmdb:episodes:${tmdbId}:${seasonNumber}`, TMDB_EPISODE_CACHE_TTL_MS, async () => {
-      const response = await axios.get(`${TMDB_BASE}/tv/${tmdbId}/season/${seasonNumber}`, {
-        params: {
-          api_key: settings.apiKey
-        }
-      });
+      const response = await tmdbClient.get(`/tv/${tmdbId}/season/${seasonNumber}`);
 
       const episodes = response.data.episodes || [];
       return episodes.map((e: { id: number; name: string; overview: string; still_path: string | null; episode_number: number; season_number: number; air_date: string | null; runtime: number | null; vote_average: number }) => ({

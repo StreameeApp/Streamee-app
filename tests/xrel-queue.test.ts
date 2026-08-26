@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import axios from 'axios';
+import { tmdbClient } from '../src/renderer/services/tmdb-api.ts';
 
 interface FakeTimer {
   id: number;
@@ -18,7 +19,6 @@ test('background queue handles priority, freshness, retries, offline recovery, q
   });
 
   const storage = new Map<string, string>([
-    ['streamee-tmdb', JSON.stringify({ apiKey: 'test-tmdb-key' })],
     ['streamee-xrel-background-budget-v1', JSON.stringify({
       date: '2026-08-13',
       requests: 250,
@@ -142,6 +142,19 @@ test('background queue handles priority, freshness, retries, offline recovery, q
   let feedReleases: Array<Record<string, unknown>> = [];
   let srrdbRecentPages: Array<Array<Record<string, unknown>>> = [[]];
 
+  context.mock.method(tmdbClient, 'get', async (url: string) => {
+    const tmdbId = /\/movie\/(\d+)/.exec(url)?.[1];
+    const imdbId = tmdbId === '424242'
+      ? 'tt0000003'
+      : tmdbId === '424243' ? 'tt0000004' : tmdbId === '424244' ? 'tt0000005' : undefined;
+    return {
+      data: {
+        imdb_id: imdbId,
+      },
+      headers: {},
+    };
+  });
+
   context.mock.method(axios, 'get', async (url: string, config?: { params?: Record<string, unknown> }) => {
     allRequests.push(url);
     const params = config?.params ?? {};
@@ -151,20 +164,7 @@ test('background queue handles priority, freshness, retries, offline recovery, q
       'x-ratelimit-reset': String(Math.floor(providerResetAt / 1000)),
     };
 
-    if (url.includes('api.themoviedb.org/3/movie/')) {
-      const tmdbId = /\/movie\/(\d+)/.exec(url)?.[1];
-      const imdbId = tmdbId === '424242'
-        ? 'tt0000003'
-        : tmdbId === '424243' ? 'tt0000004' : tmdbId === '424244' ? 'tt0000005' : undefined;
-      return {
-        data: {
-          imdb_id: imdbId,
-        },
-        headers: {},
-      };
-    }
-
-    if (url.includes('api.srrdb.com')) {
+    if (new URL(url).hostname === 'api.srrdb.com') {
       if (url.includes('/search/date:')) {
         const page = Number(/\/page:(\d+)/.exec(url)?.[1] ?? 1);
         return {

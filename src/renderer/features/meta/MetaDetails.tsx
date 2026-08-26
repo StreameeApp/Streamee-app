@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { FiPlay, FiHeart, FiCheck, FiArrowLeft, FiDownload, FiExternalLink, FiArrowUp, FiArrowDown, FiFilm, FiTv, FiCircle, FiRefreshCw, FiFolder, FiFile, FiThumbsUp, FiThumbsDown, FiChevronRight, FiMoreHorizontal } from 'react-icons/fi';
 import { CastMember, MetaDetails as MetaDetailsType, MetaPreview, useStore, TorrentResult, LocalVideoFile } from '../../store';
-import { getTmdbMeta, getTrailerSources, getTmdbSeasons, getTmdbEpisodes, getTmdbPersonCredits, Season, EpisodeDetail, type TmdbPersonCreditPreview, type TrailerSource } from '../../services/tmdb';
+import { getTmdbMeta, getTrailerSources, getTmdbSeasons, getTmdbEpisodes, getTmdbPersonCredits, getTmdbWatchProviders, getTmdbWatchRegion, Season, EpisodeDetail, type TmdbPersonCreditPreview, type TmdbWatchProvider, type TrailerSource } from '../../services/tmdb';
 import { getOmdbRating } from '../../services/omdb';
 import { selectAddonResumeResult } from '../../services/addon-source-search';
 import { deduplicateResults, searchEnabledSourceProviders } from '../../services/source-search';
@@ -18,6 +18,7 @@ type SortBy = 'seeds' | 'size' | 'quality';
 type SortOrder = 'desc' | 'asc';
 type ActorCreditFilter = 'all' | 'movie' | 'series';
 const TORRENT_PAGE_SIZE = 20;
+const WATCH_PROVIDER_DISPLAY_LIMIT = 12;
 const TORRENT_ACTION_STATE_STORAGE_KEY = 'streamee-torrent-action-state';
 const CAST_CARD_MIN_WIDTH = 170;
 const CAST_CARD_GAP = 8;
@@ -136,6 +137,8 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   const [searchingAddonInstallationId, setSearchingAddonInstallationId] = useState<string | null>(null);
   const [torrentsError, setTorrentsError] = useState<string | null>(null);
   const [showTorrents, setShowTorrents] = useState(false);
+  const [watchProviders, setWatchProviders] = useState<TmdbWatchProvider[]>([]);
+  const [watchProvidersLoading, setWatchProvidersLoading] = useState(false);
   const [visibleTorrentCount, setVisibleTorrentCount] = useState(TORRENT_PAGE_SIZE);
   const [selectedIndexer, setSelectedIndexer] = useState('all');
   const stored = getStoredSortPreferences();
@@ -193,6 +196,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
 
   const tmdbId = meta.id.split(':')[1];
   const isTvShow = meta.type === 'series';
+  const watchRegion = getTmdbWatchRegion();
   const continueWatchingMetaId = isTvShow ? `tv:${tmdbId}` : meta.id;
   const continueWatchingItem = useMemo(
     () =>
@@ -906,6 +910,8 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       setLogoUrl(null);
       setShowTorrents(false);
       setTorrents([]);
+      setWatchProviders([]);
+      setWatchProvidersLoading(false);
       setSelectedIndexer('all');
       setSeasons([]);
       setSeasonsLoading(meta.type === 'series');
@@ -1233,11 +1239,42 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       if (isTvShow && !selectedEpisode) {
         return;
       }
+      if (availableSearchAddons.length === 0) {
+        torrentSearchAbortRef.current?.abort();
+        setTorrents([]);
+        setTorrentsError(null);
+        setTorrentsLoading(false);
+        setShowTorrents(true);
+        return;
+      }
       if (!showTorrents || torrents.length === 0) {
         handleSearchTorrents();
       }
     }
-  }, [details, secondaryMetadataReady, selectedEpisode, selectedSeason]);
+  }, [availableSearchAddons.length, details, secondaryMetadataReady, selectedEpisode, selectedSeason]);
+
+  useEffect(() => {
+    if (!secondaryMetadataReady || !details || availableSearchAddons.length > 0) {
+      setWatchProviders([]);
+      setWatchProvidersLoading(false);
+      return;
+    }
+
+    const tmdbIdNum = parseInt(tmdbId, 10);
+    if (Number.isNaN(tmdbIdNum)) return;
+
+    let cancelled = false;
+    setWatchProvidersLoading(true);
+    void getTmdbWatchProviders(meta.type, tmdbIdNum, watchRegion).then((providers) => {
+      if (!cancelled) setWatchProviders(providers);
+    }).finally(() => {
+      if (!cancelled) setWatchProvidersLoading(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [availableSearchAddons.length, details, meta.type, secondaryMetadataReady, tmdbId, watchRegion]);
 
   useEffect(() => () => {
     torrentSearchAbortRef.current?.abort();
@@ -1903,6 +1940,56 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       ))}
     </div>
   ) : null;
+  const displayedWatchProviders = watchProviders.slice(0, WATCH_PROVIDER_DISPLAY_LIMIT);
+  const officialWatchUrl = `https://www.themoviedb.org/${isTvShow ? 'tv' : 'movie'}/${tmdbId}/watch?locale=${watchRegion}`;
+  const officialWatchFallback = watchProvidersLoading ? (
+    <div className="torrents-loading">
+      <div className="loading-spinner" />
+      <span>Finding streaming options in {watchRegion}...</span>
+    </div>
+  ) : displayedWatchProviders.length === 0 ? (
+    <div className="torrents-empty">No streaming options are currently listed for {watchRegion}.</div>
+  ) : (
+    <>
+      <div className="torrents-list">
+        {displayedWatchProviders.map((provider) => (
+          <div key={provider.id} className="torrent-item">
+            <div className="watch-provider-summary">
+              {provider.logoUrl && <img src={provider.logoUrl} alt="" className="watch-provider-logo" />}
+              <div className="torrent-item-info">
+                <span className="torrent-item-title" title={provider.name}>{provider.name}</span>
+                <span className="torrent-item-meta">
+                  <span className="stat-item">{provider.availability.join(' / ')}</span>
+                  <span className="stat-divider">&bull;</span>
+                  <span className="stat-item">Available in {watchRegion}</span>
+                </span>
+              </div>
+            </div>
+            <div className="torrent-item-actions">
+              <button
+                type="button"
+                className="torrent-action-btn play"
+                onClick={() => void window.electronAPI.openExternal(officialWatchUrl)}
+                title={`View ${provider.name} availability on TMDB`}
+              >
+                <FiExternalLink /> View
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      <button
+        type="button"
+        className="watch-provider-attribution"
+        onClick={() => void window.electronAPI.openExternal('https://www.justwatch.com/')}
+      >
+        Availability by JustWatch
+      </button>
+    </>
+  );
+  const sourceCountLabel = availableSearchAddons.length === 0
+    ? displayedWatchProviders.length
+    : torrentCountLabel;
 
   return (
     <div className="meta-details">
@@ -2274,11 +2361,11 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
             <div className="meta-torrents">
               <div className="torrents-header">
                 <div className="torrents-heading">
-                  <h2 className="torrents-title">Sources ({torrentCountLabel})</h2>
+                  <h2 className="torrents-title">Sources ({sourceCountLabel})</h2>
                 </div>
                 <div className="torrents-toolbar">
                   {addonSearchActions}
-                  <div className="torrents-sort">
+                  {availableSearchAddons.length > 0 && <div className="torrents-sort">
                     <label className="dedup-toggle" title="Hide duplicate sources returned by add-ons">
                       <input
                         type="checkbox"
@@ -2319,10 +2406,10 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
                     >
                       {sortOrder === 'desc' ? <FiArrowDown /> : <FiArrowUp />}
                     </button>
-                  </div>
+                  </div>}
                 </div>
               </div>
-              {torrentsLoading && torrents.length === 0 ? (
+              {availableSearchAddons.length === 0 ? officialWatchFallback : torrentsLoading && torrents.length === 0 ? (
                 <div className="torrents-loading">
                   <div className="loading-spinner" />
                   <span>Searching...</span>
@@ -2570,12 +2657,12 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
                   <div className="meta-torrents">
                     <div className="torrents-header">
                       <div className="torrents-heading">
-                        <h2 className="torrents-title">Sources ({torrentCountLabel})</h2>
+                        <h2 className="torrents-title">Sources ({sourceCountLabel})</h2>
                         <span className="search-info">{activeSearchLabel}</span>
                       </div>
                       <div className="torrents-toolbar">
                         {addonSearchActions}
-                        <div className="torrents-sort">
+                        {availableSearchAddons.length > 0 && <div className="torrents-sort">
                           <label className="dedup-toggle" title="Hide duplicate sources returned by add-ons">
                             <input
                               type="checkbox"
@@ -2616,10 +2703,10 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
                           >
                             {sortOrder === 'desc' ? <FiArrowDown /> : <FiArrowUp />}
                           </button>
-                        </div>
+                        </div>}
                       </div>
                     </div>
-                    {torrentsLoading && torrents.length === 0 ? (
+                    {availableSearchAddons.length === 0 ? officialWatchFallback : torrentsLoading && torrents.length === 0 ? (
                       <div className="torrents-loading">
                         <div className="loading-spinner" />
                         <span>Searching...</span>

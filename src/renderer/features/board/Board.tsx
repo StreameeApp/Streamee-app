@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { FiChevronRight, FiHeart, FiEye, FiEyeOff, FiX, FiClock, FiBookmark, FiTrendingUp } from 'react-icons/fi';
 import { useStore, ContinueWatchingItem, ContinueWatchingViewItem, MetaPreview } from '../../store';
-import { enrichTmdbItemsById, EpisodeDetail, getTmdbApiKey, getTmdbEpisodes, getTmdbMovies, getTmdbSeasons, getTmdbTv } from '../../services/tmdb';
+import { enrichTmdbItemsById, EpisodeDetail, getTmdbEpisodes, getTmdbMovies, getTmdbSeasons, getTmdbTv, isTmdbConfigured } from '../../services/tmdb';
 import { getAnticipatedMovies, getAnticipatedShows, getTrendingMovies, getTrendingShows, hasTraktCredentials } from '../../services/trakt';
 import { pushUnwatchedToTrakt, pushWatchedToTrakt, pushWatchlistToTrakt } from '../../services/trakt-sync';
 import { createPerformanceTrace } from '../../services/performance';
@@ -319,11 +319,11 @@ const Board: React.FC = () => {
 
     const fetchCatalogs = async () => {
       try {
-        const apiKey = await getTmdbApiKey();
+        const tmdbAvailable = isTmdbConfigured();
         if (cancelled) return;
-        setTmdbConfigured(Boolean(apiKey));
-        if (!apiKey) {
-          console.warn('TMDB API key not configured');
+        setTmdbConfigured(tmdbAvailable);
+        if (!tmdbAvailable) {
+          console.warn('TMDB Worker URL not configured');
           boardCatalogSnapshot = [];
           setCatalogs([]);
           setLoading(false);
@@ -757,7 +757,7 @@ const Board: React.FC = () => {
     return (
       <div className="board">
         <div className="board-loading">
-          <span>Configure TMDB API key in Settings to view catalogs</span>
+          <span>TMDB service is not configured in this build</span>
         </div>
       </div>
     );
