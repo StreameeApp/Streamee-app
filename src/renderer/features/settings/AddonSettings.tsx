@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { FiCheck, FiExternalLink, FiMenu, FiPlus, FiRefreshCw, FiShield, FiTrash2, FiX } from 'react-icons/fi';
+import { FiCheck, FiMenu, FiPlus, FiRefreshCw, FiShield, FiTrash2, FiX } from 'react-icons/fi';
 import {
   installAddonFromManifestUrl,
   loadInstalledAddons,
@@ -11,8 +11,6 @@ import {
 } from '../../services/installed-addons';
 
 type AddonTestState = { status: 'testing' | 'success' | 'error'; message?: string };
-
-const ADDON_DIRECTORY_URL = 'https://stremio-addons.net/';
 
 const AddonSettings: React.FC = () => {
   const [addons, setAddons] = useState<InstalledAddon[]>([]);
@@ -106,13 +104,6 @@ const AddonSettings: React.FC = () => {
             <h3>Install from manifest</h3>
             <span>Paste the configured manifest URL supplied by an add-on you trust.</span>
           </div>
-          <button
-            className="addon-directory-link"
-            type="button"
-            onClick={() => void window.electronAPI.openExternal(ADDON_DIRECTORY_URL)}
-          >
-            Browse add-ons <FiExternalLink aria-hidden="true" />
-          </button>
         </div>
 
         <form
@@ -147,7 +138,7 @@ const AddonSettings: React.FC = () => {
           <div>
             <strong>Privacy and third-party notice</strong>
             <span>
-              Configured URLs stay in Windows Credential Manager and are never written to frontend storage or logs. Streamee supports Stremio-compatible add-ons but is not affiliated with or endorsed by Stremio, stremio-addons.net, or any installed add-on provider. Only install services you trust and use authorized sources.
+              Configured URLs stay in Windows Credential Manager and are never written to frontend storage or logs. Streamee supports Stremio-compatible add-ons but is not affiliated with or endorsed by Stremio or any installed add-on provider. Only install services you trust and use authorized sources.
             </span>
           </div>
         </div>

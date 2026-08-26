@@ -2215,6 +2215,143 @@
   margin: 0;
 }
 
+.settings-legal {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.settings-legal-heading {
+  padding: 18px 20px 12px;
+}
+
+.settings-legal-heading h3,
+.settings-legal-heading p {
+  margin: 0;
+}
+
+.settings-legal-heading h3 {
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 720;
+}
+
+.settings-legal-heading p {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.settings-legal-document {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.settings-legal-document:last-child {
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.settings-legal-document summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 15px 20px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.settings-legal-document summary::-webkit-details-marker {
+  display: none;
+}
+
+.settings-legal-document summary::after {
+  width: 7px;
+  height: 7px;
+  margin-left: auto;
+  border-right: 1.5px solid var(--text-muted);
+  border-bottom: 1.5px solid var(--text-muted);
+  content: '';
+  transform: rotate(45deg);
+  transition: transform 160ms ease;
+}
+
+.settings-legal-document[open] summary::after {
+  transform: rotate(225deg);
+}
+
+.settings-legal-document summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.settings-legal-summary-icon {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  place-items: center;
+  background: var(--accent-muted);
+  border-radius: var(--radius-md);
+  color: var(--accent);
+}
+
+.settings-legal-document summary > span:nth-child(2) {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.settings-legal-document summary strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.settings-legal-document summary small {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.settings-legal-body {
+  padding: 2px 20px 22px 62px;
+  color: var(--text-tertiary);
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+
+.settings-legal-body h4 {
+  margin: 18px 0 5px;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+}
+
+.settings-legal-body p,
+.settings-legal-body ul {
+  margin: 8px 0 0;
+}
+
+.settings-legal-body ul {
+  padding-left: 18px;
+}
+
+.settings-legal-body li + li {
+  margin-top: 6px;
+}
+
+.settings-legal-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.settings-legal-link svg {
+  width: 12px;
+  height: 12px;
+}
+
 #audio-normalizer > .settings-form > .settings-toggle:first-child {
   position: absolute;
   top: 17px;

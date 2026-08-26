@@ -32,6 +32,7 @@ import type { WhisperRuntimeInfo } from '../../services/tauri';
 import { useStore } from '../../store';
 import TraktConnect from '../trakt/TraktConnect';
 import AddonSettings from './AddonSettings';
+import LegalDocuments from './LegalDocuments';
 import { openAudioNormalizerWindow } from '../../services/audio-normalizer-window';
 import {
   checkForUpdates,
@@ -2765,7 +2766,9 @@ const Settings: React.FC = () => {
         <div className="settings-about">
           <p><strong>Streamee</strong> {appVersion ? `v${appVersion}` : 'v—'}</p>
           <p>A media application powered by MPV and user-configured source providers.</p>
+          <p>This product uses the TMDB API but is not endorsed or certified by TMDB.</p>
         </div>
+        <LegalDocuments onOpenExternal={openExternalLink} />
       </section>
         </div>
       </div>

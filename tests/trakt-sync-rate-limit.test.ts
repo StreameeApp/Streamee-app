@@ -9,6 +9,7 @@ const traktSource = readSource('src/renderer/services/trakt.ts');
 const syncSource = readSource('src/renderer/services/trakt-sync.ts');
 const connectSource = readSource('src/renderer/features/trakt/TraktConnect.tsx');
 const settingsSource = readSource('src/renderer/features/settings/Settings.tsx');
+const legalSource = readSource('src/renderer/features/settings/LegalDocuments.tsx');
 
 test('Trakt client globally spaces writes and honors 429 cooldown headers', () => {
   assert.match(traktSource, /const TRAKT_WRITE_INTERVAL_MS = 1100/);
@@ -81,7 +82,9 @@ test('Trakt application credentials stay behind the Streamee auth service', () =
 
 test('Settings does not expose or persist owner Trakt credentials', () => {
   assert.doesNotMatch(settingsSource, /Trakt Client ID|Trakt Client Secret|setTraktCredentials/);
-  assert.match(settingsSource, /no API credentials are required/);
+  assert.doesNotMatch(settingsSource, /no API credentials are required/);
+  assert.match(legalSource, /device authorization and token-refresh requests pass through Streamee/);
+  assert.match(legalSource, /Trakt OAuth access and refresh tokens/);
   assert.match(traktSource, /localStorage\.removeItem\(TRAKT_LEGACY_CREDENTIALS_KEY\)/);
 });
 

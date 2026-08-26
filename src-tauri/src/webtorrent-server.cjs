@@ -37,18 +37,6 @@ function writeLog(level, event, message, fields = {}) {
   })}\n`);
 }
 
-const TRACKERS = [
-  'udp://tracker.opentrackr.org:1337/announce',
-  'udp://tracker.openbittorrent.com:6969/announce',
-  'udp://open.tracker.cl:1337/announce',
-  'udp://tracker.torrent.eu.org:451/announce',
-  'udp://opentracker.i2p.rocks:6969/announce',
-  'udp://tracker1.bt.moack.co.kr:80/announce',
-  'udp://tracker.tiny-vps.com:6969/announce',
-  'udp://tracker.dler.org:6969/announce',
-  'udp://explodie.org:6969/announce',
-  'udp://open.stealth.si:80/announce',
-];
 const CLIENT_MAX_CONNS = 150;
 const CLIENT_NUMWANT = 82;
 const FORWARD_SEGMENT_BYTES = 128 * 1024 * 1024;
@@ -188,31 +176,6 @@ function attachTrackerStats(torrent) {
 
   trackerClient.__streameeTrackerStatsAttached = true;
   trackerClient.on('update', updateTrackerStatsFromResponse);
-}
-
-function enhanceMagnet(magnetUri) {
-  if (!magnetUri || !magnetUri.startsWith('magnet:?')) {
-    return magnetUri;
-  }
-
-  const existingTrackers = new Set();
-  for (const match of magnetUri.matchAll(/[?&]tr=([^&]+)/g)) {
-    try {
-      existingTrackers.add(decodeURIComponent(match[1]));
-    } catch {
-      existingTrackers.add(match[1]);
-    }
-  }
-
-  const fallbackTrackers = TRACKERS
-    .filter(tracker => !existingTrackers.has(tracker))
-    .map(tracker => `tr=${encodeURIComponent(tracker)}`);
-
-  if (fallbackTrackers.length === 0) {
-    return magnetUri;
-  }
-
-  return `${magnetUri}${magnetUri.includes('?') ? '&' : '?'}${fallbackTrackers.join('&')}`;
 }
 
 function persistentCacheKey(identity) {
@@ -1057,11 +1020,8 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
   }
 
   const resolvedTorrentSource = await resolveTorrentSource(magnetUri);
-  const enhancedMagnet = typeof resolvedTorrentSource === 'string'
-    ? enhanceMagnet(resolvedTorrentSource)
-    : resolvedTorrentSource;
-  const infoHash = typeof enhancedMagnet === 'string'
-    ? extractMagnetInfoHash(enhancedMagnet)
+  const infoHash = typeof resolvedTorrentSource === 'string'
+    ? extractMagnetInfoHash(resolvedTorrentSource)
     : null;
   const existingTorrent = findExistingTorrent(infoHash);
 
@@ -1137,7 +1097,7 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
       deselect: true,
       destroyStoreOnDestroy: !activeStreamCachePersistent,
     };
-    client.add(enhancedMagnet, addOptions, async (torrent) => {
+    client.add(resolvedTorrentSource, addOptions, async (torrent) => {
       currentTorrent = torrent;
       resetDownloadTransferTelemetry();
 
