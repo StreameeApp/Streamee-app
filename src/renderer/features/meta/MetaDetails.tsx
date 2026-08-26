@@ -1013,7 +1013,10 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       window.cancelAnimationFrame(initialPaintFrame);
       if (secondaryTimer !== undefined) window.clearTimeout(secondaryTimer);
     };
-  }, [availableSearchAddons.length, meta.id, meta.type, tmdbId, watchRegion]);
+  // Episode selection changes add-on availability for series. Keeping that
+  // derived value out of this dependency list prevents the title reset above
+  // from clearing the selected episode and immediately selecting it again.
+  }, [meta.id, meta.type, tmdbId, watchRegion]);
 
   useEffect(() => {
     let cancelled = false;
