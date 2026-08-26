@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { FiChevronRight, FiHeart, FiEye, FiEyeOff, FiX, FiClock, FiBookmark, FiTrendingUp } from 'react-icons/fi';
 import { useStore, ContinueWatchingItem, ContinueWatchingViewItem, MetaPreview } from '../../store';
-import { enrichTmdbItemsById, EpisodeDetail, getTmdbEpisodes, getTmdbMovies, getTmdbSeasons, getTmdbTv, isTmdbConfigured } from '../../services/tmdb';
+import { enrichTmdbItemsById, EpisodeDetail, getTmdbBoardCatalogs, getTmdbEpisodes, getTmdbSeasons, isTmdbConfigured } from '../../services/tmdb';
 import { getAnticipatedMovies, getAnticipatedShows, getTrendingMovies, getTrendingShows, hasTraktCredentials } from '../../services/trakt';
 import { pushUnwatchedToTrakt, pushWatchedToTrakt, pushWatchlistToTrakt } from '../../services/trakt-sync';
 import { createPerformanceTrace } from '../../services/performance';
@@ -78,6 +78,7 @@ const CATALOG_ORDER = [
 ];
 let boardCatalogSnapshot: CatalogRow[] = [];
 let boardCatalogSnapshotMode: DiscoveryContentMode | null = null;
+const CONTINUE_VIEW_REFRESH_TTL_MS = 6 * 60 * 60 * 1000;
 
 function sortCatalogRows(rows: CatalogRow[]): CatalogRow[] {
   return [...rows].sort((a, b) => {
@@ -141,6 +142,28 @@ function isAvailableEpisode(episode: EpisodeDetail): boolean {
 
 function getEpisodeKey(tmdbId: number, season: number, episode: number): string {
   return `${tmdbId}:${season}:${episode}`;
+}
+
+function buildContinueViewFingerprint(
+  continueWatching: ContinueWatchingItem[],
+  watched: MetaPreview[],
+  watchedEpisodes: Record<string, string | boolean>,
+): string {
+  return JSON.stringify({
+    continueWatching: continueWatching.map((item) => ({
+      metaId: item.metaId,
+      type: item.type,
+      season: item.season,
+      episode: item.episode,
+      progress: item.progress,
+      pausedAt: item.pausedAt,
+    })).sort((a, b) => a.metaId.localeCompare(b.metaId)),
+    watchedMovies: watched
+      .filter((item) => item.type === 'movie')
+      .map((item) => item.id)
+      .sort(),
+    watchedEpisodes: Object.entries(watchedEpisodes).sort(([a], [b]) => a.localeCompare(b)),
+  });
 }
 
 function isUnfinishedResume(item: ContinueWatchingItem): boolean {
@@ -255,7 +278,11 @@ const Board: React.FC = () => {
   const [renderedFeatured, setRenderedFeatured] = useState<FeaturedItem | null>(null);
   const [heroReady, setHeroReady] = useState(false);
   const continueRefreshGenerationRef = useRef(0);
-  const { setSelectedMeta, continueWatching, continueWatchingView, setContinueWatchingView, addToContinueWatching, removeFromContinueWatching, setSelectedCatalog, setCatalogItems, setCatalogPage, setCatalogCacheKey, watchlist, addToWatchlist, removeFromWatchlist, watched, addToWatched, removeFromWatched, boardScrollPosition, setBoardScrollPosition, traktConnected, watchedEpisodes } = useStore();
+  const { setSelectedMeta, continueWatching, continueWatchingView, continueWatchingViewFingerprint, continueWatchingViewUpdatedAt, setContinueWatchingView, setContinueWatchingViewRefresh, addToContinueWatching, removeFromContinueWatching, setSelectedCatalog, setCatalogItems, setCatalogPage, setCatalogCacheKey, watchlist, addToWatchlist, removeFromWatchlist, watched, addToWatched, removeFromWatched, boardScrollPosition, setBoardScrollPosition, traktConnected, watchedEpisodes } = useStore();
+  const continueRefreshFingerprint = useMemo(
+    () => buildContinueViewFingerprint(continueWatching, watched, watchedEpisodes),
+    [continueWatching, watched, watchedEpisodes],
+  );
 
   useEffect(() => {
     const handleResize = () => setItemsPerRow(getItemsPerRow());
@@ -347,10 +374,12 @@ const Board: React.FC = () => {
             .then((items) => publishCatalog({ id: 'anticipated', title: formatDiscoveryCatalogTitle('Anticipated TV', discoveryContentMode), type: 'series', source: 'trakt', items, hideWatchedToggle: true }))
         ];
         const tasks: Array<Promise<void>> = [
-          getTmdbMovies('trending').then((items) => publishCatalog({ id: 'trending', title: formatDiscoveryCatalogTitle('Trending Movies', discoveryContentMode), type: 'movie', source: 'tmdb', items })),
-          getTmdbMovies('popular').then((items) => publishCatalog({ id: 'popular', title: formatDiscoveryCatalogTitle('Popular Movies', discoveryContentMode), type: 'movie', source: 'tmdb', items })),
-          getTmdbTv('trending').then((items) => publishCatalog({ id: 'trending', title: formatDiscoveryCatalogTitle('Trending TV', discoveryContentMode), type: 'series', source: 'tmdb', items })),
-          getTmdbTv('popular').then((items) => publishCatalog({ id: 'popular', title: formatDiscoveryCatalogTitle('Popular TV', discoveryContentMode), type: 'series', source: 'tmdb', items }))
+          getTmdbBoardCatalogs(discoveryContentMode).then((catalogs) => {
+            publishCatalog({ id: 'trending', title: formatDiscoveryCatalogTitle('Trending Movies', discoveryContentMode), type: 'movie', source: 'tmdb', items: catalogs.trendingMovies });
+            publishCatalog({ id: 'popular', title: formatDiscoveryCatalogTitle('Popular Movies', discoveryContentMode), type: 'movie', source: 'tmdb', items: catalogs.popularMovies });
+            publishCatalog({ id: 'trending', title: formatDiscoveryCatalogTitle('Trending TV', discoveryContentMode), type: 'series', source: 'tmdb', items: catalogs.trendingTv });
+            publishCatalog({ id: 'popular', title: formatDiscoveryCatalogTitle('Popular TV', discoveryContentMode), type: 'series', source: 'tmdb', items: catalogs.popularTv });
+          })
         ];
 
         if (hasTrakt) {
@@ -465,6 +494,13 @@ const Board: React.FC = () => {
 
   useEffect(() => {
     if (loading) return;
+    if (
+      continueWatchingViewFingerprint === continueRefreshFingerprint
+      && continueWatchingViewUpdatedAt > 0
+      && Date.now() - continueWatchingViewUpdatedAt < CONTINUE_VIEW_REFRESH_TTL_MS
+    ) {
+      return;
+    }
 
     let cancelled = false;
     const refreshGeneration = ++continueRefreshGenerationRef.current;
@@ -479,8 +515,21 @@ const Board: React.FC = () => {
         return null;
       }
       const seasons = await getTmdbSeasons(tmdbId);
+      const watchedCountsBySeason = new Map<number, number>();
+      for (const episodeKey of watchedEpisodeKeys) {
+        const parsed = parseWatchedEpisodeKey(episodeKey);
+        if (parsed?.tmdbId !== tmdbId) continue;
+        watchedCountsBySeason.set(
+          parsed.season,
+          (watchedCountsBySeason.get(parsed.season) ?? 0) + 1,
+        );
+      }
 
-      for (const season of seasons.sort((a, b) => a.season_number - b.season_number)) {
+      const candidateSeasons = seasons
+        .filter((season) => (watchedCountsBySeason.get(season.season_number) ?? 0) < season.episode_count)
+        .sort((a, b) => a.season_number - b.season_number);
+
+      for (const season of candidateSeasons) {
         if (!isCurrentRefresh()) {
           return null;
         }
@@ -584,32 +633,34 @@ const Board: React.FC = () => {
       const resolvedEpisodes: Array<{
         show: typeof upNextCandidates[number];
         nextEpisode: { season: number; episode: number } | null;
-        meta: MetaPreview | undefined;
       }> = [];
       let nextCandidateIndex = 0;
       const workerCount = Math.min(4, upNextCandidates.length);
       const workers = Array.from({ length: workerCount }, async () => {
         while (isCurrentRefresh() && nextCandidateIndex < upNextCandidates.length) {
           const show = upNextCandidates[nextCandidateIndex++];
-          const [nextEpisode, enriched] = await Promise.all([
-            findNextAvailableEpisode(show.tmdbId, watchedEpisodeKeys),
-            enrichTmdbItemsById([{ tmdbId: show.tmdbId, mediaType: 'tv' as const }])
-          ]);
+          const nextEpisode = await findNextAvailableEpisode(show.tmdbId, watchedEpisodeKeys);
           resolvedEpisodes.push({
             show,
             nextEpisode,
-            meta: enriched[0]
           });
         }
       });
       await Promise.all(workers);
+      const enrichedItems = await enrichTmdbItemsById(
+        resolvedEpisodes
+          .filter((item) => item.nextEpisode)
+          .map(({ show }) => ({ tmdbId: show.tmdbId, mediaType: 'tv' as const })),
+      );
+      const enrichedById = new Map(enrichedItems.map((item) => [item.id, item]));
       const upNextItems: ContinueWatchingViewItem[] = [];
 
-      for (const { show, nextEpisode, meta } of resolvedEpisodes) {
+      for (const { show, nextEpisode } of resolvedEpisodes) {
         if (!nextEpisode) {
           continue;
         }
 
+        const meta = enrichedById.get(`tv:${show.tmdbId}`);
         const fallback = continueWatching.find((item) => item.metaId === `tv:${show.tmdbId}`);
         upNextItems.push({
           metaId: `tv:${show.tmdbId}`,
@@ -632,6 +683,7 @@ const Board: React.FC = () => {
 
       if (isCurrentRefresh()) {
         setContinueWatchingView(merged);
+        setContinueWatchingViewRefresh(continueRefreshFingerprint, Date.now());
       }
     };
 
@@ -645,7 +697,7 @@ const Board: React.FC = () => {
       cancelled = true;
       window.clearTimeout(refreshTimeout);
     };
-  }, [continueWatching, loading, setContinueWatchingView, watched, watchedEpisodes]);
+  }, [continueRefreshFingerprint, continueWatching, continueWatchingViewFingerprint, continueWatchingViewUpdatedAt, loading, setContinueWatchingView, setContinueWatchingViewRefresh, watched, watchedEpisodes]);
 
   const sortedContinueWatching = [...continueWatchingView].sort((a, b) => {
     if (!a.pausedAt && !b.pausedAt) return 0;

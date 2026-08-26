@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 import { FiChevronLeft, FiChevronRight, FiCalendar, FiFilm, FiTv } from 'react-icons/fi';
 import { getCalendarShows, getCalendarMovies, getCalendarFinales, TraktCalendarShow, TraktCalendarMovie } from '../../services/trakt';
-import { getTmdbMeta, getTmdbPoster } from '../../services/tmdb';
+import { enrichTmdbItemsById } from '../../services/tmdb';
 import { useStore } from '../../store';
 import { getContinueWatchingProgressForTmdb } from '../../services/progress';
 import './Calendar.css';
@@ -152,28 +152,21 @@ const Calendar: React.FC = () => {
         return filter === 'finales' ? right - left : left - right;
       });
 
-      for (const item of allItems) {
-        if (item.tmdbId && (!item.poster || item.rating === undefined)) {
-          const tmdbType = item.type === 'show' ? 'tv' : 'movie';
-          const tmdbMeta = await getTmdbMeta(tmdbType === 'movie' ? 'movie' : 'series', item.tmdbId);
-          if (!isCurrentRequest()) return;
-
-          if (tmdbMeta?.meta) {
-            if (!item.poster && tmdbMeta.meta.poster) {
-              item.poster = tmdbMeta.meta.poster;
-            }
-            if (item.rating === undefined && tmdbMeta.meta.tmdbRating !== undefined) {
-              item.rating = tmdbMeta.meta.tmdbRating;
-            }
-          } else if (!item.poster) {
-            const tmdbPoster = await getTmdbPoster(tmdbType, item.tmdbId);
-            if (!isCurrentRequest()) return;
-
-            if (tmdbPoster) {
-              item.poster = tmdbPoster;
-            }
-          }
-        }
+      const itemsNeedingMetadata = allItems.filter((item) => !item.poster || item.rating === undefined);
+      const enrichedItems = await enrichTmdbItemsById(itemsNeedingMetadata.map((item) => ({
+        tmdbId: item.tmdbId,
+        mediaType: item.type === 'show' ? 'tv' as const : 'movie' as const,
+        name: item.title,
+        releaseDate: item.date,
+      })));
+      if (!isCurrentRequest()) return;
+      const enrichedById = new Map(enrichedItems.map((item) => [item.id, item]));
+      for (const item of itemsNeedingMetadata) {
+        const metadataId = `${item.type === 'show' ? 'tv' : 'movie'}:${item.tmdbId}`;
+        const metadata = enrichedById.get(metadataId);
+        if (!metadata) continue;
+        item.poster ||= metadata.poster;
+        item.rating ??= metadata.rating;
       }
 
       if (isCurrentRequest()) {

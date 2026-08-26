@@ -1553,10 +1553,8 @@ function releaseMatchesItem(
 async function fetchQueuedXrelQuality(
   item: XrelLookupItem
 ): Promise<number> {
-  const tmdbImdbId = await resolveTmdbImdbId(item);
-  const resolvedItem = tmdbImdbId ? { ...item, imdbId: tmdbImdbId } : item;
-  if (tmdbImdbId) rememberResolvedIdentityAlias(item, tmdbImdbId);
   let releases: XrelRelease[] = [];
+  const searchedReleases: XrelRelease[] = [];
   const searchNames = lookupNames(item).slice(0, 2);
   for (let index = 0; index < searchNames.length; index += 1) {
     if (index > 0) {
@@ -1569,23 +1567,36 @@ async function fetchQueuedXrelQuality(
       p2p: true,
       limit: 25,
     }, true, 'background');
-    releases = [
+    const searchReleases = [
       ...(response.data.results ?? []),
       ...(response.data.p2p_results ?? []),
-    ].filter((release) => releaseMatchesItem(release, resolvedItem));
+    ];
+    searchedReleases.push(...searchReleases);
+    releases = searchReleases.filter((release) => releaseMatchesItem(release, item));
     if (releases.length > 0) break;
   }
-  if (!resolvedImdbId(resolvedItem)) {
-    const candidateImdbIds = new Set(
-      releases.map((release) => imdbIdFromUris(release.ext_info?.uris)).filter(Boolean),
-    );
-    if (candidateImdbIds.size > 1) releases = [];
-  }
-  const matchedImdbIds = new Set(
+
+  let matchedImdbIds = new Set(
     releases
       .map((release) => imdbIdFromUris(release.ext_info?.uris))
       .filter((imdbId): imdbId is string => !!imdbId),
   );
+  if (!resolvedImdbId(item) && matchedImdbIds.size === 1) {
+    rememberResolvedIdentityAlias(item, [...matchedImdbIds][0]);
+  } else if (!resolvedImdbId(item) && item.id && (releases.length === 0 || matchedImdbIds.size !== 1)) {
+    const tmdbImdbId = await resolveTmdbImdbId(item);
+    if (tmdbImdbId) {
+      rememberResolvedIdentityAlias(item, tmdbImdbId);
+      const resolvedItem = { ...item, imdbId: tmdbImdbId };
+      releases = searchedReleases.filter((release) => releaseMatchesItem(release, resolvedItem));
+      matchedImdbIds = new Set(
+        releases
+          .map((release) => imdbIdFromUris(release.ext_info?.uris))
+          .filter((imdbId): imdbId is string => !!imdbId),
+      );
+    }
+  }
+  if (!resolvedImdbId(item) && matchedImdbIds.size > 1) releases = [];
   if (matchedImdbIds.size === 1) {
     rememberResolvedIdentityAlias(item, [...matchedImdbIds][0]);
   }
@@ -1767,26 +1778,21 @@ function mergeLookupItem(current: XrelLookupItem, incoming: XrelLookupItem): Xre
   };
 }
 
-function dispatchResolvedIdentity(item: XrelLookupItem, priority: XrelQueuePriority): void {
-  const knownImdbId = resolvedImdbId(item);
-  if (knownImdbId) {
-    enqueueSrrdbQualityEnrichment({ ...item, imdbId: knownImdbId }, priority);
+function dispatchKnownIdentity(item: XrelLookupItem, priority: XrelQueuePriority): void {
+  const imdbId = resolvedImdbId(item);
+  if (imdbId) {
+    enqueueSrrdbQualityEnrichment({ ...item, imdbId }, priority);
     return;
   }
-  if (!item.id) return;
+  if (!item.id || !isOnline() || readBackgroundPaused() || canRunBackgroundLookup()) return;
 
-  void resolveTmdbImdbId(item).then((imdbId) => {
-    if (!imdbId) return;
-    const changed = rememberResolvedIdentityAlias(item, imdbId);
-    const key = lazyLookupKey(item);
-    const queuedEntry = backgroundQueue.get(key);
-    if (queuedEntry) {
-      queuedEntry.item = mergeLookupItem(queuedEntry.item, { ...item, imdbId });
-      persistBackgroundQueue();
+  void resolveTmdbImdbId(item).then((resolvedId) => {
+    if (!resolvedId) return;
+    if (rememberResolvedIdentityAlias(item, resolvedId)) {
+      persistCache();
+      emitChange();
     }
-    if (changed) persistCache();
-    enqueueSrrdbQualityEnrichment({ ...item, imdbId }, priority);
-    emitChange();
+    enqueueSrrdbQualityEnrichment({ ...item, imdbId: resolvedId }, priority);
   });
 }
 
@@ -1817,7 +1823,7 @@ export function registerXrelQualityLookup(
   persistBackgroundQueue();
   emitChange();
   scheduleBackgroundWorker();
-  dispatchResolvedIdentity(entry.item, queueEntryEffectivePriority(entry));
+  dispatchKnownIdentity(entry.item, queueEntryEffectivePriority(entry));
   return () => {
     const current = backgroundQueue.get(key);
     if (!current || !current.registrations.delete(registrationId)) return;

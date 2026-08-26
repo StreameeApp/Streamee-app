@@ -25,7 +25,7 @@ import {
   TraktWatchedShow,
   TraktWatchedMovie
 } from '../services/trakt';
-import { getTmdbMeta, getTmdbPoster } from '../services/tmdb';
+import { enrichTmdbItemsById } from '../services/tmdb';
 import { useStore, MetaPreview, ContinueWatchingItem, PendingTraktHistoryAction, PendingTraktWatchlistAction } from '../store';
 
 function mergeContinueWatching(
@@ -114,6 +114,25 @@ function dedupeByMetaId(items: ContinueWatchingItem[]): ContinueWatchingItem[] {
   return Array.from(deduped.values());
 }
 
+async function enrichContinueWatchingPosters(
+  items: ContinueWatchingItem[],
+): Promise<ContinueWatchingItem[]> {
+  const previews = await enrichTmdbItemsById(items.flatMap((item) => {
+    const match = /^(movie|tv):(\d+)$/.exec(item.metaId);
+    if (!match) return [];
+    return [{
+      tmdbId: Number(match[2]),
+      mediaType: match[1] as 'movie' | 'tv',
+      name: item.title,
+    }];
+  }));
+  const postersById = new Map(previews.map((preview) => [preview.id, preview.poster]));
+  return items.map((item) => ({
+    ...item,
+    poster: item.poster || postersById.get(item.metaId) || '',
+  }));
+}
+
 async function buildContinueWatchingFromEpisodeHistory(
   historyItems: TraktHistoryItem[],
   watchedEpisodeKeys: Set<string>
@@ -153,12 +172,11 @@ async function buildContinueWatchingFromEpisodeHistory(
       continue;
     }
 
-    const poster = await getTmdbPoster('tv', tmdbId);
     continueItems.push({
       metaId: `tv:${tmdbId}`,
       type: 'series',
       title: show.title,
-      poster: poster || '',
+      poster: '',
       progress: 0,
       pausedAt: item.watched_at,
       episodeId: `${nextSeason}:${nextEpisode}`,
@@ -167,7 +185,7 @@ async function buildContinueWatchingFromEpisodeHistory(
     });
   }
 
-  return continueItems;
+  return enrichContinueWatchingPosters(continueItems);
 }
 
 const TRAKT_STARTUP_BASELINE_KEY = 'streamee-trakt-startup-push-baseline-v1';
@@ -246,6 +264,36 @@ function hasReusableEnrichedMetadata(item?: MetaPreview): boolean {
     item.rating !== undefined &&
     item.imdbId
   );
+}
+
+async function enrichMetaPreviews(items: MetaPreview[]): Promise<MetaPreview[]> {
+  const targets = items.flatMap((item) => {
+    if (hasReusableEnrichedMetadata(item)) return [];
+    const match = /^(movie|tv):(\d+)$/.exec(item.id);
+    if (!match) return [];
+    return [{
+      tmdbId: Number(match[2]),
+      mediaType: match[1] as 'movie' | 'tv',
+      name: item.name,
+      releaseDate: item.releaseDate,
+    }];
+  });
+  if (targets.length === 0) return items;
+
+  const enriched = await enrichTmdbItemsById(targets);
+  const enrichedById = new Map(enriched.map((item) => [item.id, item]));
+  return items.map((item) => {
+    const metadata = enrichedById.get(item.id);
+    if (!metadata) return item;
+    return {
+      ...item,
+      poster: item.poster || metadata.poster,
+      background: item.background || metadata.background,
+      rating: item.rating ?? metadata.rating,
+      year: item.year || metadata.year,
+      imdbId: item.imdbId || metadata.imdbId,
+    };
+  });
 }
 
 function getOldestListedAt(a?: string, b?: string): string | undefined {
@@ -444,35 +492,6 @@ function movieToMetaPreview(movie: { title?: string; year?: number; ids?: { tmdb
   };
 }
 
-async function enrichMetaPreview(item: MetaPreview): Promise<MetaPreview> {
-  const tmdbId = parseTmdbId(item.id);
-  const tmdbType = item.type === 'movie' ? 'movie' : 'series';
-  const posterType = item.type === 'movie' ? 'movie' : 'tv';
-
-  if (tmdbId) {
-    const tmdbMeta = await getTmdbMeta(tmdbType, tmdbId);
-    if (tmdbMeta?.meta) {
-      return {
-        ...item,
-        poster: item.poster || tmdbMeta.meta.poster,
-        rating: item.rating ?? tmdbMeta.meta.tmdbRating,
-        background: item.background || tmdbMeta.meta.background,
-        year: item.year || tmdbMeta.meta.year,
-        imdbId: item.imdbId || tmdbMeta.meta.imdbId
-      };
-    }
-
-    if (!item.poster) {
-      const poster = await getTmdbPoster(posterType, tmdbId);
-      if (poster) {
-        return { ...item, poster };
-      }
-    }
-  }
-
-  return item;
-}
-
 export async function checkTraktConnection(): Promise<boolean> {
   try {
     return await hasTraktAccess();
@@ -657,9 +676,7 @@ async function syncFromTraktInternal(
     const BATCH_SIZE = 20;
     for (let i = 0; i < traktWatchedWithDates.length; i += BATCH_SIZE) {
       const batch = traktWatchedWithDates.slice(i, i + BATCH_SIZE);
-      const enrichedBatch = await Promise.all(batch.map((item) =>
-        hasReusableEnrichedMetadata(item) ? item : enrichMetaPreview(item)
-      ));
+      const enrichedBatch = await enrichMetaPreviews(batch);
       traktWatchedWithDates.splice(i, enrichedBatch.length, ...enrichedBatch);
     }
 
@@ -673,7 +690,7 @@ async function syncFromTraktInternal(
 
     const existingWatchlist = store.watchlist;
     const existingWatchlistById = new Map(existingWatchlist.map((item) => [item.id, item]));
-    const traktWatchlist: MetaPreview[] = [];
+    let traktWatchlist: MetaPreview[] = [];
     for (let i = 0; i < watchlist.length; i++) {
       const item = watchlist[i];
       let poster: string | undefined;
@@ -684,7 +701,7 @@ async function syncFromTraktInternal(
           const existing = existingWatchlistById.get(preview.id);
           const enriched = existing && hasReusableEnrichedMetadata(existing)
             ? { ...existing, ...preview, poster: existing.poster, listedAt }
-            : await enrichMetaPreview({ ...preview, listedAt });
+            : { ...preview, listedAt };
           poster = enriched.poster;
           traktWatchlist.push({ ...enriched, poster, listedAt });
         }
@@ -694,13 +711,14 @@ async function syncFromTraktInternal(
           const existing = existingWatchlistById.get(preview.id);
           const enriched = existing && hasReusableEnrichedMetadata(existing)
             ? { ...existing, ...preview, poster: existing.poster, listedAt }
-            : await enrichMetaPreview({ ...preview, listedAt });
+            : { ...preview, listedAt };
           poster = enriched.poster;
           traktWatchlist.push({ ...enriched, poster, listedAt });
         }
       }
     }
 
+    traktWatchlist = await enrichMetaPreviews(traktWatchlist);
     const mergedWatchlist = mergeWatchlistByListedAt(existingWatchlist, traktWatchlist);
 
     store.setWatchlist(mergedWatchlist);
@@ -737,12 +755,11 @@ async function syncFromTraktInternal(
               continue;
             }
 
-            const poster = await getTmdbPoster('tv', progress.show.ids.tmdb);
             item = {
               metaId: `tv:${progress.show.ids.tmdb}`,
               type: 'series',
               title: progress.show.title,
-              poster: poster || '',
+              poster: '',
               progress: progress.progress,
               pausedAt: progress.paused_at,
               episodeId: `${season}:${episode}`,
@@ -750,12 +767,11 @@ async function syncFromTraktInternal(
               episode
             };
           } else if (progress.movie) {
-            const poster = await getTmdbPoster('movie', progress.movie.ids.tmdb);
             item = {
               metaId: `movie:${progress.movie.ids.tmdb}`,
               type: 'movie',
               title: progress.movie.title,
-              poster: poster || '',
+              poster: '',
               progress: progress.progress,
               pausedAt: progress.paused_at
             };
@@ -768,6 +784,11 @@ async function syncFromTraktInternal(
       }
     }
 
+    remoteContinueWatching.splice(
+      0,
+      remoteContinueWatching.length,
+      ...await enrichContinueWatchingPosters(remoteContinueWatching),
+    );
     const historyContinueWatching = await buildContinueWatchingFromEpisodeHistory(historyItems, watchedEpisodeKeys);
     const dedupedRemote = dedupeByMetaId([...remoteContinueWatching, ...historyContinueWatching]);
 

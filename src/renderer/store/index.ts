@@ -286,6 +286,8 @@ interface AppState {
   addonTransferSessionId: string | null;
   continueWatching: ContinueWatchingItem[];
   continueWatchingView: ContinueWatchingViewItem[];
+  continueWatchingViewFingerprint: string;
+  continueWatchingViewUpdatedAt: number;
   watchlist: MetaPreview[];
   watched: MetaPreview[];
   searchQuery: string;
@@ -393,6 +395,7 @@ interface AppState {
   ) => void;
   setContinueWatching: (items: ContinueWatchingItem[]) => void;
   setContinueWatchingView: (items: ContinueWatchingViewItem[]) => void;
+  setContinueWatchingViewRefresh: (fingerprint: string, updatedAt: number) => void;
   setTraktConnected: (connected: boolean) => void;
   setTraktToken: (token: string | null) => void;
   setTraktLastSync: (timestamp: number) => void;
@@ -455,6 +458,8 @@ export const useStore = create<AppState>()(
       addonTransferSessionId: null,
       continueWatching: [],
       continueWatchingView: [],
+      continueWatchingViewFingerprint: '',
+      continueWatchingViewUpdatedAt: 0,
       watchlist: [],
       watched: [],
       searchQuery: '',
@@ -702,6 +707,10 @@ export const useStore = create<AppState>()(
 
       setContinueWatching: (items) => set({ continueWatching: normalizeContinueWatchingItems(items) }),
       setContinueWatchingView: (items) => set({ continueWatchingView: items }),
+      setContinueWatchingViewRefresh: (continueWatchingViewFingerprint, continueWatchingViewUpdatedAt) => set({
+        continueWatchingViewFingerprint,
+        continueWatchingViewUpdatedAt,
+      }),
 
 
       setTraktConnected: (traktConnected) => set({ traktConnected }),
@@ -873,6 +882,12 @@ export const useStore = create<AppState>()(
           audioNormalizerPreset: normalizeAudioNormalizerPreset(nextState.audioNormalizerPreset),
           continueWatching: normalizeContinueWatchingItems(nextState.continueWatching),
           continueWatchingView: Array.isArray(nextState.continueWatchingView) ? nextState.continueWatchingView : [],
+          continueWatchingViewFingerprint: typeof nextState.continueWatchingViewFingerprint === 'string'
+            ? nextState.continueWatchingViewFingerprint
+            : '',
+          continueWatchingViewUpdatedAt: typeof nextState.continueWatchingViewUpdatedAt === 'number'
+            ? nextState.continueWatchingViewUpdatedAt
+            : 0,
         } as AppState;
       },
       partialize: (state) => ({
@@ -880,6 +895,8 @@ export const useStore = create<AppState>()(
         watched: state.watched,
         continueWatching: state.continueWatching,
         continueWatchingView: state.continueWatchingView,
+        continueWatchingViewFingerprint: state.continueWatchingViewFingerprint,
+        continueWatchingViewUpdatedAt: state.continueWatchingViewUpdatedAt,
         traktConnected: state.traktConnected,
         traktToken: state.traktToken,
         traktLastSync: state.traktLastSync,

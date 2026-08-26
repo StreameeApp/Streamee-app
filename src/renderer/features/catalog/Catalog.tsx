@@ -525,9 +525,6 @@ const Catalog: React.FC = () => {
       container.addEventListener('scroll', checkScroll);
     }
     
-    // Also check every second for fast scrollers
-    const intervalId = setInterval(checkScroll, 1000);
-    
     // Check on resize
     const onResize = () => {
       if (initialLoadDone.current) {
@@ -540,7 +537,6 @@ const Catalog: React.FC = () => {
       if (container) {
         container.removeEventListener('scroll', checkScroll);
       }
-      clearInterval(intervalId);
       window.removeEventListener('resize', onResize);
     };
   }, [selectedCatalog, fetchCatalog, loadingMore, hasMore]);

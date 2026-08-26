@@ -7,14 +7,25 @@ import {
   type DiscoveryContentMode,
   type DiscoverySourcePage,
 } from './discovery-content';
-import { deleteCachedRequest, getCachedRequest } from './request-cache';
+import {
+  deleteCachedRequest,
+  getCachedRequest,
+  getPersistentlyCachedRequest,
+  readPersistentlyCachedValue,
+  writePersistentlyCachedValue,
+  writePersistentlyCachedValues,
+} from './request-cache';
 import { isTmdbServiceConfigured, tmdbClient } from './tmdb-api';
+import { getTmdbEpisodeCacheTtlMs } from './tmdb-request-policy';
 
 const TMDB_DETAIL_CONCURRENCY = 4;
 const TMDB_DETAIL_MAX_RETRIES = 3;
-const TMDB_CATALOG_CACHE_TTL_MS = 15 * 60 * 1000;
-const TMDB_DETAIL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
-const TMDB_EPISODE_CACHE_TTL_MS = 30 * 60 * 1000;
+const TMDB_PREVIEW_BATCH_SIZE = 20;
+const TMDB_CATALOG_CACHE_TTL_MS = 30 * 60 * 1000;
+const TMDB_SEARCH_CACHE_TTL_MS = 60 * 60 * 1000;
+const TMDB_DETAIL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const TMDB_IDENTITY_CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+const TMDB_SEASON_LIST_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const TMDB_CATALOG_PAGE_SIZE = 20;
 const TMDB_MAX_RESULT_PAGES = 500;
 const TMDB_ANIMATION_GENRE_ID = 16;
@@ -84,7 +95,7 @@ interface TmdbSearchResult {
   vote_average: number;
   genre_ids?: number[];
   original_language?: string;
-  genres?: Array<{ id: number }>;
+  genres?: Array<{ id: number; name?: string }>;
 }
 
 interface TmdbPersonSearchResult {
@@ -154,7 +165,11 @@ interface TmdbDetail {
   vote_average: number;
   genre_ids?: number[];
   original_language?: string;
-  genres?: Array<{ id: number }>;
+  genres?: Array<{ id: number; name?: string }>;
+  imdb_id?: string;
+  external_ids?: { imdb_id?: string };
+  original_title?: string;
+  original_name?: string;
 }
 
 interface TmdbDiscoverParams {
@@ -175,6 +190,59 @@ interface TmdbDiscoverOptions {
   genreId?: number | null;
   year?: number | null;
   language?: string | null;
+}
+
+interface TmdbMetaData extends TmdbDetail {
+  original_title?: string;
+  original_name?: string;
+  overview?: string;
+  runtime?: number;
+  episode_run_time?: number[];
+  imdb_id?: string;
+  credits?: {
+    cast?: TmdbCastCredit[];
+    crew?: Array<{ job: string; name: string }>;
+  };
+  aggregate_credits?: { cast?: TmdbCastCredit[] };
+  external_ids?: { imdb_id?: string };
+  alternative_titles?: {
+    titles?: Array<{ title?: string }>;
+    results?: Array<{ title?: string }>;
+  };
+  seasons?: TmdbSeasonData[];
+  images?: { logos?: Array<{ file_path: string; iso_639_1: string | null; vote_average: number }> };
+  videos?: { results?: TmdbVideo[] };
+}
+
+interface TmdbCastCredit {
+  id: number;
+  name: string;
+  character?: string;
+  profile_path: string | null;
+  roles?: Array<{ character?: string }>;
+  total_episode_count?: number;
+}
+
+interface TmdbSeasonData {
+  id: number;
+  season_number: number;
+  name: string;
+  overview: string;
+  poster_path: string | null;
+  air_date: string | null;
+  episode_count: number;
+}
+
+interface TmdbBoardBundleResponse {
+  trendingMovies: TmdbResponse<TmdbMovie> | null;
+  popularMovies: TmdbResponse<TmdbMovie> | null;
+  trendingTv: TmdbResponse<TmdbTv> | null;
+  popularTv: TmdbResponse<TmdbTv> | null;
+}
+
+interface TmdbDiscoveryBundleResponse {
+  movies: TmdbResponse<TmdbMovie> | null;
+  tv: TmdbResponse<TmdbTv> | null;
 }
 
 export interface TmdbPerson {
@@ -207,6 +275,31 @@ interface TmdbWatchProviderRegion {
   flatrate?: TmdbWatchProviderResult[];
   free?: TmdbWatchProviderResult[];
   ads?: TmdbWatchProviderResult[];
+}
+
+interface TmdbWatchProviderResponse {
+  results?: Record<string, TmdbWatchProviderRegion>;
+}
+
+function tmdbMediaTypeFor(type: 'movie' | 'series'): 'movie' | 'tv' {
+  return type === 'movie' ? 'movie' : 'tv';
+}
+
+function titleDetailCacheKey(mediaType: 'movie' | 'tv', tmdbId: number | string): string {
+  return `tmdb:title-detail:${mediaType}:${tmdbId}`;
+}
+
+function previewDetailCacheKey(mediaType: 'movie' | 'tv', tmdbId: number | string): string {
+  return `tmdb:preview-detail:${mediaType}:${tmdbId}`;
+}
+
+function identityCacheKey(mediaType: 'movie' | 'tv', tmdbId: number | string): string {
+  return `tmdb:external-id:${mediaType}:${tmdbId}`;
+}
+
+function readTmdbImdbId(detail: TmdbDetail): string | undefined {
+  const imdbId = detail.external_ids?.imdb_id ?? detail.imdb_id;
+  return imdbId && /^tt\d+$/.test(imdbId) ? imdbId : undefined;
 }
 
 function buildPosterUrl(path: string | null, size: string = 'w342'): string {
@@ -294,7 +387,7 @@ async function fetchDiscoverMovies(
       options.language ?? 'any',
     ].join(':');
 
-    return getCachedRequest(cacheKey, TMDB_CATALOG_CACHE_TTL_MS, async () => {
+    return getPersistentlyCachedRequest(cacheKey, TMDB_CATALOG_CACHE_TTL_MS, async () => {
       const response = await tmdbClient.get<TmdbResponse<TmdbMovie>>('/discover/movie', {
         params: buildDiscoverParams(sourcePage, options, 'primary_release_year', sourceMode)
       });
@@ -308,7 +401,7 @@ async function fetchDiscoverMovies(
 
   try {
     if (contentMode === 'exclude-anime') {
-      return await getCachedRequest(
+      return await getPersistentlyCachedRequest(
         `tmdb:discover:filtered-v3:movie:${page}:${options.genreId ?? 'any'}:${options.year ?? 'any'}:${options.language ?? 'any'}`,
         TMDB_CATALOG_CACHE_TTL_MS,
         () => fetchFilteredDiscoveryPage(fetchSourcePage, page, contentMode, {
@@ -342,7 +435,7 @@ async function fetchDiscoverTv(
       options.language ?? 'any',
     ].join(':');
 
-    return getCachedRequest(cacheKey, TMDB_CATALOG_CACHE_TTL_MS, async () => {
+    return getPersistentlyCachedRequest(cacheKey, TMDB_CATALOG_CACHE_TTL_MS, async () => {
       const response = await tmdbClient.get<TmdbResponse<TmdbTv>>('/discover/tv', {
         params: buildDiscoverParams(sourcePage, options, 'first_air_date_year', sourceMode)
       });
@@ -356,7 +449,7 @@ async function fetchDiscoverTv(
 
   try {
     if (contentMode === 'exclude-anime') {
-      return await getCachedRequest(
+      return await getPersistentlyCachedRequest(
         `tmdb:discover:filtered-v3:tv:${page}:${options.genreId ?? 'any'}:${options.year ?? 'any'}:${options.language ?? 'any'}`,
         TMDB_CATALOG_CACHE_TTL_MS,
         () => fetchFilteredDiscoveryPage(fetchSourcePage, page, contentMode, {
@@ -379,7 +472,7 @@ async function fetchTmdbMovieCatalogPage(list: string, page: number): Promise<Di
     const url = list === 'trending'
       ? '/trending/movie/week'
       : `/movie/${list}`;
-    return await getCachedRequest(`tmdb:catalog:raw:movie:${list}:${page}`, TMDB_CATALOG_CACHE_TTL_MS, async () => {
+    return await getPersistentlyCachedRequest(`tmdb:catalog:raw:movie:${list}:${page}`, TMDB_CATALOG_CACHE_TTL_MS, async () => {
       const response = await tmdbClient.get<TmdbResponse<TmdbMovie>>(url, {
         params: { page }
       });
@@ -400,7 +493,7 @@ async function fetchTmdbTvCatalogPage(list: string, page: number): Promise<Disco
     const url = list === 'trending'
       ? '/trending/tv/week'
       : `/tv/${list}`;
-    return await getCachedRequest(`tmdb:catalog:raw:tv:${list}:${page}`, TMDB_CATALOG_CACHE_TTL_MS, async () => {
+    return await getPersistentlyCachedRequest(`tmdb:catalog:raw:tv:${list}:${page}`, TMDB_CATALOG_CACHE_TTL_MS, async () => {
       const response = await tmdbClient.get<TmdbResponse<TmdbTv>>(url, {
         params: { page }
       });
@@ -430,11 +523,46 @@ export async function getTmdbTvDiscover(
   return fetchDiscoverTv(page, options);
 }
 
+export async function getTmdbDiscovery(
+  options: TmdbDiscoverOptions,
+  page: number = 1,
+  mediaType: 'all' | 'movie' | 'tv' = 'all',
+): Promise<MetaPreview[]> {
+  const contentMode = getDiscoveryContentMode();
+  const cacheKey = [
+    'tmdb:aggregate:discovery:v1',
+    contentMode,
+    mediaType,
+    page,
+    options.genreId ?? 'any',
+    options.year ?? 'any',
+    options.language ?? 'any',
+  ].join(':');
+
+  return getPersistentlyCachedRequest(cacheKey, TMDB_CATALOG_CACHE_TTL_MS, async () => {
+    const response = await tmdbClient.get<TmdbDiscoveryBundleResponse>('/aggregate/discovery', {
+      params: {
+        content_mode: contentMode,
+        media_type: mediaType,
+        page,
+        ...(options.genreId !== null && options.genreId !== undefined ? { genre_id: options.genreId } : {}),
+        ...(options.year !== null && options.year !== undefined ? { year: options.year } : {}),
+        ...(options.language ? { language: options.language } : {}),
+      },
+    });
+    return [
+      ...(response.data.movies?.results.map((movie) => mapTmdbItemToPreview(movie, 'movie')) ?? []),
+      ...(response.data.tv?.results.map((show) => mapTmdbItemToPreview(show, 'tv')) ?? []),
+    ];
+  });
+}
+
 export async function getTmdbLanguages(): Promise<TmdbLanguage[]> {
   try {
-    const response = await tmdbClient.get<TmdbLanguage[]>('/configuration/languages');
-
-    return response.data;
+    return await getPersistentlyCachedRequest('tmdb:configuration:languages', 30 * 24 * 60 * 60 * 1000, async () => {
+      const response = await tmdbClient.get<TmdbLanguage[]>('/configuration/languages');
+      return response.data;
+    });
   } catch (error) {
     console.error('Failed to fetch TMDB languages:', error);
     return [];
@@ -489,7 +617,7 @@ async function fetchTmdbSearchPage(
   signal?: AbortSignal,
 ): Promise<DiscoverySourcePage<MetaPreview>> {
   try {
-    return await getCachedRequest(`tmdb:search:raw:${query.toLowerCase()}:${page}`, TMDB_CATALOG_CACHE_TTL_MS, async () => {
+    return await getPersistentlyCachedRequest(`tmdb:search:raw:${query.toLowerCase()}:${page}`, TMDB_SEARCH_CACHE_TTL_MS, async () => {
       const response = await tmdbClient.get<TmdbResponse<TmdbSearchResult>>('/search/multi', {
         params: {
           query,
@@ -522,9 +650,9 @@ export async function getTmdbSearch(
     return (await fetchTmdbSearchPage(query, page, signal)).items;
   }
 
-  return getCachedRequest(
+  return getPersistentlyCachedRequest(
     `tmdb:search:filtered-v3:${contentMode}:${query.toLowerCase()}:${page}`,
-    TMDB_CATALOG_CACHE_TTL_MS,
+    TMDB_SEARCH_CACHE_TTL_MS,
     () => fetchFilteredDiscoveryPage(
       (sourcePage) => fetchTmdbSearchPage(query, sourcePage, signal),
       page,
@@ -543,7 +671,7 @@ export async function getTmdbMovies(list: string, page: number = 1): Promise<Met
     return fetchDiscoverMovies(page, {}, contentMode);
   }
 
-  return getCachedRequest(
+  return getPersistentlyCachedRequest(
     `tmdb:catalog:filtered-v3:movie:${list}:${contentMode}:${page}`,
     TMDB_CATALOG_CACHE_TTL_MS,
     () => fetchFilteredDiscoveryPage(
@@ -564,7 +692,7 @@ export async function getTmdbTv(list: string, page: number = 1): Promise<MetaPre
     return fetchDiscoverTv(page, {}, contentMode);
   }
 
-  return getCachedRequest(
+  return getPersistentlyCachedRequest(
     `tmdb:catalog:filtered-v3:tv:${list}:${contentMode}:${page}`,
     TMDB_CATALOG_CACHE_TTL_MS,
     () => fetchFilteredDiscoveryPage(
@@ -576,26 +704,53 @@ export async function getTmdbTv(list: string, page: number = 1): Promise<MetaPre
   );
 }
 
+export async function getTmdbBoardCatalogs(
+  contentMode: DiscoveryContentMode = getDiscoveryContentMode(),
+): Promise<{
+  trendingMovies: MetaPreview[];
+  popularMovies: MetaPreview[];
+  trendingTv: MetaPreview[];
+  popularTv: MetaPreview[];
+}> {
+  return getPersistentlyCachedRequest(
+    `tmdb:aggregate:board:${contentMode}`,
+    TMDB_CATALOG_CACHE_TTL_MS,
+    async () => {
+      const response = await tmdbClient.get<TmdbBoardBundleResponse>('/aggregate/board', {
+        params: { content_mode: contentMode },
+      });
+      return {
+        trendingMovies: response.data.trendingMovies?.results.map((item) => mapTmdbItemToPreview(item, 'movie')) ?? [],
+        popularMovies: response.data.popularMovies?.results.map((item) => mapTmdbItemToPreview(item, 'movie')) ?? [],
+        trendingTv: response.data.trendingTv?.results.map((item) => mapTmdbItemToPreview(item, 'tv')) ?? [],
+        popularTv: response.data.popularTv?.results.map((item) => mapTmdbItemToPreview(item, 'tv')) ?? [],
+      };
+    },
+  );
+}
+
 export async function searchTmdbPeople(
   query: string,
   page: number = 1,
   signal?: AbortSignal,
 ): Promise<TmdbPerson[]> {
   try {
-    const response = await tmdbClient.get<TmdbResponse<TmdbPersonSearchResult>>('/search/person', {
-      params: {
-        query,
-        page
+    return await getPersistentlyCachedRequest(
+      `tmdb:person-search:${query.toLowerCase()}:${page}`,
+      TMDB_SEARCH_CACHE_TTL_MS,
+      async () => {
+        const response = await tmdbClient.get<TmdbResponse<TmdbPersonSearchResult>>('/search/person', {
+          params: { query, page },
+          signal,
+        });
+        return response.data.results.map((person) => ({
+          id: person.id,
+          name: person.name,
+          profile: buildPosterUrl(person.profile_path, 'w185'),
+          knownForDepartment: person.known_for_department,
+        }));
       },
-      signal,
-    });
-
-    return response.data.results.map((person) => ({
-      id: person.id,
-      name: person.name,
-      profile: buildPosterUrl(person.profile_path, 'w185'),
-      knownForDepartment: person.known_for_department
-    }));
+    );
   } catch (error) {
     if (axios.isCancel(error)) return [];
     console.error('Failed to search TMDB people:', error);
@@ -605,30 +760,31 @@ export async function searchTmdbPeople(
 
 export async function getTmdbPersonCredits(personId: number): Promise<TmdbPersonCreditPreview[]> {
   try {
-    const response = await tmdbClient.get<{ cast?: TmdbPersonCredit[] }>(`/person/${personId}/combined_credits`);
-
-    const seen = new Set<string>();
-    return (response.data.cast || [])
-      .filter((credit) => credit.media_type === 'movie' || credit.media_type === 'tv')
-      .map((credit) => ({
-        ...mapTmdbItemToPreview(credit, credit.media_type),
-        character: credit.character,
-        popularity: credit.popularity
-      }))
-      .filter((credit) => {
-        const key = credit.id;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .sort((a, b) => {
-        const bDate = Date.parse(b.releaseDate || '0000-01-01');
-        const aDate = Date.parse(a.releaseDate || '0000-01-01');
-        if (Number.isFinite(aDate) && Number.isFinite(bDate) && aDate !== bDate) {
-          return bDate - aDate;
-        }
-        return (b.popularity || 0) - (a.popularity || 0);
-      });
+    return await getPersistentlyCachedRequest(`tmdb:person-credits:${personId}`, TMDB_DETAIL_CACHE_TTL_MS, async () => {
+      const response = await tmdbClient.get<{ cast?: TmdbPersonCredit[] }>(`/person/${personId}/combined_credits`);
+      const seen = new Set<string>();
+      return (response.data.cast || [])
+        .filter((credit) => credit.media_type === 'movie' || credit.media_type === 'tv')
+        .map((credit) => ({
+          ...mapTmdbItemToPreview(credit, credit.media_type),
+          character: credit.character,
+          popularity: credit.popularity,
+        }))
+        .filter((credit) => {
+          const key = credit.id;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .sort((a, b) => {
+          const bDate = Date.parse(b.releaseDate || '0000-01-01');
+          const aDate = Date.parse(a.releaseDate || '0000-01-01');
+          if (Number.isFinite(aDate) && Number.isFinite(bDate) && aDate !== bDate) {
+            return bDate - aDate;
+          }
+          return (b.popularity || 0) - (a.popularity || 0);
+        });
+    });
   } catch (error) {
     console.error('Failed to fetch TMDB person credits:', error);
     return [];
@@ -641,6 +797,11 @@ async function getTmdbItemById(
   overrides?: Partial<MetaPreview>
 ): Promise<MetaPreview | null> {
   const cacheKey = `${mediaType}:${tmdbId}`;
+  const persistentDetailKey = previewDetailCacheKey(mediaType, tmdbId);
+  const persistentDetail = await readPersistentlyCachedValue<TmdbDetail>(persistentDetailKey);
+  if (persistentDetail) {
+    return mapTmdbItemToPreview(persistentDetail, mediaType, overrides);
+  }
   const requestCacheKey = `tmdb:preview:${cacheKey}`;
   const detail = await getCachedRequest(requestCacheKey, TMDB_DETAIL_CACHE_TTL_MS, () =>
     withTmdbDetailSlot(async () => {
@@ -669,6 +830,16 @@ async function getTmdbItemById(
     deleteCachedRequest(requestCacheKey);
     return null;
   }
+  await Promise.all([
+    writePersistentlyCachedValue(persistentDetailKey, detail, TMDB_DETAIL_CACHE_TTL_MS),
+    ...(readTmdbImdbId(detail)
+      ? [writePersistentlyCachedValue(
+          identityCacheKey(mediaType, tmdbId),
+          readTmdbImdbId(detail),
+          TMDB_IDENTITY_CACHE_TTL_MS,
+        )]
+      : []),
+  ]);
   return mapTmdbItemToPreview(detail, mediaType, overrides);
 }
 
@@ -680,74 +851,184 @@ export async function enrichTmdbItemsById(
     name?: string;
   }>
 ): Promise<MetaPreview[]> {
-  const enriched = await Promise.all(
-    items.map((item) =>
-      getTmdbItemById(item.mediaType, item.tmdbId, {
+  const enrichBatch = async (batch: typeof items): Promise<Array<MetaPreview | null>> => {
+    const uniqueItems = [...new Map(
+      batch.map((item) => [`${item.mediaType}:${item.tmdbId}`, item]),
+    ).values()];
+    const cachedDetails = await Promise.all(uniqueItems.map(async (item) => ({
+      item,
+      detail: await readPersistentlyCachedValue<TmdbDetail>(
+        previewDetailCacheKey(item.mediaType, item.tmdbId),
+      ),
+    })));
+    const missingItems = cachedDetails
+      .filter((entry) => !entry.detail)
+      .map((entry) => entry.item);
+    const detailsById = new Map(
+      cachedDetails.flatMap(({ item, detail }) => detail
+        ? [[`${item.mediaType}:${item.tmdbId}`, detail] as const]
+        : []),
+    );
+
+    try {
+      if (missingItems.length > 0) {
+        const missingCanonicalItems = missingItems
+          .map((item) => `${item.mediaType}:${item.tmdbId}`)
+          .sort();
+        const responseItems = await getPersistentlyCachedRequest(
+          `tmdb:aggregate:previews:${missingCanonicalItems.join(',')}`,
+          TMDB_DETAIL_CACHE_TTL_MS,
+          async () => {
+            const response = await tmdbClient.get<{
+              items: Array<{ mediaType: 'movie' | 'tv'; tmdbId: number; detail: TmdbDetail }>;
+            }>('/aggregate/previews', {
+              params: { items: missingCanonicalItems.join(',') },
+            });
+            return response.data.items;
+          },
+        );
+        for (const item of responseItems) {
+          detailsById.set(`${item.mediaType}:${item.tmdbId}`, item.detail);
+        }
+        await writePersistentlyCachedValues(
+          responseItems.map((item) => ({
+            key: previewDetailCacheKey(item.mediaType, item.tmdbId),
+            value: item.detail,
+          })),
+          TMDB_DETAIL_CACHE_TTL_MS,
+        );
+        await writePersistentlyCachedValues(
+          responseItems.flatMap((item) => {
+            const imdbId = readTmdbImdbId(item.detail);
+            return imdbId
+              ? [{ key: identityCacheKey(item.mediaType, item.tmdbId), value: imdbId }]
+              : [];
+          }),
+          TMDB_IDENTITY_CACHE_TTL_MS,
+        );
+      }
+
+      return Promise.all(batch.map(async (item) => {
+        const detail = detailsById.get(`${item.mediaType}:${item.tmdbId}`);
+        if (detail) {
+          return mapTmdbItemToPreview(detail, item.mediaType, {
+            name: item.name,
+            releaseDate: item.releaseDate,
+          });
+        }
+        return getTmdbItemById(item.mediaType, item.tmdbId, {
+          name: item.name,
+          releaseDate: item.releaseDate,
+        });
+      }));
+    } catch (error) {
+      console.warn('TMDB preview batch failed; falling back to individual requests:', error);
+      return Promise.all(batch.map((item) => getTmdbItemById(item.mediaType, item.tmdbId, {
         name: item.name,
-        releaseDate: item.releaseDate
-      })
-    )
-  );
+        releaseDate: item.releaseDate,
+      })));
+    }
+  };
+
+  const batches: Array<Promise<Array<MetaPreview | null>>> = [];
+  for (let index = 0; index < items.length; index += TMDB_PREVIEW_BATCH_SIZE) {
+    batches.push(enrichBatch(items.slice(index, index + TMDB_PREVIEW_BATCH_SIZE)));
+  }
+  const enriched = (await Promise.all(batches)).flat();
 
   return enriched.filter((item): item is MetaPreview => !!item);
 }
 
+function mapTmdbMetaData(type: 'movie' | 'series', data: TmdbMetaData) {
+  const castCredits = type === 'series' ? data.aggregate_credits?.cast : data.credits?.cast;
+  const releaseDate = data.release_date || data.first_air_date;
+  const originalName = data.original_title || data.original_name;
+  const alternativeTitles = [
+    ...(data.alternative_titles?.titles || []),
+    ...(data.alternative_titles?.results || []),
+  ]
+    .map((entry) => entry.title)
+    .filter((title): title is string => typeof title === 'string' && title.trim().length > 0);
+  const aliases = [...new Set([originalName, ...alternativeTitles])]
+    .filter((title): title is string => typeof title === 'string' && title !== (data.title || data.name))
+    .slice(0, 12);
+  return {
+    meta: {
+      id: `${type === 'movie' ? 'movie' : 'tv'}:${data.id}`,
+      type,
+      name: data.title || data.name || '',
+      originalName,
+      aliases,
+      poster: buildPosterUrl(data.poster_path, 'w500'),
+      background: buildBackdropUrl(data.backdrop_path, 'w1280'),
+      year: releaseDate?.split('-')[0],
+      description: data.overview,
+      runtime: data.runtime ? `${data.runtime} min` : (data.episode_run_time?.[0] ? `${data.episode_run_time[0]} min` : undefined),
+      genre: data.genres
+        ?.map((genre) => genre.name)
+        .filter((name): name is string => typeof name === 'string' && name.length > 0),
+      director: data.credits?.crew?.filter((person) => person.job === 'Director').map((person) => person.name),
+      cast: castCredits?.map((person): CastMember => ({
+        id: person.id,
+        name: person.name,
+        character: person.character || person.roles?.[0]?.character,
+        profile: buildPosterUrl(person.profile_path, 'w185'),
+        episodeCount: type === 'series' ? person.total_episode_count : undefined,
+      })),
+      tmdbRating: data.vote_average ? Math.round(data.vote_average * 10) / 10 : undefined,
+      imdbId: data.external_ids?.imdb_id || data.imdb_id,
+      releaseDate,
+      originalLanguage: data.original_language,
+    },
+    seasons: mapTmdbSeasons(data.seasons || []),
+    logoUrl: selectTmdbLogoUrl(data.images?.logos || []),
+    tmdbTrailerSources: mapTmdbVideosToTrailers(data.videos?.results || []),
+  };
+}
+
+async function persistSharedTitleData(
+  mediaType: 'movie' | 'tv',
+  tmdbId: number,
+  details: TmdbMetaData,
+): Promise<void> {
+  const imdbId = readTmdbImdbId(details);
+  await Promise.all([
+    writePersistentlyCachedValues<TmdbDetail>([
+      { key: titleDetailCacheKey(mediaType, tmdbId), value: details },
+      { key: previewDetailCacheKey(mediaType, tmdbId), value: details },
+    ], TMDB_DETAIL_CACHE_TTL_MS),
+    ...(imdbId
+      ? [writePersistentlyCachedValue(
+          identityCacheKey(mediaType, tmdbId),
+          imdbId,
+          TMDB_IDENTITY_CACHE_TTL_MS,
+        )]
+      : []),
+    ...(mediaType === 'tv' && details.seasons
+      ? [writePersistentlyCachedValue(
+          `tmdb:seasons:${tmdbId}`,
+          mapTmdbSeasons(details.seasons),
+          TMDB_SEASON_LIST_CACHE_TTL_MS,
+        )]
+      : []),
+  ]);
+}
+
 export async function getTmdbMeta(type: 'movie' | 'series', tmdbId: number) {
   try {
-    const endpoint = type === 'movie' ? 'movie' : 'tv';
-    return await getCachedRequest(`tmdb:meta:${type}:${tmdbId}`, TMDB_DETAIL_CACHE_TTL_MS, async () => {
-      const response = await tmdbClient.get(`/${endpoint}/${tmdbId}`, {
-        params: {
-          append_to_response: type === 'series'
-            ? 'credits,aggregate_credits,external_ids,alternative_titles,videos,images'
-            : 'credits,external_ids,alternative_titles,videos,images',
-          include_image_language: 'en,null'
-        }
-      });
-
-      const data = response.data;
-      const castCredits = type === 'series' ? data.aggregate_credits?.cast : data.credits?.cast;
-      const releaseDate = data.release_date || data.first_air_date;
-      const originalName = data.original_title || data.original_name;
-      const alternativeTitles = [
-        ...(data.alternative_titles?.titles || []),
-        ...(data.alternative_titles?.results || []),
-      ]
-        .map((entry: { title?: string }) => entry.title)
-        .filter((title: unknown): title is string => typeof title === 'string' && title.trim().length > 0);
-      const aliases = [...new Set([originalName, ...alternativeTitles])]
-        .filter((title): title is string => typeof title === 'string' && title !== (data.title || data.name))
-        .slice(0, 12);
-      return {
-        meta: {
-          id: `${type === 'movie' ? 'movie' : 'tv'}:${data.id}`,
-          type,
-          name: data.title || data.name,
-          originalName,
-          aliases,
-          poster: buildPosterUrl(data.poster_path, 'w500'),
-          background: buildBackdropUrl(data.backdrop_path, 'w1280'),
-          year: releaseDate?.split('-')[0],
-          description: data.overview,
-          runtime: data.runtime ? `${data.runtime} min` : (data.episode_run_time?.[0] ? `${data.episode_run_time[0]} min` : undefined),
-          genre: data.genres?.map((g: { name: string }) => g.name),
-          director: data.credits?.crew?.filter((p: { job: string }) => p.job === 'Director').map((p: { name: string }) => p.name),
-          cast: castCredits?.map((p: { id: number; name: string; character?: string; profile_path: string | null; roles?: Array<{ character?: string }>; total_episode_count?: number }): CastMember => ({
-            id: p.id,
-            name: p.name,
-            character: p.character || p.roles?.[0]?.character,
-            profile: buildPosterUrl(p.profile_path, 'w185'),
-            episodeCount: type === 'series' ? p.total_episode_count : undefined
-          })),
-          tmdbRating: data.vote_average ? Math.round(data.vote_average * 10) / 10 : undefined,
-          imdbId: data.external_ids?.imdb_id || data.imdb_id,
-          releaseDate,
-          originalLanguage: data.original_language
-        },
-        seasons: mapTmdbSeasons(data.seasons || []),
-        logoUrl: selectTmdbLogoUrl(data.images?.logos || []),
-        tmdbTrailerSources: mapTmdbVideosToTrailers(data.videos?.results || [])
-      };
+    const endpoint = tmdbMediaTypeFor(type);
+    return await getPersistentlyCachedRequest(`tmdb:meta:${type}:${tmdbId}`, TMDB_DETAIL_CACHE_TTL_MS, async () => {
+      const cachedDetails = await readPersistentlyCachedValue<TmdbMetaData>(
+        titleDetailCacheKey(endpoint, tmdbId),
+      );
+      if (cachedDetails) return mapTmdbMetaData(type, cachedDetails);
+      const bundle = await getTmdbTitleBundle(type, tmdbId, false);
+      return bundle ? {
+        meta: bundle.meta,
+        seasons: bundle.seasons,
+        logoUrl: bundle.logoUrl,
+        tmdbTrailerSources: bundle.tmdbTrailerSources,
+      } : null;
     });
   } catch (error) {
     console.error('Failed to fetch TMDB meta:', error);
@@ -788,56 +1069,137 @@ export interface TrailerSource {
   source: 'tmdb' | 'kinocheck';
 }
 
+function mapTmdbWatchProviderResponse(
+  data: { results?: Record<string, TmdbWatchProviderRegion> },
+  normalizedRegion: string,
+): TmdbWatchProvider[] {
+  const providers = new Map<number, TmdbWatchProvider & { displayPriority: number }>();
+  const availabilityGroups = [
+    ['flatrate', 'Subscription'],
+    ['free', 'Free'],
+    ['ads', 'With ads'],
+  ] as const;
+
+  const region = data.results?.[normalizedRegion];
+  availabilityGroups.forEach(([key, label]) => {
+    (region?.[key] ?? []).forEach((provider) => {
+      const existing = providers.get(provider.provider_id);
+      if (existing) {
+        if (!existing.availability.includes(label)) existing.availability.push(label);
+        existing.displayPriority = Math.min(existing.displayPriority, provider.display_priority);
+        return;
+      }
+
+      providers.set(provider.provider_id, {
+        id: provider.provider_id,
+        name: provider.provider_name,
+        logoUrl: buildPosterUrl(provider.logo_path, 'original'),
+        availability: [label],
+        displayPriority: provider.display_priority,
+      });
+    });
+  });
+
+  return [...providers.values()]
+    .sort((a, b) => a.displayPriority - b.displayPriority || a.name.localeCompare(b.name))
+    .map(({ displayPriority: _displayPriority, ...provider }) => provider);
+}
+
+export async function getTmdbTitleBundle(
+  type: 'movie' | 'series',
+  tmdbId: number,
+  includeWatchProviders: boolean,
+  watchRegion: string = getTmdbWatchRegion(),
+) {
+  const endpoint = tmdbMediaTypeFor(type);
+  const normalizedRegion = /^[A-Z]{2}$/i.test(watchRegion.trim())
+    ? watchRegion.trim().toUpperCase()
+    : detectSystemTmdbWatchRegion();
+  const providersCacheKey = `tmdb:watch-providers-raw:${endpoint}:${tmdbId}`;
+
+  try {
+    const bundle = await getPersistentlyCachedRequest(
+      `tmdb:title-bundle:${type}:${tmdbId}:${includeWatchProviders ? 'with-providers' : 'details-only'}`,
+      TMDB_DETAIL_CACHE_TTL_MS,
+      async () => {
+        let details = await readPersistentlyCachedValue<TmdbMetaData>(
+          titleDetailCacheKey(endpoint, tmdbId),
+        );
+        let watchProviders = includeWatchProviders
+          ? await readPersistentlyCachedValue<TmdbWatchProviderResponse>(providersCacheKey)
+          : null;
+
+        if (details && (!includeWatchProviders || watchProviders)) {
+          return { details, watchProviders };
+        }
+
+        if (details && includeWatchProviders && !watchProviders) {
+          const response = await tmdbClient.get<TmdbWatchProviderResponse>(
+            `/${endpoint}/${tmdbId}/watch/providers`,
+          );
+          watchProviders = response.data;
+          await writePersistentlyCachedValue(
+            providersCacheKey,
+            watchProviders,
+            TMDB_DETAIL_CACHE_TTL_MS,
+          );
+          return { details, watchProviders };
+        }
+
+        const response = await tmdbClient.get<{
+          details: TmdbMetaData;
+          watchProviders: TmdbWatchProviderResponse | null;
+        }>(`/aggregate/title/${endpoint}/${tmdbId}`, {
+          params: { include_watch_providers: includeWatchProviders ? '1' : '0' },
+        });
+        details = response.data.details;
+        watchProviders = response.data.watchProviders;
+        await persistSharedTitleData(endpoint, tmdbId, details);
+        if (watchProviders) {
+          await writePersistentlyCachedValue(
+            providersCacheKey,
+            watchProviders,
+            TMDB_DETAIL_CACHE_TTL_MS,
+          );
+        }
+        return { details, watchProviders };
+      },
+    );
+    await persistSharedTitleData(endpoint, tmdbId, bundle.details);
+    return {
+      ...mapTmdbMetaData(type, bundle.details),
+      watchProviders: bundle.watchProviders
+        ? mapTmdbWatchProviderResponse(bundle.watchProviders, normalizedRegion)
+        : [],
+    };
+  } catch (error) {
+    console.error('Failed to fetch TMDB title bundle:', error);
+    return null;
+  }
+}
+
 export async function getTmdbWatchProviders(
   type: 'movie' | 'series',
   tmdbId: number,
   watchRegion: string = getTmdbWatchRegion(),
 ): Promise<TmdbWatchProvider[]> {
-  const endpoint = type === 'movie' ? 'movie' : 'tv';
+  const endpoint = tmdbMediaTypeFor(type);
   const normalizedRegion = /^[A-Z]{2}$/i.test(watchRegion.trim())
     ? watchRegion.trim().toUpperCase()
     : detectSystemTmdbWatchRegion();
 
   try {
-    return await getCachedRequest(
-      `tmdb:watch-providers:${type}:${tmdbId}:${normalizedRegion}`,
+    const response = await getPersistentlyCachedRequest(
+      `tmdb:watch-providers-raw:${endpoint}:${tmdbId}`,
       TMDB_DETAIL_CACHE_TTL_MS,
       async () => {
-        const response = await tmdbClient.get<{ results?: Record<string, TmdbWatchProviderRegion> }>(
+        const response = await tmdbClient.get<TmdbWatchProviderResponse>(
           `/${endpoint}/${tmdbId}/watch/providers`,
         );
-        const providers = new Map<number, TmdbWatchProvider & { displayPriority: number }>();
-        const availabilityGroups = [
-          ['flatrate', 'Subscription'],
-          ['free', 'Free'],
-          ['ads', 'With ads'],
-        ] as const;
-
-        const region = response.data.results?.[normalizedRegion];
-        availabilityGroups.forEach(([key, label]) => {
-          (region?.[key] ?? []).forEach((provider) => {
-            const existing = providers.get(provider.provider_id);
-            if (existing) {
-              if (!existing.availability.includes(label)) existing.availability.push(label);
-              existing.displayPriority = Math.min(existing.displayPriority, provider.display_priority);
-              return;
-            }
-
-            providers.set(provider.provider_id, {
-              id: provider.provider_id,
-              name: provider.provider_name,
-              logoUrl: buildPosterUrl(provider.logo_path, 'original'),
-              availability: [label],
-              displayPriority: provider.display_priority,
-            });
-          });
-        });
-
-        return [...providers.values()]
-          .sort((a, b) => a.displayPriority - b.displayPriority || a.name.localeCompare(b.name))
-          .map(({ displayPriority: _displayPriority, ...provider }) => provider);
+        return response.data;
       },
     );
+    return mapTmdbWatchProviderResponse(response, normalizedRegion);
   } catch (error) {
     console.error('Failed to fetch TMDB watch providers:', error);
     return [];
@@ -965,9 +1327,15 @@ export async function getTrailerSources(
 
     if (tmdbSources.length === 0) {
       try {
-        const endpoint = type === 'movie' ? 'movie' : 'tv';
-        const response = await tmdbClient.get(`/${endpoint}/${tmdbId}/videos`);
-        tmdbSources.push(...mapTmdbVideosToTrailers(response.data.results ?? []));
+        const endpoint = tmdbMediaTypeFor(type);
+        const cachedDetails = await readPersistentlyCachedValue<TmdbMetaData>(
+          titleDetailCacheKey(endpoint, tmdbId),
+        );
+        tmdbSources.push(...mapTmdbVideosToTrailers(cachedDetails?.videos?.results ?? []));
+        if (tmdbSources.length === 0) {
+          const response = await tmdbClient.get(`/${endpoint}/${tmdbId}/videos`);
+          tmdbSources.push(...mapTmdbVideosToTrailers(response.data.results ?? []));
+        }
       } catch (error) {
         console.error('Failed to fetch TMDB trailer:', error);
       }
@@ -990,13 +1358,17 @@ export async function getTrailerSources(
 
 export async function getTmdbPoster(type: 'movie' | 'tv', tmdbId: number): Promise<string | null> {
   try {
-    const response = await tmdbClient.get(`/${type}/${tmdbId}`);
-
-    const posterPath = response.data.poster_path;
-    if (posterPath) {
-      return buildPosterUrl(posterPath, 'w342');
-    }
-    return null;
+    return await getPersistentlyCachedRequest(`tmdb:poster:${type}:${tmdbId}`, TMDB_DETAIL_CACHE_TTL_MS, async () => {
+      const cachedDetail = await readPersistentlyCachedValue<TmdbDetail>(
+        previewDetailCacheKey(type, tmdbId),
+      ) ?? await readPersistentlyCachedValue<TmdbDetail>(
+        titleDetailCacheKey(type, tmdbId),
+      );
+      if (cachedDetail) return cachedDetail.poster_path ? buildPosterUrl(cachedDetail.poster_path, 'w342') : null;
+      const response = await tmdbClient.get(`/${type}/${tmdbId}`);
+      const posterPath = response.data.poster_path;
+      return posterPath ? buildPosterUrl(posterPath, 'w342') : null;
+    });
   } catch (error) {
     console.error('Failed to fetch TMDB poster:', error);
     return null;
@@ -1049,7 +1421,11 @@ function mapTmdbSeasons(seasons: Array<{
 
 export async function getTmdbSeasons(tmdbId: number): Promise<Season[]> {
   try {
-    return await getCachedRequest(`tmdb:seasons:${tmdbId}`, TMDB_EPISODE_CACHE_TTL_MS, async () => {
+    return await getPersistentlyCachedRequest(`tmdb:seasons:${tmdbId}`, TMDB_SEASON_LIST_CACHE_TTL_MS, async () => {
+      const cachedDetails = await readPersistentlyCachedValue<TmdbMetaData>(
+        titleDetailCacheKey('tv', tmdbId),
+      );
+      if (cachedDetails?.seasons) return mapTmdbSeasons(cachedDetails.seasons);
       const response = await tmdbClient.get(`/tv/${tmdbId}`);
 
       return mapTmdbSeasons(response.data.seasons || []);
@@ -1062,22 +1438,26 @@ export async function getTmdbSeasons(tmdbId: number): Promise<Season[]> {
 
 export async function getTmdbEpisodes(tmdbId: number, seasonNumber: number): Promise<EpisodeDetail[]> {
   try {
-    return await getCachedRequest(`tmdb:episodes:${tmdbId}:${seasonNumber}`, TMDB_EPISODE_CACHE_TTL_MS, async () => {
-      const response = await tmdbClient.get(`/tv/${tmdbId}/season/${seasonNumber}`);
+    return await getPersistentlyCachedRequest(
+      `tmdb:episodes:${tmdbId}:${seasonNumber}`,
+      (episodes: EpisodeDetail[]) => getTmdbEpisodeCacheTtlMs(episodes),
+      async () => {
+        const response = await tmdbClient.get(`/tv/${tmdbId}/season/${seasonNumber}`);
 
-      const episodes = response.data.episodes || [];
-      return episodes.map((e: { id: number; name: string; overview: string; still_path: string | null; episode_number: number; season_number: number; air_date: string | null; runtime: number | null; vote_average: number }) => ({
-        id: e.id,
-        name: e.name,
-        overview: e.overview || '',
-        still_path: e.still_path,
-        episode_number: e.episode_number,
-        season_number: e.season_number,
-        air_date: e.air_date || null,
-        runtime: e.runtime,
-        vote_average: e.vote_average
-      }));
-    });
+        const episodes = response.data.episodes || [];
+        return episodes.map((e: { id: number; name: string; overview: string; still_path: string | null; episode_number: number; season_number: number; air_date: string | null; runtime: number | null; vote_average: number }) => ({
+          id: e.id,
+          name: e.name,
+          overview: e.overview || '',
+          still_path: e.still_path,
+          episode_number: e.episode_number,
+          season_number: e.season_number,
+          air_date: e.air_date || null,
+          runtime: e.runtime,
+          vote_average: e.vote_average
+        }));
+      },
+    );
   } catch (error) {
     console.error('Failed to fetch TMDB episodes:', error);
     return [];

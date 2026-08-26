@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { FiPlay, FiHeart, FiCheck, FiArrowLeft, FiDownload, FiExternalLink, FiArrowUp, FiArrowDown, FiFilm, FiTv, FiCircle, FiRefreshCw, FiFolder, FiFile, FiThumbsUp, FiThumbsDown, FiChevronRight, FiMoreHorizontal } from 'react-icons/fi';
 import { CastMember, MetaDetails as MetaDetailsType, MetaPreview, useStore, TorrentResult, LocalVideoFile } from '../../store';
-import { getTmdbMeta, getTrailerSources, getTmdbSeasons, getTmdbEpisodes, getTmdbPersonCredits, getTmdbWatchProviders, getTmdbWatchRegion, Season, EpisodeDetail, type TmdbPersonCreditPreview, type TmdbWatchProvider, type TrailerSource } from '../../services/tmdb';
+import { getTmdbTitleBundle, getTrailerSources, getTmdbSeasons, getTmdbEpisodes, getTmdbPersonCredits, getTmdbWatchRegion, Season, EpisodeDetail, type TmdbPersonCreditPreview, type TmdbWatchProvider, type TrailerSource } from '../../services/tmdb';
 import { getOmdbRating } from '../../services/omdb';
 import { selectAddonResumeResult } from '../../services/addon-source-search';
 import { deduplicateResults, searchEnabledSourceProviders } from '../../services/source-search';
@@ -901,6 +901,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     };
 
     const fetchDetails = async () => {
+      const shouldLoadWatchProviders = availableSearchAddons.length === 0;
       setDetails(meta);
       setSecondaryMetadataReady(false);
       setTrailerSources([]);
@@ -911,7 +912,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       setShowTorrents(false);
       setTorrents([]);
       setWatchProviders([]);
-      setWatchProvidersLoading(false);
+      setWatchProvidersLoading(shouldLoadWatchProviders);
       setSelectedIndexer('all');
       setSeasons([]);
       setSeasonsLoading(meta.type === 'series');
@@ -940,11 +941,12 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
         const initialResumeTarget = resumeTarget;
         const secondaryTasks: Array<Promise<unknown>> = [];
 
-        const data = await getTmdbMeta(type, tmdbIdNum);
+        const data = await getTmdbTitleBundle(type, tmdbIdNum, shouldLoadWatchProviders, watchRegion);
         if (!isCurrentRequest()) return;
         performanceTrace.mark('primary metadata ready');
 
         if (data?.meta) {
+          setWatchProviders(data.watchProviders);
           setDetails({ ...meta, ...data.meta, id: meta.id, type: meta.type });
           useStore.setState((state) => ({
             selectedMeta: state.selectedMeta?.id === meta.id
@@ -989,6 +991,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
             setSelectedSeason(preferredSeason || seasonsData[0] || null);
           }
         }
+        setWatchProvidersLoading(false);
         setSeasonsLoading(false);
         scheduleSecondaryMetadata();
         void Promise.allSettled(secondaryTasks).then(() => {
@@ -997,6 +1000,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       } catch (error) {
         console.error('Failed to fetch meta details:', error);
         if (isCurrentRequest()) {
+          setWatchProvidersLoading(false);
           setSeasonsLoading(false);
           scheduleSecondaryMetadata();
           performanceTrace.finish('primary metadata failed');
@@ -1009,7 +1013,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       window.cancelAnimationFrame(initialPaintFrame);
       if (secondaryTimer !== undefined) window.clearTimeout(secondaryTimer);
     };
-  }, [meta.id, meta.type, tmdbId]);
+  }, [availableSearchAddons.length, meta.id, meta.type, tmdbId, watchRegion]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1252,29 +1256,6 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       }
     }
   }, [availableSearchAddons.length, details, secondaryMetadataReady, selectedEpisode, selectedSeason]);
-
-  useEffect(() => {
-    if (!secondaryMetadataReady || !details || availableSearchAddons.length > 0) {
-      setWatchProviders([]);
-      setWatchProvidersLoading(false);
-      return;
-    }
-
-    const tmdbIdNum = parseInt(tmdbId, 10);
-    if (Number.isNaN(tmdbIdNum)) return;
-
-    let cancelled = false;
-    setWatchProvidersLoading(true);
-    void getTmdbWatchProviders(meta.type, tmdbIdNum, watchRegion).then((providers) => {
-      if (!cancelled) setWatchProviders(providers);
-    }).finally(() => {
-      if (!cancelled) setWatchProvidersLoading(false);
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [availableSearchAddons.length, details, meta.type, secondaryMetadataReady, tmdbId, watchRegion]);
 
   useEffect(() => () => {
     torrentSearchAbortRef.current?.abort();

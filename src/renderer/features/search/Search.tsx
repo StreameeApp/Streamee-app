@@ -5,10 +5,7 @@ import XrelQualityBadge from '../../components/XrelQualityBadge';
 import { getContinueWatchingProgress } from '../../services/progress';
 import {
   getTmdbSearch,
-  getTmdbMovies,
-  getTmdbTv,
-  getTmdbMoviesDiscover,
-  getTmdbTvDiscover,
+  getTmdbDiscovery,
   getTmdbLanguages,
   getTmdbPersonCredits,
   searchTmdbPeople,
@@ -16,6 +13,7 @@ import {
   type TmdbPersonCreditPreview,
   TMDB_GENRES
 } from '../../services/tmdb';
+import { isTmdbSearchQueryReady } from '../../services/tmdb-request-policy';
 import { pushUnwatchedToTrakt, pushWatchedToTrakt, pushWatchlistToTrakt } from '../../services/trakt-sync';
 import {
   getTraktListPreviewPosters,
@@ -42,6 +40,7 @@ const RELEASE_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
   day: 'numeric'
 });
 const LIST_SEARCH_PAGE_SIZE = 20;
+const SEARCH_DEBOUNCE_MS = 500;
 type DiscoverFilter = 'all' | 'movie' | 'tv' | 'actor' | 'list';
 type ActorCreditFilter = 'all' | 'movie' | 'series';
 type ListItemFilter = 'all' | 'movie' | 'series';
@@ -369,6 +368,16 @@ const Discover: React.FC = () => {
     try {
       let data: MetaPreview[] = [];
 
+      if (mode === 'search' && !isTmdbSearchQueryReady(trimmedSearchQuery)) {
+        setLists([]);
+        setPeople([]);
+        setItems([]);
+        setDiscoverItems([]);
+        setHasMore(false);
+        if (page === 1) initialLoadDone.current = true;
+        return;
+      }
+
       if (listMode) {
         if (mode === 'search' && trimmedSearchQuery) {
           const result = await searchTraktListsResult(trimmedSearchQuery, page, LIST_SEARCH_PAGE_SIZE);
@@ -454,37 +463,11 @@ const Discover: React.FC = () => {
           data = data.filter(d => d.type === 'series');
         }
       } else if (mode === 'browse') {
-        const fetchMovies = filter === 'tv' ? null : (filter === 'all' || filter === 'movie');
-        const fetchTv = filter === 'movie' ? null : (filter === 'all' || filter === 'tv');
-        const hasDiscoverFilters = selectedGenre !== null || selectedYear !== null || selectedLanguage !== null;
-
-        if (hasDiscoverFilters) {
-          const discoverOptions = {
-            genreId: selectedGenre,
-            year: selectedYear,
-            language: selectedLanguage
-          };
-
-          if (fetchMovies) {
-            data = await getTmdbMoviesDiscover(discoverOptions, page);
-          }
-          if (fetchTv) {
-            const tvs = await getTmdbTvDiscover(discoverOptions, page);
-            data = fetchMovies ? [...data, ...tvs] : tvs;
-          }
-        } else {
-          if (fetchMovies && fetchTv) {
-            const [movies, tvs] = await Promise.all([
-              getTmdbMovies('popular', page),
-              getTmdbTv('popular', page)
-            ]);
-            data = [...movies, ...tvs];
-          } else if (fetchMovies) {
-            data = await getTmdbMovies('popular', page);
-          } else if (fetchTv) {
-            data = await getTmdbTv('popular', page);
-          }
-        }
+        data = await getTmdbDiscovery({
+          genreId: selectedGenre,
+          year: selectedYear,
+          language: selectedLanguage,
+        }, page, filter === 'all' ? 'all' : filter);
       }
 
       if (requestId !== fetchRequestIdRef.current) return;
@@ -680,7 +663,7 @@ const Discover: React.FC = () => {
   useEffect(() => {
     const timeoutId = window.setTimeout(() => {
       syncModeWithQuery();
-    }, 300);
+    }, SEARCH_DEBOUNCE_MS);
 
     return () => window.clearTimeout(timeoutId);
   }, [searchQuery, syncModeWithQuery]);
@@ -1075,6 +1058,9 @@ const Discover: React.FC = () => {
               spellCheck={false}
               aria-label={actorMode ? 'Search actors' : listMode ? 'Search Trakt lists' : 'Search movies and TV shows'}
               onChange={(e) => setLocalSearchQuery(e.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') syncModeWithQuery();
+              }}
             />
           </div>
           <button
@@ -1714,9 +1700,11 @@ const Discover: React.FC = () => {
         </>
       ) : items.length === 0 ? (
         <div className="search-empty">
-          <h2>{mode === 'search' ? 'No matches yet' : 'Nothing fits these filters'}</h2>
+          <h2>{mode === 'search' && !isTmdbSearchQueryReady(trimmedSearchQuery) ? 'Keep typing' : mode === 'search' ? 'No matches yet' : 'Nothing fits these filters'}</h2>
           <p>
-            {mode === 'search'
+            {mode === 'search' && !isTmdbSearchQueryReady(trimmedSearchQuery)
+              ? 'Enter at least two characters to search.'
+              : mode === 'search'
               ? 'Try a shorter title, remove a type filter, or jump back into browsing.'
               : 'Relax one or two filters and the catalog will open back up.'}
           </p>

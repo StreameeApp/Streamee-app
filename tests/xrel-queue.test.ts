@@ -135,6 +135,7 @@ test('background queue handles priority, freshness, retries, offline recovery, q
   const providerResetAt = now + 50 * 60 * 1000;
   const backgroundQueries: string[] = [];
   const allRequests: string[] = [];
+  const tmdbRequests: string[] = [];
   const preciseTitlesById = new Map<string, { title: string; imdbId?: string; year: string }>();
   const failures = new Map<string, number>();
   const serviceFailures = new Map<string, number>();
@@ -143,6 +144,7 @@ test('background queue handles priority, freshness, retries, offline recovery, q
   let srrdbRecentPages: Array<Array<Record<string, unknown>>> = [[]];
 
   context.mock.method(tmdbClient, 'get', async (url: string) => {
+    tmdbRequests.push(url);
     const tmdbId = /\/movie\/(\d+)/.exec(url)?.[1];
     const imdbId = tmdbId === '424242'
       ? 'tt0000003'
@@ -227,6 +229,7 @@ test('background queue handles priority, freshness, retries, offline recovery, q
       const isAliasPoster = title === 'Alias Poster';
       const isLocalizedPoster = title === 'The Odyssey';
       const isTmdbAliasPoster = title === 'TMDB Alias Poster';
+      const isIdentityReusePoster = title === 'Identity Reuse Poster';
       const isConflictingPoster = title === 'Conflicting Identity Poster';
       const isMissingIdentityPoster = title === 'Missing Identity Poster';
       const imdbId = title === 'Tier Movie'
@@ -237,7 +240,9 @@ test('background queue handles priority, freshness, retries, offline recovery, q
             ? 'tt33764258'
             : isTmdbAliasPoster
               ? 'tt0000003'
-              : isConflictingPoster ? 'tt9999999' : undefined;
+              : isIdentityReusePoster
+                ? 'tt0000006'
+                : isConflictingPoster ? 'tt9999999' : undefined;
       const releaseTitle = isAliasPoster
         ? 'Canonical Alias Title'
         : isLocalizedPoster
@@ -261,7 +266,18 @@ test('background queue handles priority, freshness, retries, offline recovery, q
               uris: imdbId ? [`imdb:${imdbId}`] : [],
             },
           }],
-          p2p_results: [],
+          p2p_results: isConflictingPoster ? [{
+            id: `background-${title}-conflict`,
+            dirname: `${dirnameTitle.replaceAll(' ', '.')}.${releaseYear}.1080p.WEB.H264-OTHER`,
+            time: Math.floor(now / 1000),
+            video_type: 'Web-Rip',
+            ext_info: {
+              id: `title-${title}-conflict`,
+              type: 'movie',
+              title: releaseTitle,
+              uris: ['imdb:tt8888888'],
+            },
+          }] : [],
         },
         headers,
       };
@@ -412,6 +428,24 @@ test('background queue handles priority, freshness, retries, offline recovery, q
   assert.equal(service.getXrelQualityBadge(missingIdentityPoster)?.label, '1080p');
   assert.equal(service.getXrelQualityBadge(missingIdentityPoster)?.matchMethod, 'title-year');
 
+  const identityReusePoster = {
+    id: 'movie:424245',
+    type: 'movie' as const,
+    name: 'Identity Reuse Poster',
+    year: '2026',
+  };
+  const tmdbRequestsBeforeIdentityReuse = tmdbRequests.length;
+  service.registerXrelQualityLookup(identityReusePoster, 'visible');
+  await runTimersUntil(
+    () => service.getXrelQualityBadge(identityReusePoster)?.lookupTier === 'background',
+    'unambiguous xREL identity lookup did not finish',
+  );
+  assert.equal(
+    tmdbRequests.length,
+    tmdbRequestsBeforeIdentityReuse,
+    'an unambiguous xREL IMDb identity avoids an additional TMDB Worker request',
+  );
+
   const originalTitlePoster = {
     type: 'movie' as const,
     name: 'Original Display Title',
@@ -436,12 +470,14 @@ test('background queue handles priority, freshness, retries, offline recovery, q
     year: '2026',
   };
   const conflictingQueryStart = backgroundQueries.length;
+  const tmdbRequestsBeforeConflict = tmdbRequests.length;
   service.registerXrelQualityLookup(conflictingIdentityPoster, 'visible');
   await runTimersUntil(
     () => backgroundQueries.length > conflictingQueryStart
       && !service.getXrelQualitySnapshot().backgroundProcessing,
     'conflicting identity lookup did not finish',
   );
+  assert.ok(tmdbRequests.length > tmdbRequestsBeforeConflict, 'ambiguous xREL identities fall back to TMDB verification');
   assert.equal(service.getXrelQualityBadge(conflictingIdentityPoster), null, 'explicitly conflicting IMDb result is rejected');
 
   const tmdbAliasPoster = {
