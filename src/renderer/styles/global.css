@@ -32,11 +32,11 @@
   --red: #fb7185;
   --red-muted: rgba(251, 113, 133, 0.12);
 
-  --radius-sm: 3px;
-  --radius-md: 5px;
-  --radius-lg: 7px;
-  --radius-xl: 9px;
-  --radius-full: 5px;
+  --radius-sm: 1px;
+  --radius-md: 2px;
+  --radius-lg: 3px;
+  --radius-xl: 4px;
+  --radius-full: 4px;
 
   --shadow-sm: 0 12px 30px rgba(0, 0, 0, 0.16);
   --shadow-md: 0 18px 40px rgba(0, 0, 0, 0.26);
