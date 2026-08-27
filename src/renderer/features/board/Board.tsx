@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { FiChevronRight, FiHeart, FiEye, FiEyeOff, FiX, FiClock, FiBookmark, FiTrendingUp } from 'react-icons/fi';
 import { useStore, ContinueWatchingItem, ContinueWatchingViewItem, MetaPreview } from '../../store';
 import { enrichTmdbItemsById, EpisodeDetail, getTmdbBoardCatalogs, getTmdbEpisodes, getTmdbSeasons, isTmdbConfigured } from '../../services/tmdb';
@@ -14,6 +14,8 @@ import {
   type DiscoverySourcePage,
 } from '../../services/discovery-content';
 import XrelQualityBadge from '../../components/XrelQualityBadge';
+import { scheduleAddonReleaseQualityProbes } from '../../services/addon-release-probes';
+import { getXrelQualitySnapshot, subscribeXrelQualitySnapshot } from '../../services/xrel';
 import './Board.css';
 
 function formatRelativeTime(dateStr: string): string {
@@ -79,6 +81,8 @@ const CATALOG_ORDER = [
 let boardCatalogSnapshot: CatalogRow[] = [];
 let boardCatalogSnapshotMode: DiscoveryContentMode | null = null;
 const CONTINUE_VIEW_REFRESH_TTL_MS = 6 * 60 * 60 * 1000;
+const BOARD_CATALOG_ITEM_LIMIT = 20;
+const ADDON_RELEASE_PROBE_RECHECK_MS = 12 * 60 * 60 * 1000;
 
 function sortCatalogRows(rows: CatalogRow[]): CatalogRow[] {
   return [...rows].sort((a, b) => {
@@ -89,11 +93,18 @@ function sortCatalogRows(rows: CatalogRow[]): CatalogRow[] {
   });
 }
 
-const getItemsPerRow = (): number => {
-  const width = window.innerWidth - 250;
-  const itemWidth = 220;
-  return Math.max(3, Math.floor(width / itemWidth));
-};
+function getCatalogVisibleItemCount(columns: number): number {
+  if (columns > BOARD_CATALOG_ITEM_LIMIT) {
+    return BOARD_CATALOG_ITEM_LIMIT;
+  }
+
+  const completeRowsWithinLimit = Math.floor(BOARD_CATALOG_ITEM_LIMIT / columns);
+  return columns * Math.min(2, completeRowsWithinLimit);
+}
+
+function getContinueWatchingVisibleItemCount(columns: number): number {
+  return Math.min(columns, BOARD_CATALOG_ITEM_LIMIT);
+}
 
 function parseTmdbId(metaId: string): number | null {
   const match = metaId.match(/^(?:tv|movie):(\d+)$/);
@@ -273,22 +284,42 @@ const Board: React.FC = () => {
     boardCatalogSnapshotMode !== discoveryContentMode || boardCatalogSnapshot.length === 0
   );
   const [tmdbConfigured, setTmdbConfigured] = useState<boolean | null>(null);
-  const [itemsPerRow, setItemsPerRow] = useState(getItemsPerRow);
+  const [itemsPerRow, setItemsPerRow] = useState(3);
   const [featuredIndex, setFeaturedIndex] = useState(0);
   const [renderedFeatured, setRenderedFeatured] = useState<FeaturedItem | null>(null);
   const [heroReady, setHeroReady] = useState(false);
+  const catalogGridRef = useRef<HTMLDivElement>(null);
   const continueRefreshGenerationRef = useRef(0);
+  const releaseQualitySnapshot = useSyncExternalStore(
+    subscribeXrelQualitySnapshot,
+    getXrelQualitySnapshot,
+    getXrelQualitySnapshot,
+  );
   const { setSelectedMeta, continueWatching, continueWatchingView, continueWatchingViewFingerprint, continueWatchingViewUpdatedAt, setContinueWatchingView, setContinueWatchingViewRefresh, addToContinueWatching, removeFromContinueWatching, setSelectedCatalog, setCatalogItems, setCatalogPage, setCatalogCacheKey, watchlist, addToWatchlist, removeFromWatchlist, watched, addToWatched, removeFromWatched, boardScrollPosition, setBoardScrollPosition, traktConnected, watchedEpisodes } = useStore();
   const continueRefreshFingerprint = useMemo(
     () => buildContinueViewFingerprint(continueWatching, watched, watchedEpisodes),
     [continueWatching, watched, watchedEpisodes],
   );
 
-  useEffect(() => {
-    const handleResize = () => setItemsPerRow(getItemsPerRow());
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, []);
+  useLayoutEffect(() => {
+    const grid = catalogGridRef.current;
+    if (!grid) return;
+
+    const updateItemsPerRow = () => {
+      const renderedColumns = window.getComputedStyle(grid).gridTemplateColumns
+        .split(' ')
+        .filter(Boolean)
+        .length;
+      if (renderedColumns > 0) {
+        setItemsPerRow(renderedColumns);
+      }
+    };
+
+    updateItemsPerRow();
+    const observer = new ResizeObserver(updateItemsPerRow);
+    observer.observe(grid);
+    return () => observer.disconnect();
+  }, [catalogs.length, continueWatchingView.length]);
 
   useEffect(() => {
     const handleContentModeChange = (event: Event) => {
@@ -298,6 +329,21 @@ const Board: React.FC = () => {
     window.addEventListener(DISCOVERY_CONTENT_CHANGED_EVENT, handleContentModeChange);
     return () => window.removeEventListener(DISCOVERY_CONTENT_CHANGED_EVENT, handleContentModeChange);
   }, []);
+
+  useEffect(() => {
+    if (!releaseQualitySnapshot.enabled || releaseQualitySnapshot.backgroundPaused) return;
+    const items = catalogs
+      .filter((catalog) => catalog.id === 'trending' || catalog.id === 'popular')
+      .flatMap((catalog) => catalog.items);
+    const schedule = () => scheduleAddonReleaseQualityProbes(items);
+    schedule();
+    const timer = window.setInterval(schedule, ADDON_RELEASE_PROBE_RECHECK_MS);
+    window.addEventListener('online', schedule);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('online', schedule);
+    };
+  }, [catalogs, releaseQualitySnapshot.backgroundPaused, releaseQualitySnapshot.enabled]);
 
   useEffect(() => {
     const container = document.querySelector('.main-content');
@@ -319,7 +365,6 @@ const Board: React.FC = () => {
   useEffect(() => {
     let cancelled = false;
     let firstCatalogPublished = false;
-    let catalogExpansionTimer: number | undefined;
     const performanceTrace = createPerformanceTrace('Board catalogs');
     if (boardCatalogSnapshotMode !== discoveryContentMode) {
       boardCatalogSnapshot = [];
@@ -366,7 +411,6 @@ const Board: React.FC = () => {
           });
         }
 
-        const initialTraktLimit = Math.min(20, Math.max(6, getItemsPerRow() * 2));
         const createTraktTasks = (limit: number): Array<Promise<void>> => [
           fetchTraktCatalogItems('anticipated', 'movie', 1, limit, discoveryContentMode)
             .then((items) => publishCatalog({ id: 'anticipated', title: formatDiscoveryCatalogTitle('Anticipated Movies', discoveryContentMode), type: 'movie', source: 'trakt', items, hideWatchedToggle: true })),
@@ -383,15 +427,10 @@ const Board: React.FC = () => {
         ];
 
         if (hasTrakt) {
-          tasks.push(...createTraktTasks(initialTraktLimit));
+          tasks.push(...createTraktTasks(BOARD_CATALOG_ITEM_LIMIT));
         }
 
         await Promise.allSettled(tasks);
-        if (hasTrakt && initialTraktLimit < 20 && !cancelled) {
-          catalogExpansionTimer = window.setTimeout(() => {
-            void Promise.allSettled(createTraktTasks(20));
-          }, 1500);
-        }
       } catch (error) {
         console.error('Failed to fetch catalogs:', error);
       } finally {
@@ -405,7 +444,6 @@ const Board: React.FC = () => {
     void fetchCatalogs();
     return () => {
       cancelled = true;
-      if (catalogExpansionTimer !== undefined) window.clearTimeout(catalogExpansionTimer);
     };
   }, [discoveryContentMode]);
 
@@ -907,8 +945,8 @@ const Board: React.FC = () => {
               <h2>Continue Watching</h2>
             </div>
           </div>
-          <div className="board-grid">
-            {sortedContinueWatching.slice(0, 6).map((item) => (
+          <div className="board-grid" ref={catalogGridRef}>
+            {sortedContinueWatching.slice(0, getContinueWatchingVisibleItemCount(itemsPerRow)).map((item) => (
               <div
                 key={item.metaId}
                 className="board-item"
@@ -956,7 +994,7 @@ const Board: React.FC = () => {
               </div>
             ))}
           </div>
-          {sortedContinueWatching.length > 6 && (
+          {sortedContinueWatching.length > getContinueWatchingVisibleItemCount(itemsPerRow) && (
             <button
               className="board-show-all"
               onClick={handleShowAllContinueWatching}
@@ -980,7 +1018,7 @@ const Board: React.FC = () => {
         </div>
       )}
 
-      {catalogs.map((catalog) => (
+      {catalogs.map((catalog, catalogIndex) => (
         <section key={catalog.source + catalog.id + catalog.type} className="board-section">
           <div className="board-section-header">
             <div>
@@ -988,8 +1026,11 @@ const Board: React.FC = () => {
               <h2>{catalog.title}</h2>
             </div>
           </div>
-          <div className="board-grid">
-            {catalog.items.slice(0, itemsPerRow * 2).map((item) => (
+          <div
+            className="board-grid"
+            ref={sortedContinueWatching.length === 0 && catalogIndex === 0 ? catalogGridRef : undefined}
+          >
+            {catalog.items.slice(0, getCatalogVisibleItemCount(itemsPerRow)).map((item) => (
               <div
                 key={item.id}
                 className="board-item"

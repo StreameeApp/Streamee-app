@@ -45,7 +45,11 @@ function tooltipText(
   const language = badge.language === 'unknown'
     ? 'Language not tagged'
     : `${badge.language[0].toUpperCase()}${badge.language.slice(1)} release`;
-  const provider = badge.provider === 'srrdb' ? 'Source: srrDB' : 'Source: xREL';
+  const provider = badge.provider === 'srrdb'
+    ? 'Source: srrDB'
+    : badge.provider === 'addon'
+      ? 'Source: configured add-on'
+      : 'Source: xREL';
   const lookup = badge.lookupTier === 'precise'
     ? 'Lookup: precise title verification'
     : badge.lookupTier === 'background'

@@ -8106,6 +8106,7 @@ pub fn run() {
             addons::install_addon,
             addons::refresh_addon_manifest,
             addons::fetch_addon_streams,
+            addons::probe_addon_streams,
             addons::remove_addon,
             start_torrent,
             stop_torrent,

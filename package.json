@@ -10,6 +10,7 @@
         "release": "npm run tauri:build",
         "dev": "vite",
         "build": "tsc && vite build",
+        "test": "node --experimental-strip-types --test tests/*.test.ts",
         "test:anime-filter": "node --experimental-strip-types --test tests/discovery-content.test.ts",
         "test:xrel": "node --experimental-strip-types --test tests/xrel-quality.test.ts tests/xrel-queue.test.ts",
         "test:logging": "node --experimental-strip-types --test tests/logger.test.ts",

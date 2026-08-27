@@ -492,124 +492,50 @@ impl PeakMeasurement {
 pub fn get_preset(name: &str) -> Option<NormalizerConfig> {
     let name = if name == "night" { "medium" } else { name };
 
+    let preset_with_target = |target_lufs| NormalizerConfig {
+        enabled: true,
+        slow_enabled: true,
+        fast_enabled: false,
+        transient_enabled: false,
+        peak_ceiling_enabled: false,
+        limiter_enabled: true,
+        target_lufs,
+        max_gain_db: 30.0,
+        max_cut_db: -60.0,
+        attack_ms: 200.0,
+        release_ms: 1500.0,
+        slow_control_mode: SlowControlMode::Momentary,
+        response_mode: RiderResponseMode::DbPerSec,
+        attack_db_per_sec: 24.0,
+        release_db_per_sec: 2.0,
+        transient_threshold_lu: 4.0,
+        max_transient_cut_db: 12.0,
+        fast_threshold_lu: 3.0,
+        fast_max_cut_db: 10.0,
+        fast_attack_ms: 80.0,
+        fast_release_ms: 350.0,
+        fast_detector_mode: FastDetectorMode::TruePeak,
+        fast_true_peak_threshold_db: -8.0,
+        peak_ceiling_threshold_db: -1.0,
+        limiter_limit_db: -1.0,
+        limiter_attack_ms: 1.0,
+        limiter_release_ms: 5.0,
+        adaptive_gate_enabled: true,
+        adaptive_gate_mode: AdaptiveGateMode::Stable,
+        adaptive_max_gain_enabled: true,
+        adaptive_max_gain_limit_db: 48.0,
+        subtitle_assist_enabled: true,
+        gate_detector_mode: GateDetectorMode::Momentary,
+        gate_observation_window_secs: 30.0,
+        gate_threshold_lufs: 0.0,
+        hold_ms: 100.0,
+        refresh_interval_ms: 50.0,
+    };
+
     match name {
-        "light" => Some(NormalizerConfig {
-            enabled: true,
-            slow_enabled: true,
-            fast_enabled: false,
-            transient_enabled: false,
-            peak_ceiling_enabled: false,
-            limiter_enabled: true,
-            target_lufs: -20.0,
-            max_gain_db: 30.0,
-            max_cut_db: -60.0,
-            attack_ms: 200.0,
-            release_ms: 1500.0,
-            slow_control_mode: SlowControlMode::ShortTerm,
-            response_mode: RiderResponseMode::DbPerSec,
-            attack_db_per_sec: 12.0,
-            release_db_per_sec: 12.0,
-            transient_threshold_lu: default_transient_threshold_lu(),
-            max_transient_cut_db: default_max_transient_cut_db(),
-            fast_threshold_lu: default_fast_threshold_lu(),
-            fast_max_cut_db: default_fast_max_cut_db(),
-            fast_attack_ms: default_fast_attack_ms(),
-            fast_release_ms: default_fast_release_ms(),
-            fast_detector_mode: FastDetectorMode::TruePeak,
-            fast_true_peak_threshold_db: default_fast_true_peak_threshold_db(),
-            peak_ceiling_threshold_db: default_peak_ceiling_threshold_db(),
-            limiter_limit_db: -1.0,
-            limiter_attack_ms: 5.0,
-            limiter_release_ms: 5.0,
-            adaptive_gate_enabled: false,
-            adaptive_gate_mode: AdaptiveGateMode::Direct,
-            adaptive_max_gain_enabled: false,
-            adaptive_max_gain_limit_db: default_adaptive_max_gain_limit_db(),
-            subtitle_assist_enabled: false,
-            gate_detector_mode: GateDetectorMode::ShortTerm,
-            gate_observation_window_secs: default_gate_observation_window_secs(),
-            gate_threshold_lufs: -40.0,
-            hold_ms: 100.0,
-            refresh_interval_ms: default_refresh_interval_ms(),
-        }),
-        "medium" => Some(NormalizerConfig {
-            enabled: true,
-            slow_enabled: true,
-            fast_enabled: false,
-            transient_enabled: false,
-            peak_ceiling_enabled: false,
-            limiter_enabled: true,
-            target_lufs: -16.0,
-            max_gain_db: 30.0,
-            max_cut_db: -60.0,
-            attack_ms: 200.0,
-            release_ms: 1500.0,
-            slow_control_mode: SlowControlMode::ShortTerm,
-            response_mode: RiderResponseMode::DbPerSec,
-            attack_db_per_sec: 12.0,
-            release_db_per_sec: 12.0,
-            transient_threshold_lu: default_transient_threshold_lu(),
-            max_transient_cut_db: default_max_transient_cut_db(),
-            fast_threshold_lu: default_fast_threshold_lu(),
-            fast_max_cut_db: default_fast_max_cut_db(),
-            fast_attack_ms: default_fast_attack_ms(),
-            fast_release_ms: default_fast_release_ms(),
-            fast_detector_mode: FastDetectorMode::TruePeak,
-            fast_true_peak_threshold_db: default_fast_true_peak_threshold_db(),
-            peak_ceiling_threshold_db: default_peak_ceiling_threshold_db(),
-            limiter_limit_db: -1.0,
-            limiter_attack_ms: 5.0,
-            limiter_release_ms: 20.0,
-            adaptive_gate_enabled: true,
-            adaptive_gate_mode: AdaptiveGateMode::Direct,
-            adaptive_max_gain_enabled: false,
-            adaptive_max_gain_limit_db: default_adaptive_max_gain_limit_db(),
-            subtitle_assist_enabled: false,
-            gate_detector_mode: GateDetectorMode::ShortTerm,
-            gate_observation_window_secs: default_gate_observation_window_secs(),
-            gate_threshold_lufs: -25.0,
-            hold_ms: 100.0,
-            refresh_interval_ms: default_refresh_interval_ms(),
-        }),
-        "strong" => Some(NormalizerConfig {
-            enabled: true,
-            slow_enabled: true,
-            fast_enabled: false,
-            transient_enabled: false,
-            peak_ceiling_enabled: false,
-            limiter_enabled: true,
-            target_lufs: -10.0,
-            max_gain_db: 30.0,
-            max_cut_db: -60.0,
-            attack_ms: 200.0,
-            release_ms: 1500.0,
-            slow_control_mode: SlowControlMode::ShortTerm,
-            response_mode: RiderResponseMode::DbPerSec,
-            attack_db_per_sec: 12.0,
-            release_db_per_sec: 12.0,
-            transient_threshold_lu: default_transient_threshold_lu(),
-            max_transient_cut_db: default_max_transient_cut_db(),
-            fast_threshold_lu: default_fast_threshold_lu(),
-            fast_max_cut_db: default_fast_max_cut_db(),
-            fast_attack_ms: default_fast_attack_ms(),
-            fast_release_ms: default_fast_release_ms(),
-            fast_detector_mode: FastDetectorMode::TruePeak,
-            fast_true_peak_threshold_db: default_fast_true_peak_threshold_db(),
-            peak_ceiling_threshold_db: default_peak_ceiling_threshold_db(),
-            limiter_limit_db: -1.0,
-            limiter_attack_ms: 5.0,
-            limiter_release_ms: 5.0,
-            adaptive_gate_enabled: false,
-            adaptive_gate_mode: AdaptiveGateMode::Direct,
-            adaptive_max_gain_enabled: false,
-            adaptive_max_gain_limit_db: default_adaptive_max_gain_limit_db(),
-            subtitle_assist_enabled: false,
-            gate_detector_mode: GateDetectorMode::ShortTerm,
-            gate_observation_window_secs: default_gate_observation_window_secs(),
-            gate_threshold_lufs: -40.0,
-            hold_ms: 100.0,
-            refresh_interval_ms: default_refresh_interval_ms(),
-        }),
+        "light" => Some(preset_with_target(-18.0)),
+        "medium" => Some(preset_with_target(-16.0)),
+        "strong" => Some(preset_with_target(-14.0)),
         "custom" => get_custom_preset(),
         _ => None,
     }
@@ -3656,8 +3582,10 @@ mod tests {
     }
 
     #[test]
-    fn medium_preset_matches_saved_tuning_reference() {
+    fn built_in_presets_match_saved_custom_tuning_except_target_loudness() {
+        let mut low = get_preset("light").expect("low preset should exist");
         let medium = get_preset("medium").expect("medium preset should exist");
+        let mut high = get_preset("strong").expect("high preset should exist");
 
         assert!(medium.enabled);
         assert!(medium.slow_enabled);
@@ -3665,14 +3593,36 @@ mod tests {
         assert!(!medium.transient_enabled);
         assert!(!medium.peak_ceiling_enabled);
         assert!(medium.limiter_enabled);
+        assert_eq!(low.target_lufs, -18.0);
         assert_eq!(medium.target_lufs, -16.0);
-        assert_eq!(medium.limiter_release_ms, 20.0);
+        assert_eq!(high.target_lufs, -14.0);
+        assert_eq!(medium.slow_control_mode, SlowControlMode::Momentary);
+        assert_eq!(medium.response_mode, RiderResponseMode::DbPerSec);
+        assert_eq!(medium.attack_db_per_sec, 24.0);
+        assert_eq!(medium.release_db_per_sec, 2.0);
+        assert_eq!(medium.fast_true_peak_threshold_db, -8.0);
+        assert_eq!(medium.limiter_attack_ms, 1.0);
+        assert_eq!(medium.limiter_release_ms, 5.0);
         assert!(medium.adaptive_gate_enabled);
-        assert_eq!(medium.adaptive_gate_mode, AdaptiveGateMode::Direct);
-        assert!(!medium.subtitle_assist_enabled);
-        assert_eq!(medium.gate_detector_mode, GateDetectorMode::ShortTerm);
-        assert_eq!(medium.gate_observation_window_secs, 60.0);
-        assert_eq!(medium.gate_threshold_lufs, -25.0);
+        assert_eq!(medium.adaptive_gate_mode, AdaptiveGateMode::Stable);
+        assert!(medium.adaptive_max_gain_enabled);
+        assert_eq!(medium.adaptive_max_gain_limit_db, 48.0);
+        assert!(medium.subtitle_assist_enabled);
+        assert_eq!(medium.gate_detector_mode, GateDetectorMode::Momentary);
+        assert_eq!(medium.gate_observation_window_secs, 30.0);
+        assert_eq!(medium.gate_threshold_lufs, 0.0);
+        assert_eq!(medium.refresh_interval_ms, 50.0);
+
+        low.target_lufs = medium.target_lufs;
+        high.target_lufs = medium.target_lufs;
+        assert_eq!(
+            serde_json::to_value(low).expect("low preset should serialize"),
+            serde_json::to_value(&medium).expect("medium preset should serialize")
+        );
+        assert_eq!(
+            serde_json::to_value(high).expect("high preset should serialize"),
+            serde_json::to_value(medium).expect("medium preset should serialize")
+        );
     }
 
     #[test]

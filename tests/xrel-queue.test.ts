@@ -771,6 +771,37 @@ test('background queue handles priority, freshness, retries, offline recovery, q
   );
   assert.equal(backgroundQueries.length, xrelCallsBeforeIndependentLookup);
   assert.equal(service.getXrelQualityBadge(independentProviderItem)?.label, '4K');
+  assert.equal(
+    service.shouldProbeAddonReleaseQuality(independentProviderItem),
+    false,
+    '4K-or-better release metadata skips add-on probing',
+  );
+
+  const addonProbeItem = {
+    type: 'movie' as const,
+    name: 'Add-on Probe Movie',
+    year: '2026',
+    imdbId: 'tt7000001',
+  };
+  assert.equal(service.shouldProbeAddonReleaseQuality(addonProbeItem), true);
+  assert.equal(service.mergeAddonReleaseQualityObservations(addonProbeItem, [{
+    title: 'Add-on.Probe.Movie.2026.2160p.DV.HDR.HEVC',
+  }]), 1);
+  assert.equal(service.getXrelQualityBadge(addonProbeItem)?.label, '4K DV');
+  assert.equal(service.getXrelQualityBadge(addonProbeItem)?.provider, 'addon');
+  assert.equal(service.shouldProbeAddonReleaseQuality(addonProbeItem), false);
+
+  const addonProbeService = await import('../src/renderer/services/addon-release-probe-utils.ts?queue-test');
+  const deduplicatedProbes = addonProbeService.dedupeAddonReleaseProbeItems([
+    { id: 'movie:1', type: 'movie', name: 'First copy', imdbId: 'tt7000002' },
+    { id: 'movie:2', type: 'movie', name: 'Duplicate copy', imdbId: 'tt7000002' },
+    { id: 'movie:3', type: 'movie', name: 'Different item', imdbId: 'tt7000003' },
+  ]);
+  assert.deepEqual(
+    deduplicatedProbes.map((item) => item.imdbId),
+    ['tt7000002', 'tt7000003'],
+    'duplicate catalog cards share one add-on probe identity',
+  );
 
   now = service.getXrelQualitySnapshot().backgroundBudgetResetAt + 1;
   const unregisterNextWindow = service.registerXrelQualityLookup(

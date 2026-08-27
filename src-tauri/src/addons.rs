@@ -200,6 +200,16 @@ pub struct AddonStreamResult {
     pub size: Option<u64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonStreamProbeResult {
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
 fn credential_target(installation_id: &str) -> String {
     format!("Streamee/addon/{installation_id}/manifestUrl")
 }
@@ -510,6 +520,56 @@ pub async fn fetch_addon_streams(
         }
     }
     Ok(results)
+}
+
+#[tauri::command]
+pub async fn probe_addon_streams(
+    request: AddonStreamRequest,
+) -> Result<Vec<AddonStreamProbeResult>, String> {
+    let manifest_url = read_manifest_url(&request.installation_id)?;
+    let stream_url = stream_resource_url(&manifest_url, &request.media_type, &request.content_id)?;
+    let response: StremioStreamResponse = fetch_json(&stream_url).await?;
+
+    Ok(response
+        .streams
+        .into_iter()
+        .filter_map(|stream| {
+            let has_playable_url = stream
+                .url
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .and_then(|value| Url::parse(value).ok())
+                .is_some_and(|url| url.scheme() == "https" || url.scheme() == "http");
+            let has_info_hash = stream
+                .info_hash
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            if !has_playable_url && !has_info_hash {
+                return None;
+            }
+
+            let title = stream
+                .behavior_hints
+                .filename
+                .as_deref()
+                .or(stream.title.as_deref())
+                .or(stream.name.as_deref())
+                .unwrap_or("Add-on stream")
+                .trim()
+                .to_string();
+            let description = stream.description.filter(|value| !value.trim().is_empty());
+            let filename = stream
+                .behavior_hints
+                .filename
+                .filter(|value| !value.trim().is_empty());
+
+            Some(AddonStreamProbeResult {
+                title,
+                description,
+                filename,
+            })
+        })
+        .collect())
 }
 
 #[tauri::command]

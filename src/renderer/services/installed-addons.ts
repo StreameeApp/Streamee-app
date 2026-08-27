@@ -61,6 +61,12 @@ export interface InstalledAddonStreamRequest {
   contentId: string;
 }
 
+export interface InstalledAddonStreamProbe {
+  title: string;
+  description?: string;
+  filename?: string;
+}
+
 interface InstalledAddonRegistryV1 {
   version: 1;
   /** Array order is the fallback priority, from highest to lowest. */
@@ -240,6 +246,12 @@ export async function fetchInstalledAddonStreams(
   request: InstalledAddonStreamRequest,
 ): Promise<InstalledAddonStream[]> {
   return invoke<InstalledAddonStream[]>('fetch_addon_streams', { request });
+}
+
+export async function probeInstalledAddonStreams(
+  request: InstalledAddonStreamRequest,
+): Promise<InstalledAddonStreamProbe[]> {
+  return invoke<InstalledAddonStreamProbe[]>('probe_addon_streams', { request });
 }
 
 export async function uninstallAddon(installationId: string): Promise<InstalledAddon[]> {

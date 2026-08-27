@@ -1411,7 +1411,7 @@ const Settings: React.FC = () => {
             <div className="settings-toggle-info">
               <label>Release-quality badges</label>
               <span className="settings-toggle-desc">
-                Shows the best release found by xREL and srrDB on movie and series posters. Both sources are public and require no API key.
+                Shows the highest quality found by xREL, srrDB, or your configured add-ons on movie and series posters.
               </span>
             </div>
             <button
@@ -1489,7 +1489,7 @@ const Settings: React.FC = () => {
                 <div className="xrel-status-metrics">
                   <div className="xrel-status-metric">
                     <span>Sources</span>
-                    <strong>xREL + srrDB</strong>
+                    <strong>xREL + srrDB + add-ons</strong>
                   </div>
                   <div className="xrel-status-metric">
                     <span>Titles with release matches</span>
@@ -1591,7 +1591,7 @@ const Settings: React.FC = () => {
                 )}
                 <div className="xrel-status-footer">
                   <span>
-                    xREL discovers poster matches. srrDB selectively improves weak matches and checks recent releases every 30 minutes. xREL poster lookups preserve {xrelSnapshot.backgroundQuotaReserve} requests.
+                    xREL discovers poster matches. srrDB selectively improves weak matches and checks recent releases every 30 minutes. Configured add-ons rotate through unique Trending and Popular titles when their saved check is stale; titles already at 4K or better are skipped. xREL poster lookups preserve {xrelSnapshot.backgroundQuotaReserve} requests.
                   </span>
                   <div className="xrel-status-actions">
                     <button

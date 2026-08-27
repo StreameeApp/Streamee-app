@@ -2,7 +2,7 @@
 
 A Windows desktop media application for discovering movies and TV shows and playing user-authorized sources through MPV.
 
-![Streamee](https://img.shields.io/badge/Streamee-v2.0.1-orange)
+[![Latest Streamee release](https://img.shields.io/github/v/release/StreameeApp/Streamee-app?color=orange&label=Streamee)](https://github.com/StreameeApp/Streamee-app/releases/latest)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4)
 ![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB)
 
