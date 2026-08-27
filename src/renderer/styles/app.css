@@ -55,6 +55,120 @@
   animation: fadeUpSoft var(--duration-page) var(--ease-out);
 }
 
+.announcement-banner {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px;
+  width: 100%;
+  padding: 13px 14px 13px 17px;
+  color: #fff;
+  background: linear-gradient(90deg, #e9743f, #f08a4d);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  animation: announcementBannerIn 180ms var(--ease-out);
+}
+
+.announcement-banner-warning {
+  background: linear-gradient(90deg, #b86b22, #d8842c);
+}
+
+.announcement-banner-critical {
+  background: linear-gradient(90deg, #a93b3b, #cb4b43);
+}
+
+.announcement-banner-content {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
+  gap: 8px 14px;
+}
+
+.announcement-banner-message {
+  flex: 1 1 360px;
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.announcement-banner-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 7px 11px;
+  color: inherit;
+  background: rgba(0, 0, 0, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.42);
+  border-radius: 7px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.25;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.announcement-banner-link:hover {
+  background: rgba(0, 0, 0, 0.24);
+}
+
+.announcement-banner-link:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+.announcement-banner-link svg {
+  flex: 0 0 auto;
+}
+
+.announcement-banner-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  margin: -5px -5px -5px 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 22px;
+  flex: 0 0 auto;
+}
+
+.announcement-banner-dismiss:hover {
+  background: rgba(0, 0, 0, 0.14);
+}
+
+.announcement-banner-dismiss:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 1px;
+}
+
+@keyframes announcementBannerIn {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .update-toast {
   position: fixed;
   right: 22px;
@@ -146,6 +260,15 @@
 }
 
 @media (max-width: 640px) {
+  .announcement-banner {
+    gap: 10px;
+    padding: 11px 12px 11px 14px;
+  }
+
+  .announcement-banner-message {
+    font-size: 13px;
+  }
+
   .update-toast {
     right: 14px;
     bottom: 14px;

@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useSyncExternalStore } from 'react';
-import { FiDownload, FiX } from 'react-icons/fi';
+import { FiDownload, FiExternalLink, FiX } from 'react-icons/fi';
 import { useShallow } from 'zustand/react/shallow';
 import { MetaPreview, useStore } from './store';
 import Board from './features/board/Board';
@@ -30,6 +30,7 @@ import {
   getUpdaterSnapshot,
   subscribeUpdater,
 } from './services/updater';
+import { Announcement, fetchActiveAnnouncement } from './services/announcements';
 import './styles/app.css';
 
 type ActiveEpisodeInfo = { season: number; episode: number; title: string };
@@ -44,6 +45,7 @@ type PlayerProgressPayload = {
 const PLAYBACK_SNAPSHOT_INTERVAL_MS = 20_000;
 const DISCORD_PRESENCE_UPDATE_INTERVAL_MS = 30_000;
 const DISMISSED_UPDATE_VERSION_KEY = 'streamee-dismissed-update-version';
+const DISMISSED_ANNOUNCEMENT_ID_KEY = 'streamee-dismissed-announcement-id';
 
 let currentPlayingMeta: {
   type: 'movie' | 'show';
@@ -652,15 +654,48 @@ const App: React.FC = () => {
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(() =>
     localStorage.getItem(DISMISSED_UPDATE_VERSION_KEY),
   );
+  const [announcement, setAnnouncement] = useState<Announcement | null>(null);
+  const [dismissedAnnouncementId, setDismissedAnnouncementId] = useState<string | null>(() =>
+    localStorage.getItem(DISMISSED_ANNOUNCEMENT_ID_KEY),
+  );
   const showUpdateToast = updaterSnapshot.status === 'available'
     && !!updaterSnapshot.version
     && updaterSnapshot.version !== dismissedUpdateVersion;
+  const showAnnouncement = announcement !== null
+    && announcement.id !== dismissedAnnouncementId
+    && view !== 'player';
 
   const dismissUpdateToast = () => {
     if (!updaterSnapshot.version) return;
     localStorage.setItem(DISMISSED_UPDATE_VERSION_KEY, updaterSnapshot.version);
     setDismissedUpdateVersion(updaterSnapshot.version);
   };
+
+  const dismissAnnouncement = () => {
+    if (!announcement) return;
+    localStorage.setItem(DISMISSED_ANNOUNCEMENT_ID_KEY, announcement.id);
+    setDismissedAnnouncementId(announcement.id);
+  };
+
+  const openAnnouncementLink = () => {
+    if (!announcement?.linkUrl) return;
+    void window.electronAPI.openExternal(announcement.linkUrl).catch(() => {
+      console.error('[Announcements] Failed to open external link.');
+    });
+  };
+
+  useEffect(() => {
+    let isDisposed = false;
+
+    void fetchActiveAnnouncement().then((activeAnnouncement) => {
+      if (!isDisposed) setAnnouncement(activeAnnouncement);
+    });
+
+    return () => {
+      isDisposed = true;
+    };
+  }, []);
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
@@ -1079,6 +1114,40 @@ const App: React.FC = () => {
     <div className={`app app-view-${view}`}>
       <Sidebar currentView={view} onNavigate={setView} />
       <main className="main-content">
+        {showAnnouncement && announcement && (
+          <aside
+            className={`announcement-banner announcement-banner-${announcement.kind}`}
+            aria-label="Announcement"
+          >
+            <div className="announcement-banner-content">
+              <p
+                className="announcement-banner-message"
+                role={announcement.kind === 'critical' ? 'alert' : 'status'}
+                aria-live={announcement.kind === 'critical' ? 'assertive' : 'polite'}
+              >
+                {announcement.message}
+              </p>
+              {announcement.linkUrl && (
+                <button
+                  className="announcement-banner-link"
+                  type="button"
+                  onClick={openAnnouncementLink}
+                >
+                  <span>{announcement.linkLabel ?? 'Learn more'}</span>
+                  <FiExternalLink aria-hidden="true" />
+                </button>
+              )}
+            </div>
+            <button
+              className="announcement-banner-dismiss"
+              type="button"
+              onClick={dismissAnnouncement}
+              aria-label="Dismiss announcement"
+            >
+              <FiX />
+            </button>
+          </aside>
+        )}
         <div className="main-content-inner">
           {renderContent()}
         </div>
