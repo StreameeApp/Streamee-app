@@ -15,6 +15,7 @@ __pycache__/
 !.env.example
 
 # Local Cloudflare credentials and deployment state
+/cloudflare/
 **/.dev.vars
 **/.dev.vars.*
 !**/.dev.vars.example

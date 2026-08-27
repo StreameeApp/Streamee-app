@@ -591,6 +591,10 @@ fn mpv_noise_category(entry: &MpvLogLine) -> Option<&'static str> {
         return Some("audio_meter_frame");
     }
 
+    if module == "ffmpeg/video" && message == "hevc: Skipping NAL unit 63" {
+        return Some("hevc_unspecified_nal");
+    }
+
     if module == "cplayer"
         && message.starts_with("Run command: af-command")
         && message.contains("label=\"rider-")
@@ -1276,6 +1280,10 @@ mod tests {
             Some("audio_meter_frame")
         );
         assert_eq!(
+            mpv_noise_category(&entry("v", "ffmpeg/video", "hevc: Skipping NAL unit 63")),
+            Some("hevc_unspecified_nal")
+        );
+        assert_eq!(
             mpv_noise_category(&entry(
                 "d",
                 "cplayer",
@@ -1306,6 +1314,14 @@ mod tests {
 
         assert_eq!(
             mpv_noise_category(&entry("warn", "swscale", "Using zimg.")),
+            None
+        );
+        assert_eq!(
+            mpv_noise_category(&entry("warn", "ffmpeg/video", "hevc: Skipping NAL unit 63")),
+            None
+        );
+        assert_eq!(
+            mpv_noise_category(&entry("v", "ffmpeg/video", "hevc: Skipping NAL unit 62")),
             None
         );
         assert_eq!(
