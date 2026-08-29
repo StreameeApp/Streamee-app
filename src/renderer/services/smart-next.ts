@@ -2,6 +2,37 @@ import type { TorrentResult } from '../store';
 
 export const SMART_NEXT_AUTOLOAD_TRIGGER_RATIO = 0.7;
 
+export type SmartEpisodeDirection = 'next' | 'previous';
+export type SmartEpisodeTarget = { season: number; episode: number };
+
+export function orderSmartEpisodeSeasons(
+  seasonNumbers: number[],
+  current: SmartEpisodeTarget,
+  direction: SmartEpisodeDirection,
+): number[] {
+  return seasonNumbers
+    .filter((season) => (
+      current.season === 0 || season > 0
+    ) && (direction === 'next'
+      ? season >= current.season
+      : season <= current.season))
+    .sort((a, b) => direction === 'next' ? a - b : b - a);
+}
+
+export function selectSmartEpisodeInSeason(
+  episodeNumbers: number[],
+  season: number,
+  current: SmartEpisodeTarget,
+  direction: SmartEpisodeDirection,
+): number | null {
+  const candidates = episodeNumbers
+    .filter((episode) => direction === 'next'
+      ? season > current.season || episode > current.episode
+      : season < current.season || episode < current.episode)
+    .sort((a, b) => direction === 'next' ? a - b : b - a);
+  return candidates[0] ?? null;
+}
+
 export function shouldReuseSmartNextPreparation(
   existingKey: string,
   requestedKey: string,

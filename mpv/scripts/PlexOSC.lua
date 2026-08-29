@@ -148,6 +148,14 @@ local osc_styles = {
     TransBg = '{\\blur100\\bord150\\1c&H000000&\\3c&H000000&}',
     SeekbarBg = '{\\blur0\\bord0\\1c&H2A2A2A&}',
     SeekbarFg = '{\\blur1\\bord1\\1c&H356BFF&}',
+    SeekbarHandle = '{\\blur0\\bord1\\1c&H356BFF&\\3c&HF3F3F3&}',
+    SeekbarChapterA = '{\\blur0\\bord0\\1c&H356BFF&}',
+    SeekbarChapterB = '{\\blur0\\bord0\\1c&H244BC9&}',
+    SeekbarChapterDimA = '{\\blur0\\bord0\\1c&H1F2124&}',
+    SeekbarChapterDimB = '{\\blur0\\bord0\\1c&H191A1C&}',
+    SeekbarChapterSpecial = '{\\blur0\\bord0\\1c&HB6C42B&}',
+    SeekbarChapterSpecialDim = '{\\blur0\\bord0\\1c&H484D18&}',
+    SeekbarCached = '{\\blur0\\bord0.7\\1c&H243F8C&\\3c&H2F56C2&}',
     DelayLabel = '{\\blur0\\bord0\\shad0\\1c&HAAAAAA&\\fs12\\b1\\fn' .. user_opts.font .. '}',
     DelayCtrl = '{\\blur0\\bord0\\shad0\\1c&HFFFFFF&\\fs13\\b1\\fn' .. user_opts.font .. '}',
     VolumebarBg = '{\\blur0\\bord0\\1c&H999999&}',
@@ -207,6 +215,7 @@ local state = {
     fulltime = user_opts.timems,
     highlight_element = 'cy_audio',
     chapter_list = {},                      -- sorted by time
+    detected_segments = {},                 -- renderer-resolved intro/recap/outro ranges
     track_menu_type = nil,
     track_menu_first = 1,
 }
@@ -378,8 +387,8 @@ function get_hitbox_coords_geo(geometry)
 end
 
 function get_element_hitbox(element)
-    return element.hitbox.x1, element.hitbox.y1,
-        element.hitbox.x2, element.hitbox.y2
+    local hitbox = element.mouse_hitbox or element.hitbox
+    return hitbox.x1, hitbox.y1, hitbox.x2, hitbox.y2
 end
 
 function mouse_hit(element)
@@ -708,6 +717,17 @@ function prepare_elements()
         -- Calculate the hitbox
         local bX1, bY1, bX2, bY2 = get_hitbox_coords_geo(elem_geo)
         element.hitbox = {x1 = bX1, y1 = bY1, x2 = bX2, y2 = bY2}
+        element.mouse_hitbox = nil
+        if element.layout.mouse_hitbox_height then
+            local mX1, mY1, mX2, mY2 = get_hitbox_coords(
+                elem_geo.x,
+                elem_geo.y,
+                elem_geo.an,
+                elem_geo.w,
+                element.layout.mouse_hitbox_height
+            )
+            element.mouse_hitbox = {x1 = mX1, y1 = mY1, x2 = mX2, y2 = mY2}
+        end
 
         local style_ass = assdraw.ass_new()
 
@@ -772,6 +792,40 @@ function prepare_elements()
                                 static_ass:rect_cw(s - 1, elem_geo.h-slider_lo.gap, s + 1, elem_geo.h);
                             end
                         end
+                    end
+                end
+            end
+
+            element.slider.segment_positions = {}
+            if element.slider.segmentF then
+                local segments = element.slider.segmentF()
+                for _, segment in ipairs(segments) do
+                    if type(segment.start) == 'number' and
+                       type(segment.finish) == 'number' and
+                       segment.finish > segment.start then
+                        table.insert(element.slider.segment_positions, {
+                            start = get_slider_ele_pos_for(element, segment.start),
+                            finish = get_slider_ele_pos_for(element, segment.finish),
+                            played_style = segment.played_style,
+                            unplayed_style = segment.unplayed_style,
+                        })
+                    end
+                end
+            end
+
+            element.slider.semantic_segment_positions = {}
+            if element.slider.semanticSegmentF then
+                local segments = element.slider.semanticSegmentF()
+                for _, segment in ipairs(segments) do
+                    if type(segment.start) == 'number' and
+                       type(segment.finish) == 'number' and
+                       segment.finish > segment.start then
+                        table.insert(element.slider.semantic_segment_positions, {
+                            start = get_slider_ele_pos_for(element, segment.start),
+                            finish = get_slider_ele_pos_for(element, segment.finish),
+                            played_style = segment.played_style,
+                            unplayed_style = segment.unplayed_style,
+                        })
                     end
                 end
             end
@@ -876,26 +930,189 @@ function render_elements(master_ass)
 			local rh = user_opts.seekbarhandlesize * elem_geo.h / 2 -- Handle radius
             local xp
             
-            if pos then
+            local segments = element.slider.segment_positions or {}
+            local has_segments = #segments > 0
+            local semantic_segments = element.slider.semantic_segment_positions or {}
+            local has_semantic_segments = #semantic_segments > 0
+
+            if pos and not has_segments then
                 xp = get_slider_ele_pos_for(element, pos)
 				ass_draw_cir_cw(elem_ass, xp, elem_geo.h/2, rh)
 				elem_ass:rect_cw(0, slider_lo.gap, xp, elem_geo.h - slider_lo.gap)
+            elseif pos then
+                xp = get_slider_ele_pos_for(element, pos)
+            end
+
+            if has_segments then
+                local progress_x = xp or element.slider.min.ele_pos
+                elem_ass:draw_stop()
+
+                local grouped_rects = {}
+                local style_order = {}
+
+                local function add_segment_rect(style, x1, x2)
+                    if not style or x2 <= x1 then return end
+                    if not grouped_rects[style] then
+                        grouped_rects[style] = {}
+                        table.insert(style_order, style)
+                    end
+                    table.insert(grouped_rects[style], {x1 = x1, x2 = x2})
+                end
+
+                for _, segment in ipairs(segments) do
+                    local played_end = math.min(segment.finish, progress_x)
+                    add_segment_rect(
+                        segment.played_style,
+                        segment.start,
+                        played_end
+                    )
+
+                    local unplayed_start = math.max(segment.start, progress_x)
+                    add_segment_rect(
+                        segment.unplayed_style,
+                        unplayed_start,
+                        segment.finish
+                    )
+                end
+
+                -- A chapter-heavy file can contain dozens of segments. Group
+                -- rectangles by color so the ASS overlay stays compact and is
+                -- not truncated or malformed by the renderer.
+                for _, style in ipairs(style_order) do
+                    elem_ass:new_event()
+                    elem_ass:pos(element.hitbox.x1, element.hitbox.y1)
+                    elem_ass:an(7)
+                    elem_ass:append(style)
+                    ass_append_alpha(elem_ass, element.layout.alpha, 0)
+                    elem_ass:draw_start()
+                    -- Keep every color group in the seekbar's complete
+                    -- coordinate frame. Without this zero-area bounding box,
+                    -- ASS aligns each sparse group from its own bounds.
+                    elem_ass:rect_cw(0, 0, elem_geo.w, elem_geo.h)
+                    elem_ass:rect_ccw(0, 0, elem_geo.w, elem_geo.h)
+                    for _, rect in ipairs(grouped_rects[style]) do
+                        elem_ass:rect_cw(rect.x1, 0, rect.x2, elem_geo.h)
+                    end
+                    elem_ass:draw_stop()
+                end
             end
 
             if seekRanges then
 				elem_ass:draw_stop()
-				elem_ass:merge(element.style_ass)
-				ass_append_alpha(elem_ass, element.layout.alpha, user_opts.seekrangealpha)
-				elem_ass:merge(element.static_ass)
 
-                for _,range in pairs(seekRanges) do
-                    local pstart = get_slider_ele_pos_for(element, range['start'])
-                    local pend = get_slider_ele_pos_for(element, range['end'])
-					elem_ass:rect_cw(pstart - rh, slider_lo.gap, pend + rh, elem_geo.h - slider_lo.gap)
+                if slider_lo.seekrange_style then
+                    local inset = slider_lo.seekrange_inset or 0
+                    local range_height = elem_geo.h - inset * 2
+
+                    elem_ass:new_event()
+                    elem_ass:pos(element.hitbox.x1, element.hitbox.y1)
+                    elem_ass:an(7)
+                    elem_ass:append(slider_lo.seekrange_style)
+                    ass_append_alpha(
+                        elem_ass,
+                        element.layout.alpha,
+                        slider_lo.seekrange_alpha or user_opts.seekrangealpha
+                    )
+                    elem_ass:draw_start()
+                    elem_ass:rect_cw(0, 0, elem_geo.w, elem_geo.h)
+                    elem_ass:rect_ccw(0, 0, elem_geo.w, elem_geo.h)
+                    for _, range in pairs(seekRanges) do
+                        local pstart = get_slider_ele_pos_for(element, range['start'])
+                        local pend = get_slider_ele_pos_for(element, range['end'])
+                        if slider_lo.seekrange_future_only and xp then
+                            pstart = math.max(pstart, xp)
+                        end
+                        if pend > pstart and range_height > 0 then
+                            ass_draw_rr_h_cw(
+                                elem_ass,
+                                pstart,
+                                inset,
+                                pend,
+                                elem_geo.h - inset,
+                                math.min(range_height / 2, (pend - pstart) / 2),
+                                false
+                            )
+                        end
+                    end
+                    elem_ass:draw_stop()
+                else
+					elem_ass:merge(element.style_ass)
+					ass_append_alpha(elem_ass, element.layout.alpha, user_opts.seekrangealpha)
+					elem_ass:merge(element.static_ass)
+
+                    for _, range in pairs(seekRanges) do
+                        local pstart = get_slider_ele_pos_for(element, range['start'])
+                        local pend = get_slider_ele_pos_for(element, range['end'])
+						elem_ass:rect_cw(
+                            pstart - rh,
+                            slider_lo.gap,
+                            pend + rh,
+                            elem_geo.h - slider_lo.gap
+                        )
+                    end
+                end
+            end
+
+
+            if has_semantic_segments then
+                local progress_x = xp or element.slider.min.ele_pos
+                local semantic_rects = {
+                    [osc_styles.SeekbarChapterSpecial] = {},
+                    [osc_styles.SeekbarChapterSpecialDim] = {},
+                }
+
+                for _, segment in ipairs(semantic_segments) do
+                    local played_end = math.min(segment.finish, progress_x)
+                    if played_end > segment.start then
+                        table.insert(semantic_rects[segment.played_style], {
+                            x1 = segment.start,
+                            x2 = played_end,
+                        })
+                    end
+                    local unplayed_start = math.max(segment.start, progress_x)
+                    if segment.finish > unplayed_start then
+                        table.insert(semantic_rects[segment.unplayed_style], {
+                            x1 = unplayed_start,
+                            x2 = segment.finish,
+                        })
+                    end
+                end
+
+                for _, style in ipairs({
+                    osc_styles.SeekbarChapterSpecial,
+                    osc_styles.SeekbarChapterSpecialDim,
+                }) do
+                    if #semantic_rects[style] > 0 then
+                        elem_ass:new_event()
+                        elem_ass:pos(element.hitbox.x1, element.hitbox.y1)
+                        elem_ass:an(7)
+                        elem_ass:append(style)
+                        ass_append_alpha(elem_ass, element.layout.alpha, 0)
+                        elem_ass:draw_start()
+                        elem_ass:rect_cw(0, 0, elem_geo.w, elem_geo.h)
+                        elem_ass:rect_ccw(0, 0, elem_geo.w, elem_geo.h)
+                        for _, rect in ipairs(semantic_rects[style]) do
+                            elem_ass:rect_cw(rect.x1, 0, rect.x2, elem_geo.h)
+                        end
+                        elem_ass:draw_stop()
+                    end
                 end
             end
 
             elem_ass:draw_stop()
+
+            if (has_segments or has_semantic_segments) and xp then
+                elem_ass:new_event()
+                elem_ass:pos(element.hitbox.x1, element.hitbox.y1)
+                elem_ass:an(7)
+                elem_ass:append(slider_lo.handle_style or element.layout.style)
+                ass_append_alpha(elem_ass, element.layout.alpha, 0)
+                elem_ass:draw_start()
+                elem_ass:rect_cw(0, 0, elem_geo.w, elem_geo.h)
+                elem_ass:rect_ccw(0, 0, elem_geo.w, elem_geo.h)
+                ass_draw_cir_cw(elem_ass, xp, elem_geo.h / 2, rh)
+                elem_ass:draw_stop()
+            end
             
             -- add tooltip
             if not (element.slider.tooltipF == nil) then
@@ -1043,6 +1260,71 @@ function render_elements(master_ass)
     else
         clear_thumbfast()
     end
+end
+
+function get_chapter_segment_kind(title)
+    if type(title) ~= 'string' then return nil end
+
+    local normalized = title:lower()
+        :gsub('[^%w]+', ' ')
+        :gsub('^%s+', '')
+        :gsub('%s+$', '')
+
+    if normalized == 'recap' or normalized:match('^recap%s') or
+       normalized:find('previously', 1, true) then
+        return 'special'
+    end
+
+    if normalized == 'intro' or normalized == 'introduction' or
+       normalized == 'opening' or normalized == 'op' or
+       normalized:match('^intro%s') or normalized:match('^opening%s') then
+        return 'special'
+    end
+
+    if normalized == 'credits' or normalized == 'outro' or
+       normalized == 'ending' or normalized == 'end credits' or
+       normalized == 'closing credits' or normalized == 'ed' or
+       normalized:match('%scredits$') then
+        return 'special'
+    end
+
+    return nil
+end
+
+function is_position_cached(possec)
+    local cache_state = state.cache_state
+    local ranges = cache_state and cache_state['seekable-ranges'] or nil
+    if type(possec) ~= 'number' or type(ranges) ~= 'table' then
+        return false
+    end
+
+    local current_pos = mp.get_property_number('time-pos', nil)
+    if current_pos and possec < current_pos then
+        return false
+    end
+
+    for _, range in ipairs(ranges) do
+        local range_start = tonumber(range['start'])
+        local range_end = tonumber(range['end'])
+        if range_start and range_end and
+           possec >= range_start and possec <= range_end then
+            return true
+        end
+    end
+
+    return false
+end
+
+function get_detected_segment(possec)
+    if type(possec) ~= 'number' then return nil end
+
+    for _, segment in ipairs(state.detected_segments or {}) do
+        if possec >= segment.start_sec and possec < segment.end_sec then
+            return segment
+        end
+    end
+
+    return nil
 end
 
 --
@@ -1329,7 +1611,7 @@ layouts = function ()
     if state.track_menu_type then
         add_area('input', 0, 0, osc_param.playresx, osc_param.playresy)
     else
-        add_area('input', get_hitbox_coords(posX, posY, 1, osc_geo.w, 104))
+        add_area('input', get_hitbox_coords(posX, posY, 1, osc_geo.w, 110))
     end
     add_area('topinput', 18, 18, 148, 52)
 
@@ -1372,8 +1654,14 @@ layouts = function ()
 
     lo = add_layout('seekbar')
     lo.geometry = {x = refX, y = refY - 97 , an = 5, w = osc_geo.w - 50, h = 7}
+	lo.mouse_hitbox_height = 24
 	lo.style = osc_styles.SeekbarFg
     lo.slider.gap = 0
+    lo.slider.handle_style = osc_styles.SeekbarHandle
+    lo.slider.seekrange_style = osc_styles.SeekbarCached
+    lo.slider.seekrange_alpha = 145
+    lo.slider.seekrange_inset = 0.5
+    lo.slider.seekrange_future_only = true
     lo.slider.tooltip_style = osc_styles.Tooltip
     lo.slider.tooltip_an = 2
 
@@ -1601,10 +1889,21 @@ function osc_init()
     ne = new_element('pl_prev', 'button')
 
     ne.content = icons.previous
-    ne.enabled = (pl_pos > 1) or (loop ~= 'no')
+    ne.enabled = (pl_pos > 1) or (loop ~= 'no') or have_smart_next
     ne.eventresponder['mbtn_left_up'] =
         function ()
-            mp.commandv('playlist-prev', 'weak')
+            if (pl_pos > 1) or (loop ~= 'no') then
+                mp.commandv('playlist-prev', 'weak')
+                return
+            end
+
+            if have_smart_next then
+                local previous_request = mp.get_property_number('user-data/streamee-smart-next-request', 0)
+                local request_id = math.max(previous_request + 1, math.floor(mp.get_time() * 1000))
+                mp.set_property('user-data/streamee-smart-episode-direction', 'previous')
+                mp.set_property_number('user-data/streamee-smart-next-request', request_id)
+                show_message('Finding previous episode...')
+            end
         end
     ne.eventresponder['mbtn_right_up'] =
         function () show_message(get_playlist()) end
@@ -1624,6 +1923,7 @@ function osc_init()
             if have_smart_next then
                 local previous_request = mp.get_property_number('user-data/streamee-smart-next-request', 0)
                 local request_id = math.max(previous_request + 1, math.floor(mp.get_time() * 1000))
+                mp.set_property('user-data/streamee-smart-episode-direction', 'next')
                 mp.set_property_number('user-data/streamee-smart-next-request', request_id)
                 show_message('Finding next episode...')
             end
@@ -1963,26 +2263,98 @@ function osc_init()
 
     ne.enabled = not (mp.get_property('percent-pos') == nil)
     state.slider_element = ne.enabled and ne or nil  -- used for forced_title
-    ne.slider.markerF = function ()
+    ne.slider.segmentF = function ()
         local duration = mp.get_property_number('duration', nil)
-        if not (duration == nil) then
-            local chapters = mp.get_property_native('chapter-list', {})
-            local markers = {}
-            for n = 1, #chapters do
-                markers[n] = (chapters[n].time / duration * 100)
+        if not duration or duration <= 0 then return {} end
+
+        local chapters = state.chapter_list or {}
+        local chapter_segments = {}
+        local starts = {}
+
+        for _, chapter in ipairs(chapters) do
+            if type(chapter.time) == 'number' and
+               chapter.time >= 0 and chapter.time < duration then
+                table.insert(starts, {
+                    time = chapter.time,
+                    title = chapter.title,
+                })
             end
-            return markers
-        else
-            return {}
         end
+
+        if #starts == 0 then return {} end
+
+        if starts[1].time > 0 then
+            table.insert(starts, 1, {time = 0, title = nil})
+        end
+
+        local seekbar_width = state.slider_element and
+            state.slider_element.layout and
+            state.slider_element.layout.geometry.w or 0
+        local alternate = false
+
+        for n, chapter in ipairs(starts) do
+            local finish = starts[n + 1] and starts[n + 1].time or duration
+            if finish > chapter.time then
+                local special = get_chapter_segment_kind(chapter.title) == 'special'
+                local visual_width = (finish - chapter.time) / duration * seekbar_width
+                table.insert(chapter_segments, {
+                    start = chapter.time / duration * 100,
+                    finish = finish / duration * 100,
+                    played_style = special and osc_styles.SeekbarChapterSpecial or
+                        (alternate and osc_styles.SeekbarChapterB or osc_styles.SeekbarChapterA),
+                    unplayed_style = special and osc_styles.SeekbarChapterSpecialDim or
+                        (alternate and osc_styles.SeekbarChapterDimB or osc_styles.SeekbarChapterDimA),
+                })
+
+                -- Keep very short chapters seekable without turning a dense
+                -- chapter list into a high-contrast barcode.
+                if not special and visual_width >= 6 then
+                    alternate = not alternate
+                end
+            end
+        end
+
+        return chapter_segments
+    end
+    ne.slider.semanticSegmentF = function ()
+        local duration = mp.get_property_number('duration', nil)
+        if not duration or duration <= 0 then return {} end
+
+        local segments = {}
+        for _, segment in ipairs(state.detected_segments or {}) do
+            local start_sec = math.max(0, segment.start_sec)
+            local end_sec = math.min(duration, segment.end_sec)
+            if end_sec > start_sec then
+                table.insert(segments, {
+                    start = start_sec / duration * 100,
+                    finish = end_sec / duration * 100,
+                    played_style = osc_styles.SeekbarChapterSpecial,
+                    unplayed_style = osc_styles.SeekbarChapterSpecialDim,
+                })
+            end
+        end
+        return segments
     end
     ne.slider.posF =
         function () return mp.get_property_number('percent-pos', nil) end
     ne.slider.tooltipF = function (pos)
         local duration = mp.get_property_number('duration', nil)
         if not ((duration == nil) or (pos == nil)) then
-            possec = duration * (pos / 100)
-            return mp.format_time(possec)
+            local possec = duration * (pos / 100)
+            local label = mp.format_time(possec)
+            local detected_segment = get_detected_segment(possec)
+            if detected_segment then
+                local detected_labels = {
+                    intro = 'Intro',
+                    recap = 'Recap',
+                    outro = 'Outro',
+                }
+                label = label .. ' · ' .. (detected_labels[detected_segment.kind] or 'Segment')
+            end
+            if is_position_cached(possec) then
+                label = label .. ' · Cached'
+            end
+            return label
         else
             return ''
         end
@@ -2703,11 +3075,39 @@ end
 validate_user_opts()
 update_duration_watch()
 
+local function update_detected_segments(_, segments)
+    local detected_segments = {}
+    if type(segments) == 'table' then
+        for _, segment in ipairs(segments) do
+            local kind = type(segment) == 'table' and segment.kind or nil
+            local start_sec = type(segment) == 'table' and tonumber(segment.start_sec) or nil
+            local end_sec = type(segment) == 'table' and tonumber(segment.end_sec) or nil
+            if (kind == 'intro' or kind == 'recap' or kind == 'outro') and
+               start_sec and end_sec and start_sec >= 0 and end_sec > start_sec then
+                table.insert(detected_segments, {
+                    kind = kind,
+                    start_sec = start_sec,
+                    end_sec = end_sec,
+                })
+            end
+        end
+    end
+    table.sort(detected_segments, function(a, b) return a.start_sec < b.start_sec end)
+    state.detected_segments = detected_segments
+    request_init()
+end
+
+local function on_start_file()
+    state.detected_segments = {}
+    request_init()
+end
+
 mp.register_event('shutdown', shutdown)
-mp.register_event('start-file', request_init)
+mp.register_event('start-file', on_start_file)
 mp.observe_property('track-list', nil, request_init)
 mp.observe_property('playlist', nil, request_init)
 mp.observe_property('user-data/streamee-smart-next-available', 'bool', request_init)
+mp.observe_property('user-data/streamee-detected-segments', 'native', update_detected_segments)
 mp.observe_property("chapter-list", "native", function(_, list)
     list = list or {}  -- safety, shouldn't return nil
     table.sort(list, function(a, b) return a.time < b.time end)

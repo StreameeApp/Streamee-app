@@ -15,12 +15,16 @@ import { buildDirectStreamCacheIdentity } from '../../services/stream-cache-iden
 import {
   rankSmartNextCandidates,
   rememberCompletedSmartNextRequest,
+  orderSmartEpisodeSeasons,
+  selectSmartEpisodeInSeason,
   shouldAutoloadSmartNext,
   shouldExecuteSmartNextRequest,
   shouldReuseSmartNextPreparation,
   smartNextRequestKey,
   SMART_NEXT_AUTOLOAD_TRIGGER_RATIO,
   type RankedSmartNextCandidate,
+  type SmartEpisodeDirection,
+  type SmartEpisodeTarget,
   type SmartNextRequestIdentity,
 } from '../../services/smart-next';
 import {
@@ -32,7 +36,7 @@ import {
   shouldAutoSkipIntroDbSegment,
   validateIntroDbSegment,
 } from '../../services/introdb';
-import type { IntroDbSegment, IntroDbSegments, IntroSkipperDetectionResult, PlayerChapterSegments, PlayerPlaylistChangedPayload, PreparedQbittorrentStreamResult, StreamLaunchResult, StreamPlaylistItem, SubtitleProgressEvent, SubtitleSegment, TorrentStartupState } from '../../services/tauri';
+import type { IntroDbSegment, IntroDbSegments, IntroSkipperDetectionResult, PlayerChapterSegments, PlayerDetectedSegment, PlayerPlaylistChangedPayload, PreparedQbittorrentStreamResult, StreamLaunchResult, StreamPlaylistItem, SubtitleProgressEvent, SubtitleSegment, TorrentStartupState } from '../../services/tauri';
 import './Player.css';
 
 const formatTime = (seconds: number): string => {
@@ -95,7 +99,7 @@ type WhisperMediaSource = {
   sourceType: WhisperSourceType;
 };
 
-type SmartNextTarget = { season: number; episode: number };
+type SmartNextTarget = SmartEpisodeTarget;
 type SmartNextPreparedMatch = {
   target: SmartNextTarget;
   episodeLabel: string;
@@ -118,6 +122,7 @@ type SmartNextPreparationEntry = {
 };
 type SmartNextPerformanceTrace = {
   id: string;
+  direction: SmartEpisodeDirection;
   startedAt: number;
   preparationStartedAt?: number;
   nextEpisodeResolvedAt?: number;
@@ -154,25 +159,30 @@ const isAiredEpisode = (airDate: string | null): boolean => {
   return timestamp <= endOfToday.getTime();
 };
 
-const findNextAiredEpisode = async (
+const findAdjacentAiredEpisode = async (
   tmdbId: number,
   current: SmartNextTarget,
+  direction: SmartEpisodeDirection,
 ): Promise<SmartNextTarget | null> => {
-  const seasons = (await getTmdbSeasons(tmdbId))
-    .filter((season) => season.season_number >= current.season)
-    .sort((a, b) => a.season_number - b.season_number);
+  const seasonNumbers = orderSmartEpisodeSeasons(
+    (await getTmdbSeasons(tmdbId)).map((season) => season.season_number),
+    current,
+    direction,
+  );
 
-  for (const season of seasons) {
-    const episodes = (await getTmdbEpisodes(tmdbId, season.season_number))
-      .filter((episode) => isAiredEpisode(episode.air_date))
-      .filter((episode) =>
-        season.season_number > current.season || episode.episode_number > current.episode
-      )
-      .sort((a, b) => a.episode_number - b.episode_number);
-    if (episodes[0]) {
+  for (const season of seasonNumbers) {
+    const episode = selectSmartEpisodeInSeason(
+      (await getTmdbEpisodes(tmdbId, season))
+        .filter((episode) => isAiredEpisode(episode.air_date))
+        .map((episode) => episode.episode_number),
+      season,
+      current,
+      direction,
+    );
+    if (episode != null) {
       return {
-        season: season.season_number,
-        episode: episodes[0].episode_number,
+        season,
+        episode,
       };
     }
   }
@@ -810,6 +820,7 @@ const Player: React.FC = () => {
   const smartNextActiveRequestRef = useRef<string | null>(null);
   const smartNextCompletedRequestsRef = useRef<Set<string>>(new Set());
   const smartNextPreparationRef = useRef<SmartNextPreparationEntry | null>(null);
+  const smartPreviousPreparationRef = useRef<SmartNextPreparationEntry | null>(null);
   const smartNextWarmupHandoffRef = useRef<SmartNextWarmupHandoff | null>(null);
   const smartNextPerformanceRef = useRef<SmartNextPerformanceTrace | null>(null);
   const smartNextTransitionRef = useRef(false);
@@ -1647,6 +1658,7 @@ const Player: React.FC = () => {
     const outroSmartNextRetryAfter = new Map<string, number>();
     const segmentDetectionLoggedKeys = new Set<string>();
     const segmentDecisionLoggedKeys = new Set<string>();
+    let lastPublishedDetectedSegmentsSignature = '';
     type SegmentBoundaryTimerState = {
       timerId: number;
       generation: number;
@@ -1660,6 +1672,29 @@ const Player: React.FC = () => {
     if (!selectedStream) {
       return;
     }
+
+    const publishDetectedSegmentsToPlayer = (
+      filename: string,
+      resolved: Array<readonly [PlayerDetectedSegment['kind'], IntroDbSegment | null]>,
+    ) => {
+      const segments = resolved.flatMap(([kind, segment]) => segment ? [{
+        kind,
+        start_sec: segment.start_sec,
+        end_sec: segment.end_sec,
+        source: segment.source,
+      }] : []);
+      const signature = JSON.stringify([filename, segments]);
+      if (signature === lastPublishedDetectedSegmentsSignature) return;
+      lastPublishedDetectedSegmentsSignature = signature;
+      void window.electronAPI.player.setDetectedSegments(segments, filename).catch((error) => {
+        if (lastPublishedDetectedSegmentsSignature === signature) {
+          lastPublishedDetectedSegmentsSignature = '';
+        }
+        if (!disposed) {
+          console.debug('[Episode Segments] Could not publish detected segments to MPV', error);
+        }
+      });
+    };
 
     const cancelSegmentBoundaryTimer = (reason: string) => {
       segmentBoundaryGeneration += 1;
@@ -1865,10 +1900,14 @@ const Player: React.FC = () => {
 
     const startPlayback = async () => {
       const isCurrentPlaybackLaunch = () => !disposed && playbackLaunchIdRef.current === playbackLaunchId;
-      const beginSmartNextPerformance = (reason: 'autoload' | 'manual') => {
+      const beginSmartNextPerformance = (
+        reason: 'autoload' | 'manual',
+        direction: SmartEpisodeDirection = 'next',
+      ) => {
         const now = Date.now();
         const trace: SmartNextPerformanceTrace = {
           id: `${playbackLaunchId}-${now}`,
+          direction,
           startedAt: now,
           preparationStartedAt: now,
         };
@@ -1876,17 +1915,20 @@ const Player: React.FC = () => {
         console.log('[Smart Next Performance] Started', {
           traceId: trace.id,
           reason,
+          direction,
         });
         return trace;
       };
       const logSmartNextPerformance = (
         stage: string,
         details: Record<string, unknown> = {},
+        traceOverride?: SmartNextPerformanceTrace | null,
       ) => {
-        const trace = smartNextPerformanceRef.current;
+        const trace = traceOverride ?? smartNextPerformanceRef.current;
         if (!trace) return;
         console.log('[Smart Next Performance]', {
           traceId: trace.id,
+          direction: trace.direction,
           stage,
           elapsedMs: Date.now() - trace.startedAt,
           ...details,
@@ -2071,7 +2113,11 @@ const Player: React.FC = () => {
         }
         return currentEpisode;
       };
-      const getOrCreateSmartNextPreparation = (filename: string): SmartNextPreparationEntry => {
+      const getOrCreateSmartNextPreparation = (
+        filename: string,
+        direction: SmartEpisodeDirection = 'next',
+        trace: SmartNextPerformanceTrace | null = smartNextPerformanceRef.current,
+      ): SmartNextPreparationEntry => {
         if (!selectedMeta || selectedMeta.type !== 'series') {
           throw new Error('Smart Next is only available for TV episodes.');
         }
@@ -2090,10 +2136,14 @@ const Player: React.FC = () => {
           tmdbId,
           currentEpisode.season,
           currentEpisode.episode,
+          direction,
           configuredAddons,
           selectedStream.torrent.id || selectedStream.url,
         ].join(':');
-        const existing = smartNextPreparationRef.current;
+        const preparationRef = direction === 'next'
+          ? smartNextPreparationRef
+          : smartPreviousPreparationRef;
+        const existing = preparationRef.current;
         if (
           existing
           && shouldReuseSmartNextPreparation(
@@ -2108,21 +2158,22 @@ const Player: React.FC = () => {
 
         let entry: SmartNextPreparationEntry;
         const promise = (async (): Promise<SmartNextPreparedMatch> => {
-          const target = await findNextAiredEpisode(tmdbId, currentEpisode);
-          const trace = smartNextPerformanceRef.current;
+          const target = await findAdjacentAiredEpisode(tmdbId, currentEpisode, direction);
           if (trace) {
             trace.nextEpisodeResolvedAt = Date.now();
             logSmartNextPerformance('next-episode-resolved', {
               season: target?.season ?? null,
               episode: target?.episode ?? null,
               resolveNextEpisodeMs: trace.nextEpisodeResolvedAt - (trace.preparationStartedAt ?? trace.startedAt),
-            });
+            }, trace);
           }
           if (!isCurrentPlaybackLaunch()) {
             throw new Error('Smart Next preparation was cancelled.');
           }
           if (!target) {
-            throw new Error('No later aired episode is available yet.');
+            throw new Error(direction === 'next'
+              ? 'No later aired episode is available yet.'
+              : 'No earlier aired episode is available.');
           }
 
           const episodeLabel = formatSmartNextEpisode(target);
@@ -2154,7 +2205,7 @@ const Player: React.FC = () => {
               candidateCount: candidates.length,
               sourceSearchMs: trace.sourceSelectedAt - (trace.sourceSearchStartedAt ?? trace.startedAt),
               preparationMs: trace.sourceSelectedAt - (trace.preparationStartedAt ?? trace.startedAt),
-            });
+            }, trace);
           }
           return { target, episodeLabel, best };
         })();
@@ -2166,32 +2217,32 @@ const Player: React.FC = () => {
           result: null,
           warmupPromise: null,
         };
-        smartNextPreparationRef.current = entry;
+        preparationRef.current = entry;
         void promise
           .then((result) => {
-            if (smartNextPreparationRef.current === entry) {
+            if (preparationRef.current === entry) {
               entry.result = result;
             }
           })
           .catch(() => {
-            if (smartNextPreparationRef.current === entry) {
-              smartNextPreparationRef.current = null;
+            if (preparationRef.current === entry) {
+              preparationRef.current = null;
             }
           });
         return entry;
       };
-      const warmPreparedSmartNext = async (prepared: SmartNextPreparedMatch) => {
+      const warmPreparedSmartNext = async (
+        prepared: SmartNextPreparedMatch,
+        trace: SmartNextPerformanceTrace,
+      ) => {
         const candidate = prepared.best.result;
         const sourceUrl = candidate.streamUrl || candidate.magnetUri;
-        const trace = smartNextPerformanceRef.current;
-        if (trace) {
-          trace.warmupStartedAt = Date.now();
-          trace.episode = prepared.episodeLabel;
-          logSmartNextPerformance('warmup-started', {
-            episode: prepared.episodeLabel,
-            provider: candidate.directStreamProvider || candidate.sourceProvider || candidate.indexer,
-          });
-        }
+        trace.warmupStartedAt = Date.now();
+        trace.episode = prepared.episodeLabel;
+        logSmartNextPerformance('warmup-started', {
+          episode: prepared.episodeLabel,
+          provider: candidate.directStreamProvider || candidate.sourceProvider || candidate.indexer,
+        }, trace);
         let addonSessionId: string | undefined;
         let preparedQbitHash: string | undefined;
         try {
@@ -2278,7 +2329,7 @@ const Player: React.FC = () => {
               episode: prepared.episodeLabel,
               provider: candidate.sourceProvider || candidate.indexer,
               reason: 'playable-source-reference-required',
-            });
+            }, trace);
             console.info('[Smart Next Autoload] No non-disruptive warmup path for selected source', {
               episode: prepared.episodeLabel,
               provider: candidate.sourceProvider || candidate.indexer,
@@ -2293,20 +2344,18 @@ const Player: React.FC = () => {
             return;
           }
           prepared.warmup = handoff;
-          if (trace) {
-            trace.warmupReadyAt = Date.now();
-            trace.sourceType = handoff.sourceType;
-            trace.cachedBytes = handoff.prepared.ready_bytes;
-            trace.totalBytes = handoff.prepared.total_bytes;
-            trace.warmupReady = true;
-            logSmartNextPerformance('warmup-ready', {
-              episode: prepared.episodeLabel,
-              sourceType: handoff.sourceType,
-              warmupMs: trace.warmupReadyAt - (trace.warmupStartedAt ?? trace.startedAt),
-              cachedBytes: handoff.prepared.ready_bytes,
-              totalBytes: handoff.prepared.total_bytes,
-            });
-          }
+          trace.warmupReadyAt = Date.now();
+          trace.sourceType = handoff.sourceType;
+          trace.cachedBytes = handoff.prepared.ready_bytes;
+          trace.totalBytes = handoff.prepared.total_bytes;
+          trace.warmupReady = true;
+          logSmartNextPerformance('warmup-ready', {
+            episode: prepared.episodeLabel,
+            sourceType: handoff.sourceType,
+            warmupMs: trace.warmupReadyAt - (trace.warmupStartedAt ?? trace.startedAt),
+            cachedBytes: handoff.prepared.ready_bytes,
+            totalBytes: handoff.prepared.total_bytes,
+          }, trace);
           console.log('[Smart Next Autoload] Warmup ready for handoff', {
             episode: prepared.episodeLabel,
             sourceType: handoff.sourceType,
@@ -2327,7 +2376,7 @@ const Player: React.FC = () => {
               episode: prepared.episodeLabel,
               warmupMs: Date.now() - (trace?.warmupStartedAt ?? trace?.startedAt ?? Date.now()),
               message,
-            });
+            }, trace);
             console.warn('[Smart Next Autoload] Warmup failed; metadata preparation remains usable:', error);
           }
         }
@@ -2383,14 +2432,14 @@ const Player: React.FC = () => {
                     || prepared.best.result.sourceProvider
                     || prepared.best.result.indexer,
                 });
-                preparation.warmupPromise ??= warmPreparedSmartNext(prepared);
+                preparation.warmupPromise ??= warmPreparedSmartNext(prepared, trace);
               }
             })
             .catch((error) => {
               if (isCurrentPlaybackLaunch()) {
                 logSmartNextPerformance('source-preparation-failed', {
                   message: error instanceof Error ? error.message : String(error),
-                });
+                }, trace);
                 console.warn('[Smart Next Autoload] Source preparation failed:', error);
               }
             });
@@ -2401,23 +2450,41 @@ const Player: React.FC = () => {
       const handleSmartNextRequest = async (
         filename: string,
         allowUnwarmedFallback = false,
+        direction: SmartEpisodeDirection = 'next',
       ) => {
         if (!isCurrentPlaybackLaunch()) return false;
 
         try {
           const store = useStore.getState();
-          if (store.playlistActive && store.playlistCurrentIndex < store.playlistFiles.length - 1) {
+          if (
+            direction === 'next'
+            && store.playlistActive
+            && store.playlistCurrentIndex < store.playlistFiles.length - 1
+          ) {
             await window.electronAPI.player.playlistNext();
             return true;
           }
-          const trace = smartNextPerformanceRef.current ?? beginSmartNextPerformance('manual');
+          if (direction === 'previous' && store.playlistActive && store.playlistCurrentIndex > 0) {
+            await window.electronAPI.player.playlistPrev();
+            return true;
+          }
+          const activeTrace = smartNextPerformanceRef.current;
+          const trace = direction === 'next'
+            && activeTrace?.direction === 'next'
+            && smartNextPreparationRef.current != null
+            ? activeTrace
+            : beginSmartNextPerformance('manual', direction);
           trace.transitionRequestedAt = Date.now();
           logSmartNextPerformance('transition-requested', {
-            sourcePreparationReady: !!smartNextPreparationRef.current?.result,
-          });
-          const preparation = getOrCreateSmartNextPreparation(filename);
+            sourcePreparationReady: !!(
+              direction === 'next'
+                ? smartNextPreparationRef.current?.result
+                : smartPreviousPreparationRef.current?.result
+            ),
+          }, trace);
+          const preparation = getOrCreateSmartNextPreparation(filename, direction, trace);
           if (!preparation.result) {
-            showSmartNextMessage('Preparing next episode...', 5000);
+            showSmartNextMessage(`Preparing ${direction} episode...`, 5000);
           }
           const prepared = await preparation.promise;
           await preparation.warmupPromise;
@@ -2460,7 +2527,7 @@ const Player: React.FC = () => {
 
           flushCurrentPlayingProgress();
           showSmartNextMessage(
-            `Next ${episodeLabel}: ${matchSummary || best.result.quality}`,
+            `${direction === 'next' ? 'Next' : 'Previous'} ${episodeLabel}: ${matchSummary || best.result.quality}`,
             4000,
           );
 
@@ -2540,7 +2607,10 @@ const Player: React.FC = () => {
           smartNextWindowRestoreRef.current = null;
           const message = error instanceof Error ? error.message : String(error);
           console.error('[Smart Next] Failed:', error);
-          showSmartNextMessage(`Smart Next: ${message}`, 5000);
+          showSmartNextMessage(
+            `${direction === 'next' ? 'Smart Next' : 'Previous episode'}: ${message}`,
+            5000,
+          );
           return false;
         }
       };
@@ -3381,6 +3451,12 @@ const Player: React.FC = () => {
           }
         }
 
+        publishDetectedSegmentsToPlayer(filename, [
+          ['intro', resolvedIntro],
+          ['recap', resolvedRecap],
+          ['outro', resolvedOutro],
+        ]);
+
         if (!localDetectionPending && !segmentDetectionLoggedKeys.has(episodeKey)) {
           segmentDetectionLoggedKeys.add(episodeKey);
           console.debug('[Segment Detection] Resolution complete', {
@@ -3631,7 +3707,7 @@ const Player: React.FC = () => {
         }
       };
       const consumeSmartNextRequest = async (
-        request: SmartNextRequestIdentity,
+        request: SmartNextRequestIdentity & { direction?: SmartEpisodeDirection },
         filename: string,
       ) => {
         const requestKey = smartNextRequestKey(request);
@@ -3650,7 +3726,7 @@ const Player: React.FC = () => {
         smartNextActiveRequestRef.current = requestKey;
         console.log('[Smart Next] Consuming retained request', { ...request, filename });
         try {
-          await handleSmartNextRequest(filename, true);
+          await handleSmartNextRequest(filename, true, request.direction ?? 'next');
         } finally {
           rememberCompletedSmartNextRequest(smartNextCompletedRequestsRef.current, requestKey);
           await acknowledgeSmartNextRequest(request);
@@ -6000,6 +6076,7 @@ const Player: React.FC = () => {
         smartNextWarmupHandoffRef.current = null;
         smartNextPreparationRef.current = null;
       }
+      smartPreviousPreparationRef.current = null;
       if (addonProxySessionId) {
         const releasedSessionId = addonProxySessionId;
         addonProxySessionId = null;

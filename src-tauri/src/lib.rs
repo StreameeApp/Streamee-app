@@ -22,9 +22,10 @@ use introdb::fetch_introdb_segments;
 use mpv_ipc::{
     ack_smart_next_request, fetch_player_tracks, get_pending_smart_next_request, get_player_info,
     get_playlist_info, load_file_replace_with_title, load_subtitle_file, playlist_add,
-    playlist_next, playlist_prev, seek_absolute_time, set_media_title as set_mpv_media_title,
-    set_player_track as set_mpv_player_track, set_smart_next_available, show_player_message,
-    start_player_observing, stop_player_observing,
+    playlist_next, playlist_prev, seek_absolute_time, set_detected_segments,
+    set_media_title as set_mpv_media_title, set_player_track as set_mpv_player_track,
+    set_smart_next_available, show_player_message, start_player_observing, stop_player_observing,
+    PlayerDetectedSegment,
 };
 use sha1::{Digest, Sha1};
 use tauri_plugin_store::StoreExt;
@@ -2235,6 +2236,7 @@ struct SingleFileRangeCache {
     file: Arc<fs::File>,
     total_size: u64,
     retain_whole_file: bool,
+    fill_whole_file: AtomicBool,
     pinned_opening_bytes: AtomicU64,
     pinned_tail_start: AtomicU64,
     producer_limit_bytes: AtomicU64,
@@ -2852,6 +2854,7 @@ impl SingleFileRangeCache {
             file: Arc::new(file),
             total_size,
             retain_whole_file,
+            fill_whole_file: AtomicBool::new(retain_whole_file),
             pinned_opening_bytes: AtomicU64::new(0),
             pinned_tail_start: AtomicU64::new(tail_start),
             producer_limit_bytes: AtomicU64::new(total_size),
@@ -2877,7 +2880,7 @@ impl SingleFileRangeCache {
         provider: &str,
         total_size: u64,
         tail_start: u64,
-        retain_whole_file: bool,
+        fill_whole_file: bool,
     ) -> Result<Arc<Self>, String> {
         fs::create_dir_all(&settings.root)
             .map_err(|error| format!("Failed to create persistent stream cache folder: {error}"))?;
@@ -2898,6 +2901,9 @@ impl SingleFileRangeCache {
                 active_cache
                     .pinned_tail_start
                     .fetch_min(tail_start, Ordering::AcqRel);
+                if fill_whole_file {
+                    active_cache.fill_whole_file.store(true, Ordering::Release);
+                }
                 info!(
                     "Reusing active persistent stream cache item: provider={} total_size={}",
                     provider, total_size
@@ -2960,7 +2966,8 @@ impl SingleFileRangeCache {
             path: content_path,
             file: Arc::new(file),
             total_size,
-            retain_whole_file,
+            retain_whole_file: true,
+            fill_whole_file: AtomicBool::new(fill_whole_file),
             pinned_opening_bytes: AtomicU64::new(0),
             pinned_tail_start: AtomicU64::new(tail_start),
             producer_limit_bytes: AtomicU64::new(total_size),
@@ -3149,22 +3156,23 @@ impl SingleFileRangeCache {
             return Ok(SingleFileCachePlan::Wait);
         }
         let tail_start = self.pinned_tail_start.load(Ordering::Acquire);
-        let full_cache_generation = if self.retain_whole_file && position < tail_start {
-            state.full_cache_generation = state.full_cache_generation.saturating_add(1);
-            state.full_cache_priority_start = Some(position);
-            let generation = state.full_cache_generation;
-            state.active_producers.retain(|producer| {
-                let keep = producer.cursor >= tail_start;
-                if !keep {
-                    producer.cancel.store(true, Ordering::Release);
-                }
-                keep
-            });
-            self.changed.notify_all();
-            Some(generation)
-        } else {
-            None
-        };
+        let full_cache_generation =
+            if self.fill_whole_file.load(Ordering::Acquire) && position < tail_start {
+                state.full_cache_generation = state.full_cache_generation.saturating_add(1);
+                state.full_cache_priority_start = Some(position);
+                let generation = state.full_cache_generation;
+                state.active_producers.retain(|producer| {
+                    let keep = producer.cursor >= tail_start;
+                    if !keep {
+                        producer.cancel.store(true, Ordering::Release);
+                    }
+                    keep
+                });
+                self.changed.notify_all();
+                Some(generation)
+            } else {
+                None
+            };
         if state.active_producers.len() >= SINGLE_FILE_CACHE_MAX_PRODUCERS {
             if let Some(index) = state
                 .active_producers
@@ -3503,7 +3511,7 @@ fn create_stream_range_cache(
                 provider,
                 total_size,
                 tail_start,
-                true,
+                retain_whole_file,
             ) {
                 Ok(cache) => return Ok(cache),
                 Err(error) => warn!(
@@ -4870,13 +4878,14 @@ fn handle_addon_proxy_connection(mut stream: TcpStream) {
         let request_sequence = entry.request_sequence.fetch_add(1, Ordering::Relaxed) + 1;
         if should_log_single_file_cache_request(request_sequence) {
             info!(
-                "Addon single-file cache request id={} sequence={} requested_range={} response_range={} tail={} retain_whole_file={}",
+                "Addon single-file cache request id={} sequence={} requested_range={} response_range={} tail={} retain_whole_file={} fill_whole_file={}",
                 id,
                 request_sequence,
                 range_label(request_start, request_end),
                 range_label(request_start, response_end),
                 request_start >= entry.tail_start,
-                entry.range_cache.retain_whole_file
+                entry.range_cache.retain_whole_file,
+                entry.range_cache.fill_whole_file.load(Ordering::Acquire)
             );
         }
         if let Err(error) =
@@ -5101,7 +5110,7 @@ async fn prepare_addon_stream_url(
         cleanup_addon_entry_cache(&stale_entry);
     }
     info!(
-        "Addon single-file stream cache: sparse=true max_producers={} read_ahead_bytes={} producer_back_buffer_bytes={} block_bytes={} rolling_limit_bytes={} pinned_opening_bytes={} persistent={} retain_whole_file={} whisper_deduplication={} total_size={}",
+        "Addon single-file stream cache: sparse=true max_producers={} read_ahead_bytes={} producer_back_buffer_bytes={} block_bytes={} rolling_limit_bytes={} pinned_opening_bytes={} persistent={} retain_whole_file={} fill_whole_file={} whisper_deduplication={} total_size={}",
         SINGLE_FILE_CACHE_MAX_PRODUCERS,
         SINGLE_FILE_CACHE_READ_AHEAD_BYTES,
         SINGLE_FILE_CACHE_PRODUCER_BACK_BUFFER_BYTES,
@@ -5110,6 +5119,7 @@ async fn prepare_addon_stream_url(
         pinned_opening_bytes,
         entry.range_cache.is_persistent(),
         entry.range_cache.retain_whole_file,
+        entry.range_cache.fill_whole_file.load(Ordering::Acquire),
         whisper_deduplication_enabled.unwrap_or(false),
         total_size
     );
@@ -6185,6 +6195,14 @@ async fn seek_player_time(position: f64, expected_filename: String) -> Result<()
         position, expected_filename
     );
     seek_absolute_time(position, &expected_filename)
+}
+
+#[tauri::command]
+async fn set_player_detected_segments(
+    segments: Vec<PlayerDetectedSegment>,
+    expected_filename: String,
+) -> Result<(), String> {
+    set_detected_segments(segments, &expected_filename)
 }
 
 #[tauri::command]
@@ -8202,6 +8220,7 @@ pub fn run() {
             stop_player,
             stop_mpv_process,
             seek_player_time,
+            set_player_detected_segments,
             get_player_tracks,
             set_player_track,
             set_player_media_title,
@@ -8768,6 +8787,49 @@ mod stream_cache_tests {
         drop(first);
         assert!(second.is_persistent());
         drop(second);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persistent_cache_without_full_mpv_cache_stays_demand_bounded() {
+        let root = std::env::temp_dir().join(format!(
+            "streamee-persistent-cache-demand-bounded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let settings = PersistentStreamCacheSettings {
+            root: root.clone(),
+            limit_bytes: 1024 * 1024 * 1024,
+        };
+        let total_size = 512 * 1024 * 1024;
+        let cache = SingleFileRangeCache::open_persistent(
+            &settings,
+            "addon:demand-bounded-test:0",
+            "addon",
+            total_size,
+            total_size - (64 * 1024 * 1024),
+            false,
+        )
+        .unwrap();
+
+        assert!(cache.retain_whole_file);
+        assert!(!cache.fill_whole_file.load(Ordering::Acquire));
+        let producer = match cache.plan(0).unwrap() {
+            SingleFileCachePlan::StartProducer(producer) => producer,
+            _ => panic!("expected a demand-bounded producer"),
+        };
+        assert_eq!(producer.upstream_end, total_size - 1);
+        assert!(producer.full_cache_generation.is_none());
+        assert_eq!(
+            cache.state.lock().unwrap().active_producers[0].demand_end,
+            SINGLE_FILE_CACHE_READ_AHEAD_BYTES - 1
+        );
+
+        drop(producer);
+        drop(cache);
         let _ = fs::remove_dir_all(root);
     }
 

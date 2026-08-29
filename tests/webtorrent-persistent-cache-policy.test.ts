@@ -9,7 +9,7 @@ const source = fs.readFileSync(
 
 test('WebTorrent persistence is keyed without requiring Continue to know the size', () => {
   const policyStart = source.indexOf('const usePersistentCache =');
-  const policyEnd = source.indexOf('\n\n  if (usePersistentCache)', policyStart);
+  const policyEnd = source.indexOf('if (usePersistentCache)', policyStart);
   assert.ok(policyStart >= 0 && policyEnd > policyStart);
   const policy = source.slice(policyStart, policyEnd);
   assert.match(policy, /cacheOptions\.persistentCacheEnabled === true/);

@@ -3,13 +3,56 @@ import test from 'node:test';
 import type { TorrentResult } from '../src/renderer/store/index.ts';
 import {
   fingerprintRelease,
+  orderSmartEpisodeSeasons,
   rankSmartNextCandidates,
   rememberCompletedSmartNextRequest,
+  selectSmartEpisodeInSeason,
   shouldAutoloadSmartNext,
   shouldExecuteSmartNextRequest,
   shouldReuseSmartNextPreparation,
   smartNextRequestKey,
 } from '../src/renderer/services/smart-next.ts';
+
+test('previous episode traverses regular seasons backward without falling into specials', () => {
+  assert.deepEqual(
+    orderSmartEpisodeSeasons([0, 1, 2, 3], { season: 2, episode: 1 }, 'previous'),
+    [2, 1],
+  );
+  assert.deepEqual(
+    orderSmartEpisodeSeasons([0, 1, 2], { season: 1, episode: 1 }, 'previous'),
+    [1],
+  );
+});
+
+test('previous episode selects the closest lower episode from unsorted data', () => {
+  assert.equal(
+    selectSmartEpisodeInSeason([1, 3, 2], 2, { season: 2, episode: 4 }, 'previous'),
+    3,
+  );
+  assert.equal(
+    selectSmartEpisodeInSeason([1, 3, 2], 1, { season: 2, episode: 1 }, 'previous'),
+    3,
+  );
+  assert.equal(
+    selectSmartEpisodeInSeason([1], 1, { season: 1, episode: 1 }, 'previous'),
+    null,
+  );
+});
+
+test('next episode keeps forward regular-season traversal semantics', () => {
+  assert.deepEqual(
+    orderSmartEpisodeSeasons([0, 1, 2, 3], { season: 2, episode: 3 }, 'next'),
+    [2, 3],
+  );
+  assert.equal(
+    selectSmartEpisodeInSeason([5, 4, 2], 2, { season: 2, episode: 3 }, 'next'),
+    4,
+  );
+  assert.equal(
+    selectSmartEpisodeInSeason([2, 1], 3, { season: 2, episode: 3 }, 'next'),
+    1,
+  );
+});
 
 test('autoload starts only at the enabled 70 percent boundary', () => {
   assert.equal(shouldAutoloadSmartNext(false, 70, 100), false);

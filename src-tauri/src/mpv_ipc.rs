@@ -34,9 +34,33 @@ static SMART_NEXT_PENDING_REQUEST: once_cell::sync::Lazy<Mutex<Option<SmartNextP
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmartEpisodeDirection {
+    Next,
+    Previous,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PlayerDetectedSegmentKind {
+    Intro,
+    Recap,
+    Outro,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlayerDetectedSegment {
+    pub kind: PlayerDetectedSegmentKind,
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct SmartNextPendingRequest {
     pub request_id: i64,
     pub mpv_pid: u32,
+    pub direction: SmartEpisodeDirection,
 }
 
 impl SmartNextPendingRequest {
@@ -1008,6 +1032,15 @@ pub(crate) fn remote_player_command(command: &str, value: Option<f64>) -> Result
                     &loop_playlist,
                     smart_next_available,
                 ) {
+                    let direction_command = MpvCommand {
+                        command: vec![
+                            serde_json::json!("set_property"),
+                            serde_json::json!("user-data/streamee-smart-episode-direction"),
+                            serde_json::json!("next"),
+                        ],
+                        request_id: None,
+                    };
+                    let _ = send_command(pipe, &direction_command);
                     let previous_request =
                         get_property_value(pipe, "user-data/streamee-smart-next-request")
                             .and_then(|value| value.as_i64())
@@ -1787,6 +1820,72 @@ pub fn seek_absolute_time(seconds: f64, expected_filename: &str) -> Result<(), S
     }
 }
 
+pub fn set_detected_segments(
+    segments: Vec<PlayerDetectedSegment>,
+    expected_filename: &str,
+) -> Result<(), String> {
+    if expected_filename.trim().is_empty() {
+        return Err("Expected MPV filename is required for detected segments".to_string());
+    }
+    if segments.len() > 3 {
+        return Err("At most one Intro, Recap, and Outro segment may be published".to_string());
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        if !segment.start_sec.is_finite()
+            || !segment.end_sec.is_finite()
+            || segment.start_sec < 0.0
+            || segment.end_sec <= segment.start_sec
+        {
+            return Err(format!("Invalid detected segment at index {index}"));
+        }
+        if segments[..index]
+            .iter()
+            .any(|existing| existing.kind == segment.kind)
+        {
+            return Err(format!(
+                "Duplicate detected segment kind: {:?}",
+                segment.kind
+            ));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let pipe = connect_to_mpv_pipe_with_retry()
+            .ok_or_else(|| "MPV not connected after retry".to_string())?;
+        let current_filename = get_property_value(pipe, "filename")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        if current_filename.as_deref() != Some(expected_filename) {
+            unsafe {
+                let _ = CloseHandle(pipe);
+            }
+            return Err(format!(
+                "MPV item changed before detected segments were published (expected {expected_filename:?}, current {current_filename:?})"
+            ));
+        }
+
+        let command = MpvCommand {
+            command: vec![
+                serde_json::json!("set_property"),
+                serde_json::json!("user-data/streamee-detected-segments"),
+                serde_json::json!(segments),
+            ],
+            request_id: None,
+        };
+        let result = send_command(pipe, &command);
+        unsafe {
+            let _ = CloseHandle(pipe);
+        }
+        confirmed_unit_command(result, "publish detected segments")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (segments, expected_filename);
+        Err("Not implemented for this platform".to_string())
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn refresh_playback_position(pipe: HANDLE, state: &mut PlaybackSessionState) -> bool {
     let mut updated = false;
@@ -2153,6 +2252,16 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                     {
                         if request > 0 && request != last_smart_next_request {
                             last_smart_next_request = request;
+                            let direction = get_property_value(
+                                pipe,
+                                "user-data/streamee-smart-episode-direction",
+                            )
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                            .map(|value| match value.as_str() {
+                                "previous" => SmartEpisodeDirection::Previous,
+                                _ => SmartEpisodeDirection::Next,
+                            })
+                            .unwrap_or(SmartEpisodeDirection::Next);
                             let clear_request_cmd = MpvCommand {
                                 command: vec![
                                     serde_json::json!("set_property"),
@@ -2169,6 +2278,7 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                         *pending = Some(SmartNextPendingRequest {
                                             request_id: request,
                                             mpv_pid,
+                                            direction,
                                         });
                                         true
                                     } else {
@@ -2178,13 +2288,14 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                 .unwrap_or(false);
                             if accepted {
                                 info!(
-                                    "[MPV IPC] Smart Next request {request} retained for renderer (MPV {mpv_pid})"
+                                    "[MPV IPC] Smart episode request {request} retained for renderer (MPV {mpv_pid}, direction={direction:?})"
                                 );
                                 let _ = app_handle.emit(
                                     "player://smart-next-requested",
                                     serde_json::json!({
                                         "request_id": request,
                                         "mpv_pid": mpv_pid,
+                                        "direction": direction,
                                         "filename": current_state.filename,
                                         "playlist_pos": current_state.playlist_pos,
                                     }),
@@ -2599,7 +2710,8 @@ pub fn stop_player_watcher() {
 mod smart_next_tests {
     use super::{
         cached_tail_seconds, cached_window_end_seconds, mpv_start_option,
-        next_smart_next_request_id, should_request_smart_next, SmartNextPendingRequest,
+        next_smart_next_request_id, should_request_smart_next, SmartEpisodeDirection,
+        SmartNextPendingRequest,
     };
 
     #[test]
@@ -2607,6 +2719,7 @@ mod smart_next_tests {
         let request = SmartNextPendingRequest {
             request_id: 10_000,
             mpv_pid: 200,
+            direction: SmartEpisodeDirection::Previous,
         };
 
         assert!(request.belongs_to(200));
@@ -2614,8 +2727,27 @@ mod smart_next_tests {
         assert!(!SmartNextPendingRequest {
             request_id: 10_000,
             mpv_pid: 0,
+            direction: SmartEpisodeDirection::Next,
         }
         .belongs_to(0));
+    }
+
+    #[test]
+    fn pending_previous_request_serializes_for_the_renderer_contract() {
+        let request = SmartNextPendingRequest {
+            request_id: 10_001,
+            mpv_pid: 200,
+            direction: SmartEpisodeDirection::Previous,
+        };
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "request_id": 10_001,
+                "mpv_pid": 200,
+                "direction": "previous",
+            }),
+        );
     }
 
     #[test]

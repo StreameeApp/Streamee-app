@@ -323,8 +323,16 @@ export interface PlayerPlaylistChangedPayload {
 export interface PlayerSmartNextRequestedPayload {
   request_id: number;
   mpv_pid: number;
+  direction: 'next' | 'previous';
   filename: string;
   playlist_pos: number;
+}
+
+export interface PlayerDetectedSegment {
+  kind: 'intro' | 'recap' | 'outro';
+  start_sec: number;
+  end_sec: number;
+  source?: string;
 }
 
 export interface IntroDbSegment {
@@ -602,6 +610,12 @@ const tauriAPI = {
     seekTime: async (position: number, expectedFilename: string) => {
       await invoke('seek_player_time', { position, expectedFilename });
     },
+    setDetectedSegments: async (
+      segments: PlayerDetectedSegment[],
+      expectedFilename: string,
+    ) => {
+      await invoke('set_player_detected_segments', { segments, expectedFilename });
+    },
     getTracks: async () => {
       try {
         return await invoke<Track[]>('get_player_tracks');
@@ -659,7 +673,7 @@ const tauriAPI = {
       await invoke('restore_smart_next_window_state', { pid, fullscreen });
     },
     getPendingSmartNextRequest: async () => {
-      return await invoke<Pick<PlayerSmartNextRequestedPayload, 'request_id' | 'mpv_pid'> | null>('get_pending_smart_next_request');
+      return await invoke<Pick<PlayerSmartNextRequestedPayload, 'request_id' | 'mpv_pid' | 'direction'> | null>('get_pending_smart_next_request');
     },
     ackSmartNextRequest: async (requestId: number, mpvPid: number) => {
       return await invoke<boolean>('ack_smart_next_request', { requestId, mpvPid });
