@@ -795,17 +795,38 @@ fn process_is_running(_pid: u32) -> bool {
     false
 }
 
-pub fn start_mpv_log_ingestion(path: PathBuf, pid: u32) {
+pub fn start_mpv_log_ingestion(scratch_path: PathBuf, filtered_path: PathBuf, pid: u32) {
     ACTIVE_MPV_LOG_PID.store(pid as u64, Ordering::SeqCst);
     let _ = std::thread::Builder::new()
         .name(format!("streamee-mpv-log-{pid}"))
         .spawn(move || {
+            let mut filtered_file = match OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&filtered_path)
+            {
+                Ok(file) => Some(file),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "streamee_lib::mpv",
+                        source = "mpv",
+                        subsystem = "mpv.logging",
+                        event = "mpv.filtered_log_open_failed",
+                        playback_session_id = pid,
+                        path = %filtered_path.display(),
+                        error_kind = %error.kind(),
+                        "Could not open filtered MPV log: {error}"
+                    );
+                    None
+                }
+            };
             let mut file = None;
             for _ in 0..100 {
                 if ACTIVE_MPV_LOG_PID.load(Ordering::SeqCst) != pid as u64 {
                     return;
                 }
-                match File::open(&path) {
+                match File::open(&scratch_path) {
                     Ok(opened) => {
                         file = Some(opened);
                         break;
@@ -820,7 +841,7 @@ pub fn start_mpv_log_ingestion(path: PathBuf, pid: u32) {
                     subsystem = "mpv.logging",
                     event = "mpv.log_open_failed",
                     playback_session_id = pid,
-                    path = %path.display(),
+                    path = %scratch_path.display(),
                     "Could not open MPV scratch log for structured ingestion"
                 );
                 return;
@@ -854,18 +875,27 @@ pub fn start_mpv_log_ingestion(path: PathBuf, pid: u32) {
                             if mpv_noise_category(&entry).is_some() {
                                 suppressed_noise_count = suppressed_noise_count.saturating_add(1);
                             } else {
+                                write_filtered_mpv_line(
+                                    &mut filtered_file,
+                                    &filtered_path,
+                                    pid,
+                                    &line,
+                                );
                                 emit_mpv_log_line(pid, entry);
                             }
-                        } else if !line.trim().is_empty() {
-                            tracing::debug!(
-                                target: "streamee_lib::mpv",
-                                source = "mpv",
-                                subsystem = "mpv.unparsed",
-                                event = "mpv.unstructured_line",
-                                playback_session_id = pid,
-                                raw = %redact_text(line.trim()),
-                                "MPV emitted an unstructured log line"
-                            );
+                        } else {
+                            write_filtered_mpv_line(&mut filtered_file, &filtered_path, pid, &line);
+                            if !line.trim().is_empty() {
+                                tracing::debug!(
+                                    target: "streamee_lib::mpv",
+                                    source = "mpv",
+                                    subsystem = "mpv.unparsed",
+                                    event = "mpv.unstructured_line",
+                                    playback_session_id = pid,
+                                    raw = %redact_text(line.trim()),
+                                    "MPV emitted an unstructured log line"
+                                );
+                            }
                         }
                     }
                     Err(error) => {
@@ -900,7 +930,7 @@ pub fn start_mpv_log_ingestion(path: PathBuf, pid: u32) {
                 .is_ok()
             {
                 drop(reader);
-                if let Err(error) = std::fs::remove_file(&path) {
+                if let Err(error) = std::fs::remove_file(&scratch_path) {
                     if error.kind() != io::ErrorKind::NotFound {
                         tracing::debug!(
                             target: "streamee_lib::mpv",
@@ -917,6 +947,31 @@ pub fn start_mpv_log_ingestion(path: PathBuf, pid: u32) {
         });
 }
 
+fn write_filtered_mpv_line(
+    filtered_file: &mut Option<File>,
+    filtered_path: &Path,
+    pid: u32,
+    line: &str,
+) {
+    let Some(file) = filtered_file.as_mut() else {
+        return;
+    };
+
+    if let Err(error) = file.write_all(line.as_bytes()) {
+        tracing::warn!(
+            target: "streamee_lib::mpv",
+            source = "mpv",
+            subsystem = "mpv.logging",
+            event = "mpv.filtered_log_write_failed",
+            playback_session_id = pid,
+            path = %filtered_path.display(),
+            error_kind = %error.kind(),
+            "Could not write filtered MPV log: {error}"
+        );
+        *filtered_file = None;
+    }
+}
+
 fn write_cleanup_batch(log_dir: &Path) -> Result<PathBuf, String> {
     let path = log_dir.join("DeleteStreameeLogs.bat");
     let script = r#"@echo off
@@ -929,6 +984,7 @@ del /q "%LOG_DIR%Streamee.2.jsonl" 2>nul
 del /q "%LOG_DIR%Streamee.3.jsonl" 2>nul
 del /q "%LOG_DIR%Streamee.4.jsonl" 2>nul
 del /q "%LOG_DIR%MPV.log" 2>nul
+del /q "%LOG_DIR%MPV.raw.log" 2>nul
 echo Done.
 "#;
 

@@ -105,6 +105,22 @@ type EpisodeTarget = {
   episode: number;
 };
 
+const hasResumableSourcePosition = (sourceMeta: LastSourceMeta): boolean => {
+  if (typeof sourceMeta.progress === 'number' && Number.isFinite(sourceMeta.progress)) {
+    return sourceMeta.progress > 0 && sourceMeta.progress < 99.5;
+  }
+
+  if (typeof sourceMeta.playbackTime !== 'number' || !Number.isFinite(sourceMeta.playbackTime)) {
+    return false;
+  }
+
+  if (typeof sourceMeta.duration === 'number' && Number.isFinite(sourceMeta.duration) && sourceMeta.duration > 0) {
+    return sourceMeta.playbackTime > 0 && sourceMeta.playbackTime < sourceMeta.duration;
+  }
+
+  return sourceMeta.playbackTime > 0;
+};
+
 const formatReleaseDate = (dateStr?: string): string => {
   if (!dateStr) return '';
   try {
@@ -161,6 +177,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   const recommendationRequestIdRef = useRef(0);
   const metaRequestIdRef = useRef(0);
   const continueRequestIdRef = useRef(0);
+  const [continueLoading, setContinueLoading] = useState(false);
   const [sentiments, setSentiments] = useState<TraktSentiments | null>(null);
   const [sentimentsLoading, setSentimentsLoading] = useState(false);
   const [secondaryMetadataReady, setSecondaryMetadataReady] = useState(false);
@@ -381,7 +398,11 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
 
     return null;
   }, [continueWatchingItem, continueWatchingViewItem, isTvShow, latestWatchedEpisode, meta.type, tmdbId]);
-  const hasResumeState = !!continueWatchingItem || !!resumeTarget;
+  const persistedSourceMeta = getLastSourceMeta();
+  const hasResumeState =
+    !!continueWatchingItem ||
+    !!resumeTarget ||
+    hasResumableSourcePosition(persistedSourceMeta);
   const continueActionLabel = useMemo(() => {
     if (isTvShow && resumeTarget) {
       return `Continue S${resumeTarget.season} E${resumeTarget.episode}`;
@@ -869,6 +890,11 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
 
   useLayoutEffect(() => {
     setDetails(meta);
+  }, [meta.id]);
+
+  useEffect(() => {
+    continueRequestIdRef.current += 1;
+    setContinueLoading(false);
   }, [meta.id]);
 
   useEffect(() => {
@@ -1599,6 +1625,12 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     const continueRequestId = ++continueRequestIdRef.current;
     const lastSource = getLastSource();
     if (lastSource) {
+      setContinueLoading(true);
+      const finishContinueLoading = () => {
+        if (continueRequestId === continueRequestIdRef.current) {
+          setContinueLoading(false);
+        }
+      };
       const lastSourceMeta = getLastSourceMeta(lastSource);
       const shouldUseLocal = lastSourceMeta.sourceType === 'local';
       const continueEpisodeTarget =
@@ -1638,7 +1670,10 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
           }
         : null;
       const hasResumeTarget = !!continueEpisodeTarget || !!viewEpisodeTarget || !!storedEpisodeTarget || !!resumeTarget;
-      const shouldStartFromBeginning = forceStartOver || (!continueWatchingItem && !hasResumeTarget);
+      const hasPersistedResumePosition = hasResumableSourcePosition(lastSourceMeta);
+      const shouldStartFromBeginning =
+        forceStartOver ||
+        (!continueWatchingItem && !hasResumeTarget && !hasPersistedResumePosition);
       const playbackTarget = isTvShow
         ? startOverTarget ?? continueEpisodeTarget ?? viewEpisodeTarget ?? resumeTarget ?? storedEpisodeTarget
         : null;
@@ -1717,6 +1752,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
             || currentState.selectedMeta?.id !== meta.id
             || currentState.view !== 'meta'
           ) {
+            finishContinueLoading();
             return;
           }
           const resolvedTorrent = selectAddonResumeResult(results, {
@@ -1737,6 +1773,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
             : resolvedTorrent.magnetUri.startsWith('magnet:?')
                 ? 'webtorrent'
                 : 'qbittorrent';
+          finishContinueLoading();
           handleStream(
             resolvedTorrent,
             playbackTarget,
@@ -1748,6 +1785,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
             resumedSourceType,
           );
         } catch (error) {
+          finishContinueLoading();
           setShowTorrents(true);
           setTorrentsError(error instanceof Error ? error.message : String(error));
         }
@@ -1769,10 +1807,12 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       if (shouldUseLocal) {
         const localFiles = sortLocalFiles(lastSourceMeta.localFiles || []);
         if (localFiles.length === 0) {
+          finishContinueLoading();
           setLocalSourceError('The last local source is no longer available. Choose Play Local again.');
           return;
         }
 
+        finishContinueLoading();
         playLocalFiles(
           localFiles,
           lastSourceMeta.localSourceKind || 'files',
@@ -1797,6 +1837,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
             : state.selectedMeta
         }));
 
+        finishContinueLoading();
         setSelectedStream({
           url: fakeTorrent.magnetUri,
           title: fakeTorrent.title,
@@ -1813,6 +1854,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
         return;
       }
 
+      finishContinueLoading();
       handleStream(
         fakeTorrent,
         playbackTarget,
@@ -2003,6 +2045,13 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
         <div className="meta-backdrop" style={{ backgroundImage: `url(${details.background})` }} />
       )}
       <div className="meta-backdrop-overlay" />
+
+      {continueLoading && (
+        <div className="meta-continue-loading" role="status" aria-live="polite" aria-label="Loading playback">
+          <div className="loading-spinner" />
+          <span>Loading</span>
+        </div>
+      )}
       
       <button className="meta-back" onClick={handleBack}>
         <FiArrowLeft /> Back
@@ -2111,11 +2160,11 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
                   <div className="meta-actions meta-actions-resume">
                     {getLastSource() ? (
                       <>
-                        <button className="meta-btn meta-btn-continue" onClick={() => handleContinue(false)}>
+                        <button className="meta-btn meta-btn-continue" onClick={() => handleContinue(false)} disabled={continueLoading}>
                           <FiPlay /> {hasResumeState ? continueActionLabel : 'Replay'}
                         </button>
                         {hasResumeState && (
-                          <button className="meta-btn" onClick={() => handleContinue(true)}>
+                          <button className="meta-btn" onClick={() => handleContinue(true)} disabled={continueLoading}>
                             <FiRefreshCw /> Replay
                           </button>
                         )}

@@ -6833,8 +6833,9 @@ async fn launch_mpv_process(
     }
 
     let mpv_log_path = streamee_log_dir().join("MPV.log");
+    let mpv_scratch_log_path = streamee_log_dir().join("MPV.raw.log");
     if MPV_STRUCTURED_LOGGING_ENABLED {
-        cmd_args.push(format!("--log-file={}", mpv_log_path.display()));
+        cmd_args.push(format!("--log-file={}", mpv_scratch_log_path.display()));
         cmd_args.push("--msg-level=all=info".to_string());
         info!(
             event = "mpv.logging_enabled",
@@ -6885,7 +6886,7 @@ async fn launch_mpv_process(
     };
     let pid = child.id();
     if MPV_STRUCTURED_LOGGING_ENABLED {
-        logging::start_mpv_log_ingestion(mpv_log_path, pid);
+        logging::start_mpv_log_ingestion(mpv_scratch_log_path, mpv_log_path, pid);
     }
     info!(
         event = "mpv.spawned",
