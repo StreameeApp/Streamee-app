@@ -201,7 +201,11 @@ export const logger = {
 };
 
 export function initializeRendererLogger(): void {
-  if (initialized || typeof window === 'undefined') return;
+  if (
+    initialized
+    || typeof window === 'undefined'
+    || typeof window.addEventListener !== 'function'
+  ) return;
   initialized = true;
   const install = (level: LogLevel, original: (...args: unknown[]) => void) => (...args: unknown[]) => {
     original(...args);

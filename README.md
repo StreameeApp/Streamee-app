@@ -26,7 +26,8 @@ Streamee combines a polished discovery library with a highly tuned desktop playb
 - Automatic intro and recap skipping, outro-aware next-episode playback, and local detection fallbacks
 - Smart Next preparation that can warm the next aired episode before the current one ends
 - A real-time LUFS-based Audio Normalizer with adaptive gating, gain riding, and final peak protection
-- Configurable upscaling, sharpening, denoising, debanding, HDR handling, and optional SVP integration
+- Configurable upscaling, sharpening, denoising, debanding, HDR handling, Smart Ultrawide Fill, and optional SVP integration
+- Direct playback of local video files and folders through the same MPV experience
 - Cache-only seekbar thumbnails, reusable stream caching, playback statistics, and a local phone remote
 
 ## Features
@@ -34,12 +35,12 @@ Streamee combines a polished discovery library with a highly tuned desktop playb
 ### Discovery and metadata
 
 - **Board** — Continue Watching, watchlist rows, trending titles, recommendations, and other personalized entry points.
-- **Catalogs** — Browse popular, trending, upcoming, and top-rated movies and series.
-- **Search and filters** — Search titles and narrow results by media type, genre, year, language, rating, and preferred quality.
+- **Catalogs** — Browse popular and trending movies and series, plus anticipated Trakt catalogs when connected.
+- **Search and filters** — Search titles or actors, browse Trakt lists, and narrow results by media type, genre, year, language, rating, and sort order.
 - **Anime filtering** — Show all titles, only Japanese-language animation, or exclude it from discovery without hiding personal library entries.
-- **Detailed title pages** — Posters, backdrops, summaries, cast and crew, trailers, ratings, release information, and season/episode browsers.
+- **Detailed title pages** — Posters, backdrops, summaries, directors, cast and actor credits, trailers, ratings, release information, regional streaming availability, and season/episode browsers.
 - **Release context** — Optional xREL and srrDB metadata helps interpret release names and quality details without supplying playable media.
-- **TMDB + OMDb** — TMDB powers the main catalog and artwork; OMDb can supplement it with IMDb ratings and extra details.
+- **TMDB + OMDb** — Managed TMDB access powers the main catalog and artwork without requiring a personal key; OMDb can supplement it with IMDb ratings and extra details.
 
 ### Library, Trakt, and statistics
 
@@ -56,7 +57,9 @@ Streamee bundles MPV and launches it as a dedicated playback surface anchored to
 Playback helpers include:
 
 - Preferred audio and subtitle languages, with SRT and SDH preferences
-- Resume progress, playlists, audio/subtitle track selection, playback speed, and fullscreen control
+- Resume progress, playlists, audio/subtitle track popovers, playback speed, and fullscreen control
+- Local video-file and folder playback, including multi-file MPV playlists
+- Direction-aware previous/next episode navigation that preserves queued playlist behavior and can request an earlier or later episode when needed
 - Seekbar preview thumbnails generated only from bytes already present in the local cache; hovering never starts a separate upstream transfer
 - Optional stereo downmix for headphones or systems that incorrectly negotiate multichannel layouts
 - Optional Discord Rich Presence using clean movie or episode titles rather than source filenames
@@ -89,6 +92,7 @@ Streamee treats segment skipping conservatively because an incorrect automatic s
 - Intro and recap behavior can be set independently to **Always watch**, **Watch once per series session**, or **Always skip**.
 - At a verified outro, Streamee can advance an already queued episode or request Smart Next. If no next source is ready, the credits continue normally.
 - **Autoload Smart Next** begins preparing the next aired episode at 70% playback and warms only its opening—up to 10% of the episode, capped at 1 GB—for a faster, state-preserving handoff.
+- Detected intro, recap, and outro ranges are shown directly on the MPV seekbar so automatic decisions remain visible.
 
 ### Audio Normalizer: a loudness rider, not a volume preset
 
@@ -114,6 +118,7 @@ Streamee exposes a configurable MPV processing chain rather than locking playbac
 - **Sharpening** — Standard, Adaptive, Ultra, and UltraCustom presets, plus automatic source-aware selection.
 - **Denoising** — Bilateral and advanced MPV/VapourSynth processing with selectable strength and GPU-oriented BM3D modes where supported.
 - **Debanding** — Optional MPV debanding for visible color gradients.
+- **Smart Ultrawide Fill** — Detects top and bottom black bars and fills an ultrawide display without moving soft subtitles or the player controls. **Efficient** scans briefly at playback start, after seeking, and periodically; **Dynamic** continuously follows aspect-ratio changes at a higher processing cost. Off, Efficient, or Dynamic can be saved as the default in Settings, while the player menu provides a temporary override for the current title.
 - **Season-aware settings** — Player-menu processing changes can carry through later episodes of the same season without becoming a global default.
 - **SVP integration** — Start, restart, and close SmoothVideo Project with playback, and control whether RTX VSR runs before or after frame interpolation.
 
@@ -167,19 +172,17 @@ These controls reduce accidental credential exposure and unsafe network access, 
 ### Requirements
 
 - Windows 10 or Windows 11
-- A TMDB API key for catalogs, metadata, and artwork
 - `ffmpeg` on `PATH` only when using WhisperLive
 - Optional: an OMDb API key, Trakt account, compatible source add-ons, NVIDIA RTX features, or SVP
 
-MPV is bundled with Streamee.
+MPV and TMDB catalog access are bundled or managed by Streamee; no personal TMDB key is required.
 
 ### First-time setup
 
-1. Add a TMDB API key under **Settings → Providers & Accounts**.
-2. Optionally connect Trakt and add an OMDb key.
-3. Configure a trusted, lawful source add-on on its own website, then install its manifest under **Settings → Stream Add-ons**.
-4. Choose subtitle, audio, cache, and playback preferences.
-5. Browse to a title, select a source you are authorized to play, and start playback.
+1. Review **Settings → Providers & Accounts** and optionally choose a streaming region, connect Trakt, or add an OMDb key.
+2. Optionally configure a trusted, lawful source add-on on its own website, then install its manifest under **Settings → Stream Add-ons**. Local files and folders can be played without an add-on.
+3. Choose subtitle, audio, cache, and playback preferences.
+4. Browse to a title, select a source you are authorized to play, or choose **Play Local**.
 
 ## Keyboard shortcuts
 
@@ -197,7 +200,9 @@ npm install
 npm run dev          # Frontend-only Vite server
 npm run tauri:dev    # Full desktop development workflow
 npm run build        # TypeScript and Vite production build
-npm run tauri:build  # Version bump plus Windows installer build
+npm test             # TypeScript service and behavior tests
+npm run version:bump # Explicitly bump synchronized application versions
+npm run tauri:build  # Clean MPV staging plus Windows installer build
 ```
 
 The desktop application is built with Tauri 2.x, Rust, React 18, TypeScript, Zustand, and Vite. MPV handles playback; Rust services manage application commands, secure add-on access, local proxies, caching, WhisperLive orchestration, remote control, and Windows integration. A Node.js sidecar provides WebTorrent transport for supported user-supplied protocol sources.

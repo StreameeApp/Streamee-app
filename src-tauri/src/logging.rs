@@ -17,7 +17,8 @@ use tracing_subscriber::Layer;
 
 const LOG_SCHEMA_VERSION: u64 = 1;
 const MAX_LOG_FILE_BYTES: u64 = 50 * 1024 * 1024;
-const LOG_ARCHIVE_COUNT: usize = 4;
+const LOG_ARCHIVE_COUNT: usize = 1;
+const PREVIOUS_LOG_ARCHIVE_COUNT: usize = 4;
 const LOG_CHANNEL_CAPACITY: usize = 8_192;
 const REDACTED: &str = "<redacted>";
 
@@ -113,7 +114,12 @@ impl RotatingLogFile {
     fn write_line(&mut self, line: &str) -> io::Result<()> {
         let bytes = line.as_bytes();
         if self.size > 0 && self.size.saturating_add(bytes.len() as u64) > self.max_bytes {
-            self.rotate()?;
+            if let Some(file) = self.file.as_ref() {
+                self.size = file.metadata()?.len();
+            }
+            if self.size > 0 && self.size.saturating_add(bytes.len() as u64) > self.max_bytes {
+                self.rotate()?;
+            }
         }
         let file = self
             .file
@@ -130,6 +136,17 @@ impl RotatingLogFile {
         }
         Ok(())
     }
+}
+
+fn prune_obsolete_archives(writer: &RotatingLogFile, previous_count: usize) -> io::Result<()> {
+    for generation in (writer.archive_count + 1)..=previous_count {
+        match std::fs::remove_file(writer.archive_path(generation)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -977,15 +994,41 @@ fn write_cleanup_batch(log_dir: &Path) -> Result<PathBuf, String> {
     let script = r#"@echo off
 setlocal
 set "LOG_DIR=%~dp0"
-echo Deleting Streamee log files in "%LOG_DIR%"
-del /q "%LOG_DIR%Streamee.jsonl" 2>nul
-del /q "%LOG_DIR%Streamee.1.jsonl" 2>nul
-del /q "%LOG_DIR%Streamee.2.jsonl" 2>nul
-del /q "%LOG_DIR%Streamee.3.jsonl" 2>nul
-del /q "%LOG_DIR%Streamee.4.jsonl" 2>nul
-del /q "%LOG_DIR%MPV.log" 2>nul
-del /q "%LOG_DIR%MPV.raw.log" 2>nul
+echo Clearing Streamee log files in "%LOG_DIR%"
+
+for %%F in ("%LOG_DIR%Streamee.*.jsonl") do (
+  if exist "%%~fF" (
+    del /q "%%~fF" 2>nul
+    if exist "%%~fF" (
+      echo Failed to delete "%%~fF".
+      exit /b 1
+    )
+  )
+)
+
+if exist "%LOG_DIR%Streamee.jsonl" (
+  powershell.exe -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; $path = Join-Path $env:LOG_DIR 'Streamee.jsonl'; $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)); try { $stream.SetLength(0) } finally { $stream.Dispose() }"
+  if errorlevel 1 (
+    echo Failed to clear "%LOG_DIR%Streamee.jsonl".
+    exit /b 1
+  )
+)
+
+for %%F in (
+  "MPV.log"
+  "MPV.raw.log"
+) do (
+  if exist "%LOG_DIR%%%~F" (
+    del /q "%LOG_DIR%%%~F" 2>nul
+    if exist "%LOG_DIR%%%~F" (
+      echo Failed to delete "%LOG_DIR%%%~F".
+      exit /b 1
+    )
+  )
+)
+
 echo Done.
+exit /b 0
 "#;
 
     std::fs::write(&path, script)
@@ -996,6 +1039,12 @@ echo Done.
 fn start_writer(path: PathBuf) -> Result<StructuredJsonLayer, String> {
     let rotating = RotatingLogFile::open(path.clone(), MAX_LOG_FILE_BYTES, LOG_ARCHIVE_COUNT)
         .map_err(|error| format!("Failed to open structured log {:?}: {error}", path))?;
+    prune_obsolete_archives(&rotating, PREVIOUS_LOG_ARCHIVE_COUNT).map_err(|error| {
+        format!(
+            "Failed to prune obsolete structured logs near {:?}: {error}",
+            path
+        )
+    })?;
     let (sender, receiver) = sync_channel::<String>(LOG_CHANNEL_CAPACITY);
     let dropped = Arc::new(AtomicU64::new(0));
     let writer_dropped = dropped.clone();
@@ -1127,7 +1176,7 @@ mod tests {
         let root = test_dir("retention");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("Streamee.jsonl");
-        let mut writer = RotatingLogFile::open(path.clone(), 11, 4).unwrap();
+        let mut writer = RotatingLogFile::open(path.clone(), 11, LOG_ARCHIVE_COUNT).unwrap();
         for line in 0..8 {
             writer
                 .write_line(&format!("{{\"line\":{line}}}\n"))
@@ -1136,10 +1185,58 @@ mod tests {
         writer.flush().unwrap();
 
         assert!(path.exists());
-        for generation in 1..=4 {
-            assert!(root.join(format!("Streamee.{generation}.jsonl")).exists());
+        assert!(root.join("Streamee.1.jsonl").exists());
+        assert!(!root.join("Streamee.2.jsonl").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_prunes_archives_from_the_previous_retention_policy() {
+        let root = test_dir("retention-migration");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Streamee.jsonl");
+        for generation in 1..=PREVIOUS_LOG_ARCHIVE_COUNT {
+            std::fs::write(
+                root.join(format!("Streamee.{generation}.jsonl")),
+                format!("{{\"generation\":{generation}}}\n"),
+            )
+            .unwrap();
         }
-        assert!(!root.join("Streamee.5.jsonl").exists());
+
+        let writer = RotatingLogFile::open(path, 11, LOG_ARCHIVE_COUNT).unwrap();
+        prune_obsolete_archives(&writer, PREVIOUS_LOG_ARCHIVE_COUNT).unwrap();
+
+        assert!(root.join("Streamee.1.jsonl").exists());
+        for generation in 2..=PREVIOUS_LOG_ARCHIVE_COUNT {
+            assert!(!root.join(format!("Streamee.{generation}.jsonl")).exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_writer_continues_at_start_after_external_truncation() {
+        let root = test_dir("external-truncation");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Streamee.jsonl");
+        let mut writer = RotatingLogFile::open(path.clone(), 24, 4).unwrap();
+        writer.write_line("{\"event\":\"old\"}\n").unwrap();
+        writer.flush().unwrap();
+
+        let truncator = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        drop(truncator);
+
+        writer.write_line("{\"event\":\"new\"}\n").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"event\":\"new\"}\n"
+        );
+        assert!(!root.join("Streamee.1.jsonl").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

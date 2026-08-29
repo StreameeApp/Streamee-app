@@ -422,6 +422,17 @@ function get_slider_ele_pos_for(element, val)
         ele_pos)
 end
 
+-- Map painted ranges across the complete track. The thumb itself stays inset
+-- so it remains fully visible and keeps the existing seek interaction bounds.
+function get_slider_fill_pos_for(element, val)
+    local ele_pos = scale_value(
+        element.slider.min.value, element.slider.max.value,
+        0, element.layout.geometry.w,
+        val)
+
+    return limit_range(0, element.layout.geometry.w, ele_pos)
+end
+
 -- translates global (mouse) coordinates to value
 function get_slider_value_at(element, glob_pos)
 
@@ -804,8 +815,8 @@ function prepare_elements()
                        type(segment.finish) == 'number' and
                        segment.finish > segment.start then
                         table.insert(element.slider.segment_positions, {
-                            start = get_slider_ele_pos_for(element, segment.start),
-                            finish = get_slider_ele_pos_for(element, segment.finish),
+                            start = get_slider_fill_pos_for(element, segment.start),
+                            finish = get_slider_fill_pos_for(element, segment.finish),
                             played_style = segment.played_style,
                             unplayed_style = segment.unplayed_style,
                         })
@@ -821,8 +832,8 @@ function prepare_elements()
                        type(segment.finish) == 'number' and
                        segment.finish > segment.start then
                         table.insert(element.slider.semantic_segment_positions, {
-                            start = get_slider_ele_pos_for(element, segment.start),
-                            finish = get_slider_ele_pos_for(element, segment.finish),
+                            start = get_slider_fill_pos_for(element, segment.start),
+                            finish = get_slider_fill_pos_for(element, segment.finish),
                             played_style = segment.played_style,
                             unplayed_style = segment.unplayed_style,
                         })
@@ -929,6 +940,7 @@ function render_elements(master_ass)
             local seekRanges = element.slider.seekRangesF()
 			local rh = user_opts.seekbarhandlesize * elem_geo.h / 2 -- Handle radius
             local xp
+            local fill_x
             
             local segments = element.slider.segment_positions or {}
             local has_segments = #segments > 0
@@ -942,9 +954,12 @@ function render_elements(master_ass)
             elseif pos then
                 xp = get_slider_ele_pos_for(element, pos)
             end
+            if pos then
+                fill_x = get_slider_fill_pos_for(element, pos)
+            end
 
             if has_segments then
-                local progress_x = xp or element.slider.min.ele_pos
+                local progress_x = fill_x or 0
                 elem_ass:draw_stop()
 
                 local grouped_rects = {}
@@ -1017,10 +1032,10 @@ function render_elements(master_ass)
                     elem_ass:rect_cw(0, 0, elem_geo.w, elem_geo.h)
                     elem_ass:rect_ccw(0, 0, elem_geo.w, elem_geo.h)
                     for _, range in pairs(seekRanges) do
-                        local pstart = get_slider_ele_pos_for(element, range['start'])
-                        local pend = get_slider_ele_pos_for(element, range['end'])
-                        if slider_lo.seekrange_future_only and xp then
-                            pstart = math.max(pstart, xp)
+                        local pstart = get_slider_fill_pos_for(element, range['start'])
+                        local pend = get_slider_fill_pos_for(element, range['end'])
+                        if slider_lo.seekrange_future_only and fill_x then
+                            pstart = math.max(pstart, fill_x)
                         end
                         if pend > pstart and range_height > 0 then
                             ass_draw_rr_h_cw(
@@ -1055,7 +1070,7 @@ function render_elements(master_ass)
 
 
             if has_semantic_segments then
-                local progress_x = xp or element.slider.min.ele_pos
+                local progress_x = fill_x or 0
                 local semantic_rects = {
                     [osc_styles.SeekbarChapterSpecial] = {},
                     [osc_styles.SeekbarChapterSpecialDim] = {},

@@ -1419,7 +1419,10 @@ function mapTmdbSeasons(seasons: Array<{
     }));
 }
 
-export async function getTmdbSeasons(tmdbId: number): Promise<Season[]> {
+export async function getTmdbSeasons(
+  tmdbId: number,
+  options: { throwOnError?: boolean } = {},
+): Promise<Season[]> {
   try {
     return await getPersistentlyCachedRequest(`tmdb:seasons:${tmdbId}`, TMDB_SEASON_LIST_CACHE_TTL_MS, async () => {
       const cachedDetails = await readPersistentlyCachedValue<TmdbMetaData>(
@@ -1432,11 +1435,16 @@ export async function getTmdbSeasons(tmdbId: number): Promise<Season[]> {
     });
   } catch (error) {
     console.error('Failed to fetch TMDB seasons:', error);
+    if (options.throwOnError) throw error;
     return [];
   }
 }
 
-export async function getTmdbEpisodes(tmdbId: number, seasonNumber: number): Promise<EpisodeDetail[]> {
+export async function getTmdbEpisodes(
+  tmdbId: number,
+  seasonNumber: number,
+  options: { throwOnError?: boolean } = {},
+): Promise<EpisodeDetail[]> {
   try {
     return await getPersistentlyCachedRequest(
       `tmdb:episodes:${tmdbId}:${seasonNumber}`,
@@ -1460,6 +1468,7 @@ export async function getTmdbEpisodes(tmdbId: number, seasonNumber: number): Pro
     );
   } catch (error) {
     console.error('Failed to fetch TMDB episodes:', error);
+    if (options.throwOnError) throw error;
     return [];
   }
 }

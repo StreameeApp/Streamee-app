@@ -5,6 +5,8 @@ import { enrichTmdbItemsById, EpisodeDetail, getTmdbBoardCatalogs, getTmdbEpisod
 import { getAnticipatedMovies, getAnticipatedShows, getTrendingMovies, getTrendingShows, hasTraktCredentials } from '../../services/trakt';
 import { pushUnwatchedToTrakt, pushWatchedToTrakt, pushWatchlistToTrakt } from '../../services/trakt-sync';
 import { createPerformanceTrace } from '../../services/performance';
+import { logger } from '../../services/logger';
+import { readPersistentlyCachedValue, writePersistentlyCachedValue } from '../../services/request-cache';
 import {
   DISCOVERY_CONTENT_CHANGED_EVENT,
   fetchFilteredDiscoveryPage,
@@ -81,6 +83,11 @@ const CATALOG_ORDER = [
 let boardCatalogSnapshot: CatalogRow[] = [];
 let boardCatalogSnapshotMode: DiscoveryContentMode | null = null;
 const CONTINUE_VIEW_REFRESH_TTL_MS = 6 * 60 * 60 * 1000;
+const UP_NEXT_RESULT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const UP_NEXT_NO_RESULT_CACHE_BASE_TTL_MS = 24 * 60 * 60 * 1000;
+const UP_NEXT_NO_RESULT_CACHE_STAGGER_MS = 6 * 60 * 60 * 1000;
+const UP_NEXT_NO_RESULT_CACHE_STAGGER_BUCKETS = 4;
+const UP_NEXT_DIAGNOSTIC_SHOW_LIMIT = 10;
 const BOARD_CATALOG_ITEM_LIMIT = 20;
 const ADDON_RELEASE_PROBE_RECHECK_MS = 12 * 60 * 60 * 1000;
 
@@ -153,6 +160,11 @@ function isAvailableEpisode(episode: EpisodeDetail): boolean {
 
 function getEpisodeKey(tmdbId: number, season: number, episode: number): string {
   return `${tmdbId}:${season}:${episode}`;
+}
+
+function getUpNextNoResultCacheTtlMs(tmdbId: number): number {
+  const staggerBucket = Math.abs(tmdbId) % UP_NEXT_NO_RESULT_CACHE_STAGGER_BUCKETS;
+  return UP_NEXT_NO_RESULT_CACHE_BASE_TTL_MS + staggerBucket * UP_NEXT_NO_RESULT_CACHE_STAGGER_MS;
 }
 
 function buildContinueViewFingerprint(
@@ -542,50 +554,150 @@ const Board: React.FC = () => {
 
     let cancelled = false;
     const refreshGeneration = ++continueRefreshGenerationRef.current;
+    const refreshReason = continueWatchingViewFingerprint === continueRefreshFingerprint
+      ? 'ttl_expired'
+      : 'view_state_changed';
+    const refreshRequestId = `board-up-next-${Date.now()}-${refreshGeneration}`;
+    let refreshStartedAt = 0;
     const isCurrentRefresh = () =>
       !cancelled && continueRefreshGenerationRef.current === refreshGeneration;
 
     const findNextAvailableEpisode = async (
-      tmdbId: number,
+      show: {
+        tmdbId: number;
+        latestSeason: number;
+        latestEpisode: number;
+      },
       watchedEpisodeKeys: Set<string>
-    ): Promise<{ season: number; episode: number } | null> => {
+    ): Promise<{
+      nextEpisode: { season: number; episode: number } | null;
+      cacheHit: boolean;
+      seasonListLookups: number;
+      episodeListLookups: number;
+      candidateSeasonCount: number;
+      failed: boolean;
+      errorKind?: string;
+    }> => {
       if (!isCurrentRefresh()) {
-        return null;
-      }
-      const seasons = await getTmdbSeasons(tmdbId);
-      const watchedCountsBySeason = new Map<number, number>();
-      for (const episodeKey of watchedEpisodeKeys) {
-        const parsed = parseWatchedEpisodeKey(episodeKey);
-        if (parsed?.tmdbId !== tmdbId) continue;
-        watchedCountsBySeason.set(
-          parsed.season,
-          (watchedCountsBySeason.get(parsed.season) ?? 0) + 1,
-        );
+        return {
+          nextEpisode: null,
+          cacheHit: false,
+          seasonListLookups: 0,
+          episodeListLookups: 0,
+          candidateSeasonCount: 0,
+          failed: false,
+        };
       }
 
-      const candidateSeasons = seasons
-        .filter((season) => (watchedCountsBySeason.get(season.season_number) ?? 0) < season.episode_count)
-        .sort((a, b) => a.season_number - b.season_number);
+      const cacheKey = `board:up-next:v3:${show.tmdbId}:s${show.latestSeason}:e${show.latestEpisode}`;
+      const cachedResolution = await readPersistentlyCachedValue<{
+        nextEpisode: { season: number; episode: number } | null;
+      }>(cacheKey);
+      const cachedEpisode = cachedResolution?.nextEpisode;
+      if (cachedResolution && cachedEpisode === null) {
+        return {
+          nextEpisode: null,
+          cacheHit: true,
+          seasonListLookups: 0,
+          episodeListLookups: 0,
+          candidateSeasonCount: 0,
+          failed: false,
+        };
+      }
+      if (
+        cachedEpisode
+        && Number.isFinite(cachedEpisode.season)
+        && Number.isFinite(cachedEpisode.episode)
+        && (
+          cachedEpisode.season > show.latestSeason
+          || (cachedEpisode.season === show.latestSeason && cachedEpisode.episode > show.latestEpisode)
+        )
+        && !watchedEpisodeKeys.has(getEpisodeKey(show.tmdbId, cachedEpisode.season, cachedEpisode.episode))
+      ) {
+        return {
+          nextEpisode: cachedEpisode,
+          cacheHit: true,
+          seasonListLookups: 0,
+          episodeListLookups: 0,
+          candidateSeasonCount: 0,
+          failed: false,
+        };
+      }
 
-      for (const season of candidateSeasons) {
-        if (!isCurrentRefresh()) {
-          return null;
+      let seasonListLookups = 0;
+      let episodeListLookups = 0;
+      let candidateSeasonCount = 0;
+
+      try {
+        seasonListLookups = 1;
+        const seasons = await getTmdbSeasons(show.tmdbId, { throwOnError: true });
+        const candidateSeasons = seasons
+          .filter((season) => season.episode_count > 0 && season.season_number >= show.latestSeason)
+          .sort((a, b) => a.season_number - b.season_number);
+        candidateSeasonCount = candidateSeasons.length;
+
+        for (const season of candidateSeasons) {
+          if (!isCurrentRefresh()) {
+            break;
+          }
+          episodeListLookups += 1;
+          const episodes = await getTmdbEpisodes(show.tmdbId, season.season_number, { throwOnError: true });
+          const nextEpisode = episodes
+            .filter(isAvailableEpisode)
+            .filter((episode) => (
+              season.season_number > show.latestSeason
+              || episode.episode_number > show.latestEpisode
+            ))
+            .sort((a, b) => a.episode_number - b.episode_number)
+            .find((episode) => !watchedEpisodeKeys.has(getEpisodeKey(show.tmdbId, season.season_number, episode.episode_number)));
+
+          if (nextEpisode) {
+            const resolvedEpisode = {
+              season: season.season_number,
+              episode: nextEpisode.episode_number
+            };
+            await writePersistentlyCachedValue(
+              cacheKey,
+              { nextEpisode: resolvedEpisode },
+              UP_NEXT_RESULT_CACHE_TTL_MS,
+            );
+            return {
+              nextEpisode: resolvedEpisode,
+              cacheHit: false,
+              seasonListLookups,
+              episodeListLookups,
+              candidateSeasonCount,
+              failed: false,
+            };
+          }
         }
-        const episodes = await getTmdbEpisodes(tmdbId, season.season_number);
-        const nextEpisode = episodes
-          .filter(isAvailableEpisode)
-          .sort((a, b) => a.episode_number - b.episode_number)
-          .find((episode) => !watchedEpisodeKeys.has(getEpisodeKey(tmdbId, season.season_number, episode.episode_number)));
 
-        if (nextEpisode) {
-          return {
-            season: season.season_number,
-            episode: nextEpisode.episode_number
-          };
+        if (isCurrentRefresh()) {
+          await writePersistentlyCachedValue(
+            cacheKey,
+            { nextEpisode: null },
+            getUpNextNoResultCacheTtlMs(show.tmdbId),
+          );
         }
+        return {
+          nextEpisode: null,
+          cacheHit: false,
+          seasonListLookups,
+          episodeListLookups,
+          candidateSeasonCount,
+          failed: false,
+        };
+      } catch (error) {
+        return {
+          nextEpisode: null,
+          cacheHit: false,
+          seasonListLookups,
+          episodeListLookups,
+          candidateSeasonCount,
+          failed: true,
+          errorKind: error instanceof Error ? error.name : 'UnknownError',
+        };
       }
-
-      return null;
     };
 
     const refreshBoardContinueWatching = async () => {
@@ -610,13 +722,7 @@ const Board: React.FC = () => {
         watchedEpisodeKeys.add(getEpisodeKey(parsed.tmdbId, parsed.season, parsed.episode));
 
         const current = watchedShows.get(parsed.tmdbId);
-        const isLaterEpisodeAtSameTime = !!current &&
-          watchedTime === current.lastWatchedTime &&
-          (
-            parsed.season > current.latestSeason ||
-            (parsed.season === current.latestSeason && parsed.episode > current.latestEpisode)
-          );
-        if (!current || watchedTime > current.lastWatchedTime || isLaterEpisodeAtSameTime) {
+        if (!current) {
           watchedShows.set(parsed.tmdbId, {
             tmdbId: parsed.tmdbId,
             lastWatchedAt: watchedAt,
@@ -624,6 +730,19 @@ const Board: React.FC = () => {
             latestSeason: parsed.season,
             latestEpisode: parsed.episode
           });
+          continue;
+        }
+
+        if (watchedTime > current.lastWatchedTime) {
+          current.lastWatchedAt = watchedAt;
+          current.lastWatchedTime = watchedTime;
+        }
+        if (
+          parsed.season > current.latestSeason
+          || (parsed.season === current.latestSeason && parsed.episode > current.latestEpisode)
+        ) {
+          current.latestSeason = parsed.season;
+          current.latestEpisode = parsed.episode;
         }
       }
 
@@ -657,6 +776,15 @@ const Board: React.FC = () => {
         .filter((show) => !resumeShowIds.has(show.tmdbId))
         .sort((a, b) => b.lastWatchedTime - a.lastWatchedTime);
 
+      logger.info('board.up_next_refresh.started', '[TMDB Up Next] Refresh started', {
+        request_id: refreshRequestId,
+        status: 'started',
+        reason: refreshReason,
+        candidate_count: upNextCandidates.length,
+        resume_show_count: resumeShowIds.size,
+        refresh_generation: refreshGeneration,
+      }, 'board.tmdb_up_next');
+
       if (isCurrentRefresh()) {
         const existingUpNext = useStore.getState().continueWatchingView
           .filter((item) => item.source === 'up-next')
@@ -671,25 +799,54 @@ const Board: React.FC = () => {
       const resolvedEpisodes: Array<{
         show: typeof upNextCandidates[number];
         nextEpisode: { season: number; episode: number } | null;
+        cacheHit: boolean;
+        seasonListLookups: number;
+        episodeListLookups: number;
+        candidateSeasonCount: number;
+        failed: boolean;
+        errorKind?: string;
       }> = [];
       let nextCandidateIndex = 0;
       const workerCount = Math.min(4, upNextCandidates.length);
       const workers = Array.from({ length: workerCount }, async () => {
         while (isCurrentRefresh() && nextCandidateIndex < upNextCandidates.length) {
           const show = upNextCandidates[nextCandidateIndex++];
-          const nextEpisode = await findNextAvailableEpisode(show.tmdbId, watchedEpisodeKeys);
+          const resolution = await findNextAvailableEpisode(show, watchedEpisodeKeys);
           resolvedEpisodes.push({
             show,
-            nextEpisode,
+            ...resolution,
           });
         }
       });
       await Promise.all(workers);
+      if (!isCurrentRefresh()) {
+        logger.info('board.up_next_refresh.cancelled', '[TMDB Up Next] Refresh cancelled', {
+          request_id: refreshRequestId,
+          status: 'cancelled',
+          duration_ms: Math.max(0, performance.now() - refreshStartedAt),
+          candidate_count: upNextCandidates.length,
+          resolved_candidate_count: resolvedEpisodes.length,
+        }, 'board.tmdb_up_next');
+        return;
+      }
+
       const enrichedItems = await enrichTmdbItemsById(
         resolvedEpisodes
           .filter((item) => item.nextEpisode)
           .map(({ show }) => ({ tmdbId: show.tmdbId, mediaType: 'tv' as const })),
       );
+      if (!isCurrentRefresh()) {
+        logger.info('board.up_next_refresh.cancelled', '[TMDB Up Next] Refresh cancelled', {
+          request_id: refreshRequestId,
+          status: 'cancelled',
+          duration_ms: Math.max(0, performance.now() - refreshStartedAt),
+          candidate_count: upNextCandidates.length,
+          resolved_candidate_count: resolvedEpisodes.length,
+          cancellation_stage: 'metadata_enrichment',
+        }, 'board.tmdb_up_next');
+        return;
+      }
+
       const enrichedById = new Map(enrichedItems.map((item) => [item.id, item]));
       const upNextItems: ContinueWatchingViewItem[] = [];
 
@@ -722,12 +879,61 @@ const Board: React.FC = () => {
       if (isCurrentRefresh()) {
         setContinueWatchingView(merged);
         setContinueWatchingViewRefresh(continueRefreshFingerprint, Date.now());
+
+        const seasonListLookups = resolvedEpisodes.reduce((total, item) => total + item.seasonListLookups, 0);
+        const episodeListLookups = resolvedEpisodes.reduce((total, item) => total + item.episodeListLookups, 0);
+        const cachedResultCount = resolvedEpisodes.filter((item) => item.cacheHit).length;
+        const resolvedResultCount = resolvedEpisodes.filter((item) => item.nextEpisode).length;
+        const failedResultCount = resolvedEpisodes.filter((item) => item.failed).length;
+        const highestFanoutShows = [...resolvedEpisodes]
+          .sort((a, b) => b.episodeListLookups - a.episodeListLookups)
+          .slice(0, UP_NEXT_DIAGNOSTIC_SHOW_LIMIT)
+          .map((item) => ({
+            tmdb_id: item.show.tmdbId,
+            latest_season: item.show.latestSeason,
+            latest_episode: item.show.latestEpisode,
+            cache_hit: item.cacheHit,
+            candidate_season_count: item.candidateSeasonCount,
+            episode_list_lookups: item.episodeListLookups,
+            resolved_season: item.nextEpisode?.season ?? null,
+            resolved_episode: item.nextEpisode?.episode ?? null,
+            resolution_status: item.failed
+              ? 'failed'
+              : item.cacheHit
+                ? 'cache_hit'
+                : item.nextEpisode
+                  ? 'resolved'
+                  : 'no_result',
+            error_kind: item.errorKind ?? null,
+          }));
+
+        const logRefreshCompleted = failedResultCount > 0 ? logger.warn : logger.info;
+        logRefreshCompleted('board.up_next_refresh.completed', '[TMDB Up Next] Refresh completed', {
+          request_id: refreshRequestId,
+          status: failedResultCount > 0 ? 'degraded' : 'completed',
+          duration_ms: Math.max(0, performance.now() - refreshStartedAt),
+          candidate_count: upNextCandidates.length,
+          resolved_result_count: resolvedResultCount,
+          no_result_count: resolvedEpisodes.length - resolvedResultCount - failedResultCount,
+          failed_result_count: failedResultCount,
+          cached_result_count: cachedResultCount,
+          season_list_lookups: seasonListLookups,
+          episode_list_lookups: episodeListLookups,
+          metadata_preview_count: enrichedItems.length,
+          highest_fanout_shows: highestFanoutShows,
+        }, 'board.tmdb_up_next');
       }
     };
 
     const refreshTimeout = window.setTimeout(() => {
+      refreshStartedAt = performance.now();
       refreshBoardContinueWatching().catch((error) => {
-        console.error('Failed to refresh board Continue Watching:', error);
+        logger.error('board.up_next_refresh.failed', '[TMDB Up Next] Refresh failed', {
+          request_id: refreshRequestId,
+          status: 'failed',
+          duration_ms: Math.max(0, performance.now() - refreshStartedAt),
+          error_kind: error instanceof Error ? error.name : 'UnknownError',
+        }, 'board.tmdb_up_next');
       });
     }, 1200);
 
