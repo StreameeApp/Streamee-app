@@ -2444,6 +2444,22 @@ fn single_file_cache_first_uncovered(ranges: &[(u64, u64)], start: u64, end: u64
     Some(cursor)
 }
 
+fn single_file_cache_uncovered_end(ranges: &[(u64, u64)], start: u64, end: u64) -> Option<u64> {
+    if start > end {
+        return None;
+    }
+    for (covered_start, covered_end) in ranges {
+        if *covered_end < start {
+            continue;
+        }
+        if *covered_start <= start {
+            return None;
+        }
+        return Some(end.min(covered_start.saturating_sub(1)));
+    }
+    Some(end)
+}
+
 fn single_file_cache_range_overlaps_producer_back_buffer(
     range: (u64, u64),
     producer_cursor: u64,
@@ -3188,10 +3204,13 @@ impl SingleFileRangeCache {
         }
         let id = state.next_fetch_id;
         state.next_fetch_id = state.next_fetch_id.saturating_add(1);
+        let upstream_end =
+            single_file_cache_uncovered_end(&state.covered_ranges, position, producer_last)
+                .ok_or_else(|| "Stream cache position became covered while planning".to_string())?;
         let demand_end = if full_cache_generation.is_some() {
-            producer_last
+            upstream_end
         } else {
-            producer_last.min(
+            upstream_end.min(
                 position
                     .saturating_add(SINGLE_FILE_CACHE_READ_AHEAD_BYTES)
                     .saturating_sub(1),
@@ -3210,7 +3229,7 @@ impl SingleFileRangeCache {
                 cache: self.clone(),
                 id,
                 start: position,
-                upstream_end: producer_last,
+                upstream_end,
                 cancel,
                 full_cache_generation,
             },
@@ -3224,10 +3243,6 @@ impl SingleFileRangeCache {
         let Some(generation) = completed.full_cache_generation else {
             return Ok(None);
         };
-        if completed.upstream_end.saturating_add(1) != self.total_size {
-            return Ok(None);
-        }
-
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state
             .active_producers
@@ -3240,20 +3255,57 @@ impl SingleFileRangeCache {
             self.changed.notify_all();
             return Ok(None);
         };
-        let Some(backfill_end) = priority_start.checked_sub(1) else {
-            info!("Full stream cache completed forward pass from byte 0; no backfill required");
+        let completed_forward = completed.start >= priority_start;
+        let (phase, search_start, search_end) = if completed_forward {
+            let forward_start = completed.upstream_end.saturating_add(1);
+            if forward_start < self.total_size {
+                ("forward", forward_start, self.total_size.saturating_sub(1))
+            } else if let Some(backfill_end) = priority_start.checked_sub(1) {
+                ("backfill", 0, backfill_end)
+            } else {
+                info!("Full stream cache completed forward pass from byte 0; no backfill required");
+                self.changed.notify_all();
+                return Ok(None);
+            }
+        } else {
+            let Some(backfill_end) = priority_start.checked_sub(1) else {
+                self.changed.notify_all();
+                return Ok(None);
+            };
+            (
+                "backfill",
+                completed.upstream_end.saturating_add(1),
+                backfill_end,
+            )
+        };
+        let next_start =
+            single_file_cache_first_uncovered(&state.covered_ranges, search_start, search_end);
+        let (phase, next_start, search_end) = if let Some(next_start) = next_start {
+            (phase, next_start, search_end)
+        } else if completed_forward {
+            let Some(backfill_end) = priority_start.checked_sub(1) else {
+                info!("Full stream cache completed; every byte is already cached");
+                self.changed.notify_all();
+                return Ok(None);
+            };
+            let Some(backfill_start) =
+                single_file_cache_first_uncovered(&state.covered_ranges, 0, backfill_end)
+            else {
+                info!("Full stream cache completed; every byte is already cached");
+                self.changed.notify_all();
+                return Ok(None);
+            };
+            ("backfill", backfill_start, backfill_end)
+        } else {
+            info!("Full stream cache completed; every byte is already cached");
             self.changed.notify_all();
             return Ok(None);
         };
-        let Some(backfill_start) =
-            single_file_cache_first_uncovered(&state.covered_ranges, 0, backfill_end)
-        else {
-            info!(
-                "Full stream cache completed forward pass and prefix was already cached priority_start={priority_start}"
-            );
-            self.changed.notify_all();
-            return Ok(None);
-        };
+        let next_end =
+            single_file_cache_uncovered_end(&state.covered_ranges, next_start, search_end)
+                .ok_or_else(|| {
+                    "Full stream cache range became covered while planning".to_string()
+                })?;
 
         state.sequence = state.sequence.saturating_add(1);
         let sequence = state.sequence;
@@ -3262,21 +3314,21 @@ impl SingleFileRangeCache {
         let cancel = Arc::new(AtomicBool::new(false));
         state.active_producers.push(SingleFileActiveProducer {
             id,
-            cursor: backfill_start,
-            demand_end: backfill_end,
+            cursor: next_start,
+            demand_end: next_end,
             last_access: sequence,
             cancel: cancel.clone(),
         });
         info!(
-            "Full stream cache forward pass completed; backfilling prefix range={} priority_start={priority_start}",
-            range_label(backfill_start, backfill_end)
+            "Full stream cache continuing phase={phase} missing_range={} priority_start={priority_start}",
+            range_label(next_start, next_end)
         );
         self.changed.notify_all();
         Ok(Some(SingleFileProducerPermit {
             cache: self.clone(),
             id,
-            start: backfill_start,
-            upstream_end: backfill_end,
+            start: next_start,
+            upstream_end: next_end,
             cancel,
             full_cache_generation: Some(generation),
         }))
@@ -8695,6 +8747,40 @@ mod stream_cache_tests {
         assert_eq!(backfill.upstream_end, later_seek - 1);
 
         drop((first, latest, backfill, cache));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn full_single_file_cache_skips_already_covered_bytes_between_missing_ranges() {
+        let total_size = 32;
+        let path = std::env::temp_dir().join(format!(
+            "streamee-full-cache-covered-gap-{}-{}.cache",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache =
+            SingleFileRangeCache::create(path.clone(), total_size, total_size, true).unwrap();
+        cache.commit(8, &[1; 8]).unwrap();
+
+        let first = match cache.plan(0).unwrap() {
+            SingleFileCachePlan::StartProducer(permit) => permit,
+            _ => panic!("expected the first missing range producer"),
+        };
+        assert_eq!((first.start, first.upstream_end), (0, 7));
+        cache.commit(0, &[2; 8]).unwrap();
+
+        let second = cache
+            .plan_full_cache_backfill(&first)
+            .unwrap()
+            .expect("expected a producer after the covered range");
+        assert_eq!((second.start, second.upstream_end), (16, 31));
+        cache.commit(16, &[3; 16]).unwrap();
+        assert!(cache.plan_full_cache_backfill(&second).unwrap().is_none());
+
+        drop((first, second, cache));
         let _ = fs::remove_file(path);
     }
 
