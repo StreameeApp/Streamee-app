@@ -2544,7 +2544,7 @@ const Settings: React.FC = () => {
                 step="1"
               />
               <span className="settings-hint">
-                Default: 50 GB. A single stream larger than this limit uses the normal disposable cache.
+                Default: 50 GB. A single stream may exceed this limit; it replaces older cached items and is kept until another cache is created.
               </span>
             </div>
           )}

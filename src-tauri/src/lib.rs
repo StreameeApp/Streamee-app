@@ -38,7 +38,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, error, info, warn};
@@ -2171,8 +2171,8 @@ fn smart_next_warmup_target_bytes(total_bytes: u64) -> u64 {
         .clamp(1, SMART_NEXT_WARMUP_MAX_BYTES)
 }
 
-static ACTIVE_PERSISTENT_STREAM_CACHE_DIRS: Lazy<Mutex<HashSet<PathBuf>>> =
-    Lazy::new(|| Mutex::new(HashSet::new()));
+static ACTIVE_PERSISTENT_STREAM_CACHES: Lazy<Mutex<HashMap<PathBuf, Weak<SingleFileRangeCache>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static PERSISTENT_STREAM_CACHE_PRUNE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone)]
@@ -2726,14 +2726,18 @@ fn persistent_stream_cache_resident_bytes(total_size: u64, resident_blocks: &[u6
     })
 }
 
+fn active_persistent_stream_cache_dirs() -> HashSet<PathBuf> {
+    let Ok(active) = ACTIVE_PERSISTENT_STREAM_CACHES.lock() else {
+        return HashSet::new();
+    };
+    active.keys().cloned().collect()
+}
+
 fn prune_persistent_stream_cache(root: &Path, limit_bytes: u64) {
     let Ok(_prune_guard) = PERSISTENT_STREAM_CACHE_PRUNE_LOCK.lock() else {
         return;
     };
-    let active = ACTIVE_PERSISTENT_STREAM_CACHE_DIRS
-        .lock()
-        .map(|active| active.clone())
-        .unwrap_or_default();
+    let active = active_persistent_stream_cache_dirs();
     let Ok(children) = fs::read_dir(root) else {
         return;
     };
@@ -2755,11 +2759,12 @@ fn prune_persistent_stream_cache(root: &Path, limit_bytes: u64) {
         entries.push((manifest.last_access_ms, manifest.resident_bytes, entry_dir));
     }
     entries.sort_by_key(|(last_access_ms, _, _)| *last_access_ms);
+    let newest_entry_dir = entries.last().map(|(_, _, entry_dir)| entry_dir.clone());
     for (_, resident_bytes, entry_dir) in entries {
         if resident_total <= limit_bytes {
             break;
         }
-        if active.contains(&entry_dir) {
+        if active.contains(&entry_dir) || newest_entry_dir.as_ref() == Some(&entry_dir) {
             continue;
         }
         match fs::remove_dir_all(&entry_dir) {
@@ -2776,6 +2781,46 @@ fn prune_persistent_stream_cache(root: &Path, limit_bytes: u64) {
             Err(error) => warn!(
                 "Failed to evict persistent stream cache item {}: {error}",
                 entry_dir.display()
+            ),
+        }
+    }
+}
+
+fn prepare_persistent_stream_cache_for_item(
+    root: &Path,
+    limit_bytes: u64,
+    entry_dir: &Path,
+    total_size: u64,
+) {
+    let Ok(_prune_guard) = PERSISTENT_STREAM_CACHE_PRUNE_LOCK.lock() else {
+        return;
+    };
+    let active = active_persistent_stream_cache_dirs();
+    let Ok(children) = fs::read_dir(root) else {
+        return;
+    };
+    for child in children.flatten() {
+        let candidate_dir = child.path();
+        if !candidate_dir.is_dir() || candidate_dir == entry_dir || active.contains(&candidate_dir)
+        {
+            continue;
+        }
+        let candidate_is_oversized =
+            persistent_stream_cache_manifest(&candidate_dir.join("manifest.json"))
+                .is_some_and(|manifest| manifest.total_size > limit_bytes);
+        if total_size <= limit_bytes && !candidate_is_oversized {
+            continue;
+        }
+        match fs::remove_dir_all(&candidate_dir) {
+            Ok(()) => info!(
+                "Replaced persistent stream cache item: path={} new_total_size={} limit_bytes={}",
+                candidate_dir.display(),
+                total_size,
+                limit_bytes
+            ),
+            Err(error) => warn!(
+                "Failed to replace persistent stream cache item {}: {error}",
+                candidate_dir.display()
             ),
         }
     }
@@ -2836,16 +2881,30 @@ impl SingleFileRangeCache {
     ) -> Result<Arc<Self>, String> {
         fs::create_dir_all(&settings.root)
             .map_err(|error| format!("Failed to create persistent stream cache folder: {error}"))?;
-        prune_persistent_stream_cache(&settings.root, settings.limit_bytes);
 
         let cache_key = persistent_stream_cache_key(identity);
         let entry_dir = settings.root.join(&cache_key);
-        if ACTIVE_PERSISTENT_STREAM_CACHE_DIRS
+        let mut active_caches = ACTIVE_PERSISTENT_STREAM_CACHES
             .lock()
-            .map_err(|error| error.to_string())?
-            .contains(&entry_dir)
-        {
-            return Err("Persistent stream cache item is already active".to_string());
+            .map_err(|error| error.to_string())?;
+        if let Some(registered_cache) = active_caches.get(&entry_dir) {
+            if let Some(active_cache) = registered_cache.upgrade() {
+                if active_cache.total_size != total_size {
+                    return Err(
+                        "Active persistent stream cache size does not match this source"
+                            .to_string(),
+                    );
+                }
+                active_cache
+                    .pinned_tail_start
+                    .fetch_min(tail_start, Ordering::AcqRel);
+                info!(
+                    "Reusing active persistent stream cache item: provider={} total_size={}",
+                    provider, total_size
+                );
+                return Ok(active_cache);
+            }
+            return Err("Persistent stream cache item is still finalizing".to_string());
         }
         let manifest_path = entry_dir.join("manifest.json");
         let content_path = entry_dir.join("content.cache");
@@ -2927,11 +2986,16 @@ impl SingleFileRangeCache {
             }),
             changed: Condvar::new(),
         });
-        ACTIVE_PERSISTENT_STREAM_CACHE_DIRS
-            .lock()
-            .map_err(|error| error.to_string())?
-            .insert(entry_dir);
+        active_caches.insert(entry_dir.clone(), Arc::downgrade(&cache));
+        drop(active_caches);
         cache.persist_manifest()?;
+        prepare_persistent_stream_cache_for_item(
+            &settings.root,
+            settings.limit_bytes,
+            &entry_dir,
+            total_size,
+        );
+        prune_persistent_stream_cache(&settings.root, settings.limit_bytes);
         info!(
             "Persistent stream cache item ready: provider={} restored_bytes={} total_size={} limit_bytes={}",
             provider, restored_bytes, total_size, settings.limit_bytes
@@ -3410,8 +3474,13 @@ impl Drop for SingleFileRangeCache {
         if let Err(error) = self.persist_manifest() {
             warn!("Failed to finalize persistent stream cache index: {error}");
         }
-        if let Ok(mut active) = ACTIVE_PERSISTENT_STREAM_CACHE_DIRS.lock() {
-            active.remove(&persistent.entry_dir);
+        if let Ok(mut active) = ACTIVE_PERSISTENT_STREAM_CACHES.lock() {
+            let owns_registration = active
+                .get(&persistent.entry_dir)
+                .is_some_and(|cache| std::ptr::eq(cache.as_ptr(), self));
+            if owns_registration {
+                active.remove(&persistent.entry_dir);
+            }
         }
         prune_persistent_stream_cache(&persistent.root, persistent.limit_bytes);
     }
@@ -3428,25 +3497,18 @@ fn create_stream_range_cache(
 ) -> Result<Arc<SingleFileRangeCache>, String> {
     if total_size > 0 {
         if let Some(settings) = persistent_stream_cache_settings(app) {
-            if total_size <= settings.limit_bytes {
-                match SingleFileRangeCache::open_persistent(
-                    &settings,
-                    identity,
-                    provider,
-                    total_size,
-                    tail_start,
-                    true,
-                ) {
-                    Ok(cache) => return Ok(cache),
-                    Err(error) => warn!(
-                        "Persistent stream cache unavailable for provider={provider}; using disposable cache: {error}"
-                    ),
-                }
-            } else {
-                info!(
-                    "Persistent stream cache skipped for oversized item: provider={} total_size={} limit_bytes={}",
-                    provider, total_size, settings.limit_bytes
-                );
+            match SingleFileRangeCache::open_persistent(
+                &settings,
+                identity,
+                provider,
+                total_size,
+                tail_start,
+                true,
+            ) {
+                Ok(cache) => return Ok(cache),
+                Err(error) => warn!(
+                    "Persistent stream cache unavailable for provider={provider}; using disposable cache: {error}"
+                ),
             }
         }
     }
@@ -8663,6 +8725,53 @@ mod stream_cache_tests {
     }
 
     #[test]
+    fn persistent_single_file_cache_reuses_an_active_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "streamee-persistent-cache-active-reuse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let settings = PersistentStreamCacheSettings {
+            root: root.clone(),
+            limit_bytes: 16 * 1024 * 1024,
+        };
+        let total_size = 4 * 1024 * 1024;
+        let first = SingleFileRangeCache::open_persistent(
+            &settings,
+            "addon:active-reuse-test:0",
+            "addon",
+            total_size,
+            total_size - (1024 * 1024),
+            true,
+        )
+        .unwrap();
+        let second = SingleFileRangeCache::open_persistent(
+            &settings,
+            "addon:active-reuse-test:0",
+            "addon",
+            total_size,
+            total_size - (2 * 1024 * 1024),
+            true,
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        first.commit(512, b"shared").unwrap();
+        assert_eq!(
+            second.read_cached(512, 517).unwrap(),
+            Some(b"shared".to_vec())
+        );
+
+        drop(first);
+        assert!(second.is_persistent());
+        drop(second);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn persistent_stream_cache_prunes_oldest_inactive_item_first() {
         let root = std::env::temp_dir().join(format!(
             "streamee-persistent-cache-prune-{}-{}",
@@ -8700,6 +8809,55 @@ mod stream_cache_tests {
 
         assert!(!old_dir.exists());
         assert!(recent_dir.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persistent_stream_cache_retains_oversized_item_until_replaced() {
+        let root = std::env::temp_dir().join(format!(
+            "streamee-persistent-cache-oversized-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let settings = PersistentStreamCacheSettings {
+            root: root.clone(),
+            limit_bytes: 4 * 1024 * 1024,
+        };
+        let oversized_identity = "addon:oversized-test:0";
+        let oversized_dir = root.join(persistent_stream_cache_key(oversized_identity));
+        let oversized = SingleFileRangeCache::open_persistent(
+            &settings,
+            oversized_identity,
+            "addon",
+            8 * 1024 * 1024,
+            7 * 1024 * 1024,
+            true,
+        )
+        .unwrap();
+        oversized.commit(0, &vec![1; 5 * 1024 * 1024]).unwrap();
+        drop(oversized);
+
+        prune_persistent_stream_cache(&root, settings.limit_bytes);
+        assert!(oversized_dir.exists());
+
+        let replacement_identity = "addon:replacement-test:0";
+        let replacement_dir = root.join(persistent_stream_cache_key(replacement_identity));
+        let replacement = SingleFileRangeCache::open_persistent(
+            &settings,
+            replacement_identity,
+            "addon",
+            2 * 1024 * 1024,
+            1024 * 1024,
+            true,
+        )
+        .unwrap();
+        assert!(!oversized_dir.exists());
+        assert!(replacement_dir.exists());
+
+        drop(replacement);
         let _ = fs::remove_dir_all(root);
     }
 

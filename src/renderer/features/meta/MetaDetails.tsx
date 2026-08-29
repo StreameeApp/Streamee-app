@@ -3,7 +3,10 @@ import { FiPlay, FiHeart, FiCheck, FiArrowLeft, FiDownload, FiExternalLink, FiAr
 import { CastMember, MetaDetails as MetaDetailsType, MetaPreview, useStore, TorrentResult, LocalVideoFile } from '../../store';
 import { getTmdbTitleBundle, getTrailerSources, getTmdbSeasons, getTmdbEpisodes, getTmdbPersonCredits, getTmdbWatchRegion, Season, EpisodeDetail, type TmdbPersonCreditPreview, type TmdbWatchProvider, type TrailerSource } from '../../services/tmdb';
 import { getOmdbRating } from '../../services/omdb';
-import { selectAddonResumeResult } from '../../services/addon-source-search';
+import {
+  selectAddonResumeResult,
+  shouldResolveAddonResumeSource,
+} from '../../services/addon-resume-selection';
 import { deduplicateResults, searchEnabledSourceProviders } from '../../services/source-search';
 import { getEnabledStreamAddons } from '../../services/installed-addons';
 import { getRelatedRecommendations, getTraktSentiments, hasTraktCredentials, type TraktSentiments } from '../../services/trakt';
@@ -76,6 +79,8 @@ function loadYouTubeIframeApi(): Promise<YouTubeApi> {
 type LastSourceMeta = {
   sourceType: 'webtorrent' | 'qbittorrent' | 'addon' | 'local';
   sourceUrl?: string;
+  sourceSize?: number;
+  sourceInfoHash?: string;
   preferredSeason?: number;
   preferredEpisode?: number;
   progress?: number;
@@ -84,6 +89,8 @@ type LastSourceMeta = {
   sourceFilename?: string;
   addonImdbId?: string;
   directStreamProvider?: 'addon';
+  addonInstallationId?: string;
+  addonId?: string;
   addonInfoHash?: string;
   addonFileIndex?: number;
   addonIndexer?: string;
@@ -1371,12 +1378,16 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       : sourceUrl;
     rememberLastSource(sourceReference, {
       sourceType,
+      sourceSize: torrent.size,
+      sourceInfoHash: torrent.infoHash || undefined,
       preferredSeason,
       preferredEpisode,
       sourceFilename: torrent.streamFilename || resumeSourceFilename,
-      ...(sourceType === 'addon'
+      ...(sourceType === 'addon' || torrent.addonInstallationId || torrent.addonId
         ? {
             addonImdbId: details?.imdbId || meta.imdbId,
+            addonInstallationId: torrent.addonInstallationId,
+            addonId: torrent.addonId,
             ...(torrent.addonInstallationId ? {} : { directStreamProvider }),
             addonInfoHash: torrent.infoHash || undefined,
             addonFileIndex: torrent.sourceFileIndex,
@@ -1590,9 +1601,6 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     if (lastSource) {
       const lastSourceMeta = getLastSourceMeta(lastSource);
       const shouldUseLocal = lastSourceMeta.sourceType === 'local';
-      const shouldUseAddon = lastSourceMeta.sourceType === 'addon';
-      const shouldUseQbittorrent =
-        lastSourceMeta.sourceType === 'qbittorrent' || (!shouldUseLocal && !shouldUseAddon && !lastSource.startsWith('magnet:?'));
       const continueEpisodeTarget =
         typeof continueWatchingItem?.season === 'number' &&
         typeof continueWatchingItem?.episode === 'number'
@@ -1634,6 +1642,18 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       const playbackTarget = isTvShow
         ? startOverTarget ?? continueEpisodeTarget ?? viewEpisodeTarget ?? resumeTarget ?? storedEpisodeTarget
         : null;
+      const shouldUseAddon = shouldResolveAddonResumeSource({
+        sourceType: lastSourceMeta.sourceType,
+        isTvShow,
+        hasAddonOrigin: !!(lastSourceMeta.addonInstallationId || lastSourceMeta.addonId),
+        storedSeason: storedEpisodeTarget?.season,
+        storedEpisode: storedEpisodeTarget?.episode,
+        targetSeason: playbackTarget?.season,
+        targetEpisode: playbackTarget?.episode,
+      });
+      const shouldUseQbittorrent =
+        lastSourceMeta.sourceType === 'qbittorrent'
+        || (!shouldUseLocal && !shouldUseAddon && !lastSource.startsWith('magnet:?'));
       const resumeProgress =
         !shouldStartFromBeginning
           ? typeof continueWatchingItem?.progress === 'number' && continueWatchingItem.progress > 0
@@ -1700,6 +1720,8 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
             return;
           }
           const resolvedTorrent = selectAddonResumeResult(results, {
+            installationId: lastSourceMeta.addonInstallationId,
+            addonId: lastSourceMeta.addonId,
             infoHash: lastSourceMeta.addonInfoHash,
             fileIndex: lastSourceMeta.addonFileIndex,
             filename: lastSourceMeta.sourceFilename,
@@ -1735,11 +1757,11 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       const fakeTorrent: TorrentResult = {
         id: 'continue',
         title: details?.name || meta.name || 'Unknown',
-        infoHash: '',
+        infoHash: lastSourceMeta.sourceInfoHash || '',
         magnetUri: lastSource,
         seeds: 0,
         peers: 0,
-        size: 0,
+        size: lastSourceMeta.sourceSize || 0,
         quality: 'unknown',
         indexer: 'Last used',
       };

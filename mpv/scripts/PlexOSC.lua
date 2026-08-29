@@ -164,6 +164,10 @@ local osc_styles = {
     WinCtrl = '{\\blur1\\bord0.5\\1c&HFFFFFF&\\3c&H0\\fs20\\fnmpv-osd-symbols}',
     elementDown = '{\\1c&H999999&}',
     elementHighlight = '{\\blur1\\bord1\\1c&H999999&}', 
+    TrackMenuBg = '{\\blur0.6\\bord1\\shad0\\1c&H171717&\\3c&H666666&}',
+    TrackMenuTitle = '{\\blur0\\bord0\\shad0\\1c&HAAAAAA&\\fs14\\b1\\fn' .. user_opts.font .. '}',
+    TrackMenuItem = '{\\blur0\\bord0\\shad0\\1c&HD8D8D8&\\fs17\\fn' .. user_opts.font .. '}',
+    TrackMenuItemSelected = '{\\blur0\\bord0\\shad0\\1c&H356BFF&\\fs17\\b1\\fn' .. user_opts.font .. '}',
 }
 
 -- internal states, do not touch
@@ -203,6 +207,8 @@ local state = {
     fulltime = user_opts.timems,
     highlight_element = 'cy_audio',
     chapter_list = {},                      -- sorted by time
+    track_menu_type = nil,
+    track_menu_first = 1,
 }
 
 local thumbfast = {
@@ -222,6 +228,10 @@ end
 
 local window_control_box_width = 138
 local tick_delay = 0.03
+local track_menu_escape_binding = 'streamee-track-menu-close'
+local track_menu_max_visible = 12
+local track_menu_row_height = 28
+local track_menu_width = 360
 
 local is_december = os.date("*t").month == 12
 
@@ -568,6 +578,103 @@ function get_track(type)
         end
     end
     return 0
+end
+
+local function track_menu_safe_text(value)
+    return tostring(value or '')
+        :gsub('[\r\n\t]', ' ')
+        :gsub('\\', '/')
+        :gsub('{', '(')
+        :gsub('}', ')')
+end
+
+local function track_menu_label(type, track, index)
+    local language = track_menu_safe_text(track.lang or 'und'):upper()
+    local title = track_menu_safe_text(track.title)
+    if title == '' then
+        title = string.format('%s %d', nicetypes[type], index)
+    end
+
+    local details = {}
+    if track.default then details[#details + 1] = 'Default' end
+    if track.forced then details[#details + 1] = 'Forced' end
+    if track.external then details[#details + 1] = 'External' end
+    if #details > 0 then
+        title = title .. '  [' .. table.concat(details, ', ') .. ']'
+    end
+
+    return language .. '  ' .. title
+end
+
+local function build_track_menu_items(type)
+    local current = mp.get_property(type)
+    local items = {
+        {
+            label = texts.off,
+            value = 'no',
+            selected = current == nil or current == 'no',
+        },
+    }
+
+    for index, track in ipairs(tracks_osc[type] or {}) do
+        items[#items + 1] = {
+            label = track_menu_label(type, track, index),
+            value = track.id,
+            selected = tonumber(current) == tonumber(track.id),
+        }
+    end
+
+    return items
+end
+
+local function close_track_menu()
+    if not state.track_menu_type then return end
+    state.track_menu_type = nil
+    state.track_menu_first = 1
+    mp.remove_key_binding(track_menu_escape_binding)
+    request_init()
+end
+
+local function scroll_track_menu(delta)
+    if not state.track_menu_type then return end
+    local count = #build_track_menu_items(state.track_menu_type)
+    local max_first = math.max(1, count - track_menu_max_visible + 1)
+    state.track_menu_first = limit_range(1, max_first, state.track_menu_first + delta)
+    request_init()
+end
+
+local function open_track_menu(type)
+    if state.track_menu_type == type then
+        close_track_menu()
+        return
+    end
+
+    update_tracklist()
+    state.track_menu_type = type
+    local items = build_track_menu_items(type)
+    local selected = 1
+    for index, item in ipairs(items) do
+        if item.selected then
+            selected = index
+            break
+        end
+    end
+    local max_first = math.max(1, #items - track_menu_max_visible + 1)
+    state.track_menu_first = limit_range(
+        1,
+        max_first,
+        selected - math.floor(track_menu_max_visible / 2)
+    )
+
+    mp.remove_key_binding(track_menu_escape_binding)
+    mp.add_forced_key_binding('ESC', track_menu_escape_binding, close_track_menu)
+    show_osc()
+    request_init()
+end
+
+local function select_track_menu_item(type, value)
+    mp.commandv('set', type, value)
+    close_track_menu()
 end
 
 --
@@ -1219,7 +1326,11 @@ layouts = function ()
     osc_param.areas = {} -- delete areas
 
     -- area for active mouse input
-    add_area('input', get_hitbox_coords(posX, posY, 1, osc_geo.w, 104))
+    if state.track_menu_type then
+        add_area('input', 0, 0, osc_param.playresx, osc_param.playresy)
+    else
+        add_area('input', get_hitbox_coords(posX, posY, 1, osc_geo.w, 104))
+    end
     add_area('topinput', 18, 18, 148, 52)
 
     -- area for show/hide
@@ -1359,6 +1470,50 @@ layouts = function ()
     lo.geometry = {x = 37, y = refY - 40, an = 5, w = 24, h = 24}
     lo.style = osc_styles.Ctrl3
     lo.visible = (osc_param.playresx >= 600)
+
+    if state.track_menu_type and elements['track_menu_bg'] then
+        local item_count = #build_track_menu_items(state.track_menu_type)
+        local visible_count = math.min(track_menu_max_visible, item_count - state.track_menu_first + 1)
+        local header_height = 28
+        local menu_height = header_height + visible_count * track_menu_row_height + 10
+        local anchor_x = state.track_menu_type == 'audio' and 87 or 37
+        local menu_x = limit_range(12, osc_param.playresx - track_menu_width - 12,
+            anchor_x - track_menu_width / 2)
+        local menu_bottom = refY - 58
+        local menu_y = math.max(12, menu_bottom - menu_height)
+
+        lo = add_layout('track_menu_bg')
+        lo.geometry = {x = menu_x, y = menu_y, an = 7, w = track_menu_width, h = menu_height}
+        lo.style = osc_styles.TrackMenuBg
+        lo.layer = 80
+        lo.alpha[1] = 24
+        lo.alpha[3] = 42
+        lo.box.radius = 6
+
+        lo = add_layout('track_menu_title')
+        lo.geometry = {x = menu_x + 12, y = menu_y + 7, an = 7, w = track_menu_width - 24, h = 20}
+        lo.style = osc_styles.TrackMenuTitle
+        lo.layer = 81
+
+        local row = 0
+        local last = math.min(item_count, state.track_menu_first + track_menu_max_visible - 1)
+        for item_index = state.track_menu_first, last do
+            local row_name = 'track_menu_item_' .. item_index
+            lo = add_layout(row_name)
+            lo.geometry = {
+                x = menu_x + 10,
+                y = menu_y + header_height + row * track_menu_row_height,
+                an = 7,
+                w = track_menu_width - 20,
+                h = track_menu_row_height,
+            }
+            lo.style = elements[row_name].track_menu_selected and
+                osc_styles.TrackMenuItemSelected or osc_styles.TrackMenuItem
+            lo.layer = 82
+            lo.button.maxchars = 43
+            row = row + 1
+        end
+    end
 
 	lo = add_layout('tog_fs')
     lo.geometry = {x = osc_geo.w - 37, y = refY - 40, an = 5, w = 24, h = 24}
@@ -1608,13 +1763,11 @@ function osc_init()
         return msg
     end
     ne.eventresponder['mbtn_left_up'] =
-        function () set_track('audio', 1) end
+        function () open_track_menu('audio') end
     ne.eventresponder['mbtn_right_up'] =
-        function () set_track('audio', -1) end
-    ne.eventresponder['shift+mbtn_left_down'] =
-        function () show_message(get_tracklist('audio')) end
+        function () close_track_menu(); set_track('audio', 1) end
     ne.eventresponder['enter'] =
-        function () set_track('audio', 1); show_message(get_tracklist('audio')) end
+        function () open_track_menu('audio') end
 
     ne = new_element('sub_delay_label', 'button')
     ne.content = 'SUB'
@@ -1671,13 +1824,47 @@ function osc_init()
         return msg
     end
     ne.eventresponder['mbtn_left_up'] =
-        function () set_track('sub', 1) end
+        function () open_track_menu('sub') end
     ne.eventresponder['mbtn_right_up'] =
-        function () set_track('sub', -1) end
-    ne.eventresponder['shift+mbtn_left_down'] =
-        function () show_message(get_tracklist('sub')) end
+        function () close_track_menu(); set_track('sub', 1) end
     ne.eventresponder['enter'] =
-        function () set_track('sub', 1); show_message(get_tracklist('sub')) end
+        function () open_track_menu('sub') end
+
+    if state.track_menu_type then
+        local menu_type = state.track_menu_type
+        local menu_items = build_track_menu_items(menu_type)
+        if #menu_items <= 1 and #(tracks_osc[menu_type] or {}) == 0 then
+            close_track_menu()
+        else
+            local max_first = math.max(1, #menu_items - track_menu_max_visible + 1)
+            state.track_menu_first = limit_range(1, max_first, state.track_menu_first)
+            local last = math.min(#menu_items, state.track_menu_first + track_menu_max_visible - 1)
+
+            ne = new_element('track_menu_bg', 'box')
+            ne.eventresponder['wheel_up_press'] = function () scroll_track_menu(-1) end
+            ne.eventresponder['wheel_down_press'] = function () scroll_track_menu(1) end
+
+            ne = new_element('track_menu_title', 'button')
+            local title = menu_type == 'audio' and 'AUDIO TRACKS' or 'SUBTITLES'
+            if #menu_items > track_menu_max_visible then
+                title = string.format('%s   %d-%d of %d', title, state.track_menu_first, last, #menu_items)
+            end
+            ne.content = title
+            ne.enabled = false
+
+            for item_index = state.track_menu_first, last do
+                local item = menu_items[item_index]
+                local row_name = 'track_menu_item_' .. item_index
+                local row = new_element(row_name, 'button')
+                row.track_menu_item = true
+                row.track_menu_selected = item.selected
+                row.content = (item.selected and '●  ' or '○  ') .. item.label
+                row.eventresponder['mbtn_left_up'] = function ()
+                    select_track_menu_item(menu_type, item.value)
+                end
+            end
+        end
+    end
 
     -- Windows HDR toggle for the monitor currently containing the MPV window.
     -- The Tauri MPV IPC watcher handles the request and publishes the resulting
@@ -1961,6 +2148,7 @@ end
 
 function shutdown()
     clear_thumbfast()
+    mp.remove_key_binding(track_menu_escape_binding)
 end
 
 --
@@ -1989,6 +2177,7 @@ end
 
 function hide_osc()
     msg.trace('hide_osc')
+    close_track_menu()
     clear_thumbfast()
     if not state.enabled then
         -- typically hide happens at render() from tick(), but now tick() is
@@ -2055,6 +2244,7 @@ function request_tick()
 end
 
 function mouse_leave()
+    close_track_menu()
     if get_hidetimeout() >= 0 then
         hide_osc()
     end
@@ -2280,6 +2470,22 @@ end
 function process_event(source, what)
     local action = string.format('%s%s', source,
         what and ('_' .. what) or '')
+
+    if source == 'mbtn_left' and what == 'down' and state.track_menu_type then
+        local inside_track_menu = false
+        for n = 1, #elements do
+            local element = elements[n]
+            if mouse_hit(element) and
+                (element.name:match('^track_menu_') or
+                 element.name == 'cy_audio' or element.name == 'cy_sub') then
+                inside_track_menu = true
+                break
+            end
+        end
+        if not inside_track_menu then
+            close_track_menu()
+        end
+    end
 
     if what == 'down' or what == 'press' then
 

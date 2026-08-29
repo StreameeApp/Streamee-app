@@ -11,6 +11,7 @@ import { searchEnabledSourceProviders } from '../../services/source-search';
 import { searchInstalledStreamAddons } from '../../services/addon-source-search';
 import { loadInstalledAddons } from '../../services/installed-addons';
 import { selectDirectStartupReplacement } from '../../services/direct-startup-failover';
+import { buildDirectStreamCacheIdentity } from '../../services/stream-cache-identity';
 import {
   rankSmartNextCandidates,
   rememberCompletedSmartNextRequest,
@@ -2197,13 +2198,7 @@ const Player: React.FC = () => {
           let handoff: SmartNextWarmupHandoff | null = null;
           if (candidate.streamHandle || (candidate.streamUrl && /^https?:\/\//i.test(candidate.streamUrl))) {
             const displayName = candidate.streamFilename || candidate.title;
-            const directCacheIdentity = [
-              candidate.directStreamProvider || candidate.sourceProvider || 'addon',
-              candidate.addonInstallationId || 'installed',
-              candidate.infoHash || candidate.id,
-              candidate.sourceFileIndex ?? 0,
-              candidate.size,
-            ].join(':');
+            const directCacheIdentity = buildDirectStreamCacheIdentity(candidate);
             const monitoredStream = candidate.streamHandle
               ? await window.electronAPI.prepareDirectStreamHandle(
                   candidate.streamHandle,
@@ -4971,16 +4966,7 @@ const Player: React.FC = () => {
             }
             const addonDisplayName = selectedStream.torrent.streamFilename || selectedStream.title;
             const directStreamSize = selectedStream.torrent.size;
-            const directCacheIdentity = [
-              selectedStream.torrent.addonInstallationId
-                || selectedStream.torrent.directStreamProvider
-                || selectedStream.torrent.sourceProvider
-                || 'direct-stream',
-              selectedStream.torrent.addonId || 'installed',
-              selectedStream.torrent.infoHash || selectedStream.torrent.id,
-              selectedStream.torrent.sourceFileIndex ?? 0,
-              directStreamSize,
-            ].join(':');
+            const directCacheIdentity = buildDirectStreamCacheIdentity(selectedStream.torrent);
             const addonSubtitlePrefs = readSubtitlePreferences(selectedMeta?.originalLanguage);
             const monitoredStream = adoptedWarmup?.sourceType === 'addon'
               && adoptedWarmup.addonSessionId

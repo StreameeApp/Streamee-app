@@ -13,6 +13,10 @@ let streamCacheSequence = 0;
 function cleanupStreamCacheDirectory(cacheDirectory = STREAM_CACHE_ROOT) {
   try {
     fs.rmSync(cacheDirectory, { recursive: true, force: true });
+    if (fs.existsSync(cacheDirectory)) {
+      throw new Error('Cache directory still exists after removal');
+    }
+    return true;
   } catch (err) {
     // Cache cleanup must not prevent the sidecar from reporting a useful
     // startup or playback error through its normal command channel.
@@ -20,6 +24,7 @@ function cleanupStreamCacheDirectory(cacheDirectory = STREAM_CACHE_ROOT) {
       directory: cacheDirectory,
       error: err.message,
     });
+    return false;
   }
 }
 
@@ -70,9 +75,14 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 let client = null;
-const clientReady = import('webtorrent')
-  .then((mod) => {
-    const WebTorrent = mod.default || mod;
+let parseTorrentSource = null;
+const clientReady = Promise.all([
+  import('webtorrent'),
+  import('parse-torrent'),
+])
+  .then(([webTorrentModule, parseTorrentModule]) => {
+    const WebTorrent = webTorrentModule.default || webTorrentModule;
+    parseTorrentSource = parseTorrentModule.default || parseTorrentModule;
     client = new WebTorrent({
       tracker: {
         rtcConfig: null,
@@ -190,7 +200,12 @@ function readPersistentCacheManifest(manifestPath) {
   }
 }
 
-function prunePersistentStreamCache(root, limitBytes, excludedDirectory = null) {
+function prunePersistentStreamCache(
+  root,
+  limitBytes,
+  excludedDirectory = null,
+  replacementTotalSize = null,
+) {
   if (!root || !Number.isSafeInteger(limitBytes) || limitBytes <= 0 || !fs.existsSync(root)) return;
   const entries = [];
   let residentTotal = 0;
@@ -209,14 +224,31 @@ function prunePersistentStreamCache(root, limitBytes, excludedDirectory = null) 
     entries.push({
       entryDirectory,
       residentBytes,
+      totalSize: Number.isSafeInteger(manifest.total_size) ? Math.max(0, manifest.total_size) : 0,
       lastAccessMs: Number.isSafeInteger(manifest.last_access_ms) ? manifest.last_access_ms : 0,
     });
+  }
+  if (Number.isSafeInteger(replacementTotalSize) && replacementTotalSize > 0) {
+    const replacementIsOversized = replacementTotalSize > limitBytes;
+    for (const entry of entries) {
+      if (entry.entryDirectory === excludedDirectory) continue;
+      if (!replacementIsOversized && entry.totalSize <= limitBytes) continue;
+      if (!cleanupStreamCacheDirectory(entry.entryDirectory)) continue;
+      residentTotal = Math.max(0, residentTotal - entry.residentBytes);
+      entry.removed = true;
+      writeLog('debug', 'cache.persistent_item_replaced', 'Replaced persistent stream cache item', {
+        directory: entry.entryDirectory,
+        newTotalSize: replacementTotalSize,
+        limitBytes,
+      });
+    }
   }
   entries.sort((a, b) => a.lastAccessMs - b.lastAccessMs);
   for (const entry of entries) {
     if (residentTotal <= limitBytes) break;
+    if (entry.removed) continue;
     if (entry.entryDirectory === excludedDirectory) continue;
-    cleanupStreamCacheDirectory(entry.entryDirectory);
+    if (!cleanupStreamCacheDirectory(entry.entryDirectory)) continue;
     residentTotal = Math.max(0, residentTotal - entry.residentBytes);
     writeLog('debug', 'cache.persistent_item_evicted', 'Evicted persistent stream cache item', {
       directory: entry.entryDirectory,
@@ -876,24 +908,11 @@ function getBitfieldBuffer(bitfield) {
   if (bitfield instanceof Uint8Array) return bitfield;
   return null;
 }
-function extractMagnetInfoHash(magnetUri) {
-  try {
-    const parsed = new URL(magnetUri);
-    const xt = parsed.searchParams.get('xt');
-    if (!xt) return null;
-
-    const match = xt.match(/^urn:btih:([a-fA-F0-9]{40}|[A-Z2-7]{32})$/);
-    if (!match) return null;
-
-    return match[1].toLowerCase();
-  } catch {
-    return null;
-  }
-}
-
 function findExistingTorrent(infoHash) {
   if (!infoHash || !client) return null;
-  return client.torrents.find((torrent) => torrent && torrent.infoHash === infoHash) || null;
+  return client.torrents.find(
+    (torrent) => torrent && torrent.infoHash?.toLowerCase() === infoHash,
+  ) || null;
 }
 
 function waitForTick(ms) {
@@ -1020,8 +1039,9 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
   }
 
   const resolvedTorrentSource = await resolveTorrentSource(magnetUri);
-  const infoHash = typeof resolvedTorrentSource === 'string'
-    ? extractMagnetInfoHash(resolvedTorrentSource)
+  const parsedTorrentSource = await parseTorrentSource(resolvedTorrentSource);
+  const infoHash = typeof parsedTorrentSource?.infoHash === 'string'
+    ? parsedTorrentSource.infoHash.toLowerCase()
     : null;
   const existingTorrent = findExistingTorrent(infoHash);
 
@@ -1054,15 +1074,11 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
     ? cacheOptions.persistentCacheRoot.trim()
     : '';
   const persistentLimitBytes = Number(cacheOptions.persistentCacheLimitBytes);
-  const expectedSize = Number(cacheOptions.expectedSize);
   const usePersistentCache = cacheOptions.persistentCacheEnabled === true
     && !!infoHash
     && !!persistentRoot
     && Number.isSafeInteger(persistentLimitBytes)
-    && persistentLimitBytes > 0
-    && Number.isSafeInteger(expectedSize)
-    && expectedSize > 0
-    && expectedSize <= persistentLimitBytes;
+    && persistentLimitBytes > 0;
 
   if (usePersistentCache) {
     activeStreamCacheRoot = persistentRoot;
@@ -1077,11 +1093,16 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
       existingManifest.version !== PERSISTENT_CACHE_VERSION
       || existingManifest.cache_key !== activeStreamCacheKey
       || existingManifest.provider !== 'webtorrent'
-      || existingManifest.total_size !== expectedSize
     )) {
-      cleanupStreamCacheDirectory(activeStreamCacheDir);
+      if (!cleanupStreamCacheDirectory(activeStreamCacheDir)) {
+        throw new Error('Failed to reset an incompatible persistent WebTorrent cache');
+      }
     }
-    prunePersistentStreamCache(activeStreamCacheRoot, activeStreamCacheLimitBytes, activeStreamCacheDir);
+    prunePersistentStreamCache(
+      activeStreamCacheRoot,
+      activeStreamCacheLimitBytes,
+      activeStreamCacheDir,
+    );
   } else {
     streamCacheSequence += 1;
     activeStreamCacheDir = path.join(
@@ -1116,14 +1137,13 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
         return;
       }
 
-      if (activeStreamCachePersistent && torrent.length > activeStreamCacheLimitBytes) {
-        writeLog('info', 'cache.persistent_disabled_oversized', 'Persistent cache disabled for oversized torrent', {
-          totalSize: torrent.length,
-          limitBytes: activeStreamCacheLimitBytes,
-        });
-        activeStreamCachePersistent = false;
-        activeStreamCacheManifestPath = null;
-      } else {
+      if (activeStreamCachePersistent) {
+        prunePersistentStreamCache(
+          activeStreamCacheRoot,
+          activeStreamCacheLimitBytes,
+          activeStreamCacheDir,
+          torrent.length,
+        );
         persistActiveStreamCache(true);
       }
 

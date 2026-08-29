@@ -6,6 +6,10 @@ import {
   type InstalledAddon,
   type InstalledAddonStream,
 } from './installed-addons';
+export {
+  selectAddonResumeResult,
+  type AddonResumeIdentity,
+} from './addon-resume-selection';
 
 export interface AddonSourceSearchRequest {
   imdbId: string;
@@ -90,45 +94,6 @@ function toTorrentResult(addon: InstalledAddon, stream: InstalledAddonStream): T
     addonId: addon.addonId,
     addonName: addon.manifest.name,
   };
-}
-
-export interface AddonResumeIdentity {
-  infoHash?: string;
-  fileIndex?: number;
-  filename?: string;
-  size?: number;
-  indexer?: string;
-  quality?: TorrentResult['quality'];
-}
-
-const normalizeIdentityText = (value?: string): string => value?.trim().toLowerCase() || '';
-
-export function selectAddonResumeResult(
-  results: TorrentResult[],
-  identity: AddonResumeIdentity,
-): TorrentResult | null {
-  if (results.length === 0) return null;
-
-  const infoHash = normalizeIdentityText(identity.infoHash);
-  const hashMatch = infoHash
-    ? results.find((result) => normalizeIdentityText(result.infoHash) === infoHash
-      && (identity.fileIndex == null || result.sourceFileIndex === identity.fileIndex))
-    : undefined;
-  if (hashMatch) return hashMatch;
-
-  const filename = normalizeIdentityText(identity.filename);
-  const filenameMatch = filename
-    ? results.find((result) => normalizeIdentityText(result.streamFilename || result.title) === filename
-      && (identity.size == null || identity.size <= 0 || result.size === identity.size))
-    : undefined;
-  if (filenameMatch) return filenameMatch;
-
-  const indexer = normalizeIdentityText(identity.indexer);
-  return results.find((result) =>
-    (!indexer || normalizeIdentityText(result.indexer) === indexer)
-    && (identity.size == null || identity.size <= 0 || result.size === identity.size)
-    && (!identity.quality || result.quality === identity.quality)
-  ) || results[0];
 }
 
 async function searchAddon(

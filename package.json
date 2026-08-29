@@ -29,6 +29,7 @@
         "axios": "^1.6.0",
         "buffer": "^6.0.3",
         "fs-native-extensions": "1.5.0",
+        "parse-torrent": "11.0.24",
         "react": "^18.2.0",
         "react-dom": "^18.2.0",
         "react-icons": "^5.0.0",
