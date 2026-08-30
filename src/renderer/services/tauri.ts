@@ -400,6 +400,27 @@ interface AddonStreamErrorEvent {
   message: string;
 }
 
+export interface RifeRuntimeInfo {
+  installed: boolean;
+  ready: boolean;
+  version: string;
+  path: string;
+  selectedModel: string;
+  selectedModelInstalled: boolean;
+  installedModels: string[];
+  missingFiles: string[];
+  downloadBytes: number;
+  requiredFreeBytes: number;
+  message: string;
+}
+
+export interface RifeInstallProgress {
+  phase: 'downloading' | 'extracting' | 'complete';
+  message: string;
+  downloadedBytes: number;
+  totalBytes: number;
+}
+
 interface PreparedAddonStreamUrl {
   url: string;
   session_id: string;
@@ -1216,6 +1237,21 @@ const tauriAPI = {
     },
     stopClient: async () => {
       return await invoke<void>('stop_whisperlive_client');
+    },
+  },
+  rife: {
+    getRuntimeInfo: async (model: string) => {
+      return await invoke<RifeRuntimeInfo>('get_rife_runtime_info', { model });
+    },
+    install: async (model: string) => {
+      return await invoke<RifeRuntimeInfo>('install_rife_runtime', { model });
+    },
+    onInstallProgress: async (
+      callback: (data: RifeInstallProgress) => void
+    ): Promise<UnlistenFn> => {
+      return await listen<RifeInstallProgress>('rife://install-progress', (event) => {
+        callback(event.payload);
+      });
     },
   },
   audioNormalizer: {

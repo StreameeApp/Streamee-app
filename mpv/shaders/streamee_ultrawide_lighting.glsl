@@ -20,6 +20,31 @@
 //!MINIMUM 0.001
 //!MAXIMUM 1
 1
+//!PARAM light_x
+//!TYPE DYNAMIC float
+//!MINIMUM 0
+//!MAXIMUM 1
+0
+//!PARAM light_y
+//!TYPE DYNAMIC float
+//!MINIMUM 0
+//!MAXIMUM 1
+0
+//!PARAM light_w
+//!TYPE DYNAMIC float
+//!MINIMUM 0.001
+//!MAXIMUM 1
+1
+//!PARAM light_h
+//!TYPE DYNAMIC float
+//!MINIMUM 0.001
+//!MAXIMUM 1
+1
+//!PARAM content_guard
+//!TYPE DYNAMIC float
+//!MINIMUM 0
+//!MAXIMUM 1
+0
 //!PARAM source_aspect
 //!TYPE DYNAMIC float
 //!MINIMUM 0.1
@@ -59,8 +84,8 @@
 //!DESC Streamee edge-light averages
 vec4 hook() {
     if (lighting_enabled < 0.5) return vec4(0.0, 0.0, 0.0, 1.0);
-    vec2 lo = vec2(crop_x, crop_y) + 0.5 * HOOKED_pt;
-    vec2 hi = vec2(crop_x + crop_w, crop_y + crop_h) - 0.5 * HOOKED_pt;
+    vec2 lo = vec2(light_x, light_y) + 0.5 * HOOKED_pt;
+    vec2 hi = vec2(light_x + light_w, light_y + light_h) - 0.5 * HOOKED_pt;
     int edge = int(floor(HOOKED_pos.y * 4.0));
     float center = (floor(HOOKED_pos.x * 10.0) + 0.5) / 10.0;
     vec3 color = vec3(0.0);
@@ -89,18 +114,45 @@ vec4 hook() {
     vec2 fit = vec2(min(aspect / canvas_aspect, 1.0),
                     min(canvas_aspect / aspect, 1.0));
     vec2 q = (HOOKED_pos - 0.5) / fit + 0.5;
-    if (all(greaterThanEqual(q, vec2(0.0))) && all(lessThanEqual(q, vec2(1.0)))) {
-        vec2 lo = vec2(crop_x, crop_y) + 0.5 * HOOKED_pt;
-        vec2 hi = vec2(crop_x + crop_w, crop_y + crop_h) - 0.5 * HOOKED_pt;
-        return HOOKED_tex(clamp(vec2(crop_x, crop_y) + q * vec2(crop_w, crop_h), lo, hi));
+    vec2 render_lo = vec2(crop_x, crop_y) + 0.5 * HOOKED_pt;
+    vec2 render_hi = vec2(crop_x + crop_w, crop_y + crop_h) - 0.5 * HOOKED_pt;
+    vec2 source_position = vec2(crop_x, crop_y) + q * vec2(crop_w, crop_h);
+    vec2 active_lo = (vec2(light_x, light_y) - vec2(crop_x, crop_y))
+                   / vec2(crop_w, crop_h);
+    vec2 active_hi = (vec2(light_x + light_w, light_y + light_h)
+                   - vec2(crop_x, crop_y)) / vec2(crop_w, crop_h);
+    // cropdetect is intentionally quantized and can retain a few black pixels.
+    // Absorb that rounding margin into the lighting instead of drawing a seam.
+    vec2 edge_guard = content_guard * min(
+        4.0 * HOOKED_pt / vec2(crop_w, crop_h),
+        max((active_hi - active_lo) * 0.01, vec2(0.0))
+    );
+    active_lo += edge_guard;
+    active_hi -= edge_guard;
+    bool inside_render = all(greaterThanEqual(q, vec2(0.0)))
+                      && all(lessThanEqual(q, vec2(1.0)));
+    bool inside_active = all(greaterThanEqual(q, active_lo))
+                      && all(lessThanEqual(q, active_hi));
+    if (inside_render && inside_active) {
+        return HOOKED_tex(clamp(source_position, render_lo, render_hi));
     }
-    bool vertical_edge = fit.x < 0.999999;
-    float coordinate = vertical_edge ? q.y : q.x;
-    float edge = vertical_edge ? (q.x < 0.0 ? 0.0 : 1.0) : (q.y < 0.0 ? 2.0 : 3.0);
-    float available = vertical_edge ? (1.0 - fit.x) : (1.0 - fit.y);
-    float outside = vertical_edge ? abs(HOOKED_pos.x - 0.5) - fit.x * 0.5
-                                  : abs(HOOKED_pos.y - 0.5) - fit.y * 0.5;
-    float distance = outside / max(available * 0.5, 0.000001);
+    vec2 q_min = vec2(0.5) - 0.5 / fit;
+    vec2 q_max = vec2(0.5) + 0.5 / fit;
+    vec4 violations = vec4(active_lo.x - q.x, q.x - active_hi.x,
+                           active_lo.y - q.y, q.y - active_hi.y);
+    vec4 spans = max(vec4(active_lo.x - q_min.x, q_max.x - active_hi.x,
+                          active_lo.y - q_min.y, q_max.y - active_hi.y),
+                     vec4(0.000001));
+    vec4 normalized = violations / spans;
+    float edge = 0.0;
+    float distance = normalized.x;
+    if (normalized.y > distance) { edge = 1.0; distance = normalized.y; }
+    if (normalized.z > distance) { edge = 2.0; distance = normalized.z; }
+    if (normalized.w > distance) { edge = 3.0; distance = normalized.w; }
+    bool vertical_edge = edge < 1.5;
+    float coordinate = vertical_edge
+        ? (q.y - active_lo.y) / max(active_hi.y - active_lo.y, 0.000001)
+        : (q.x - active_lo.x) / max(active_hi.x - active_lo.x, 0.000001);
     float fade = pow(max(1.0 - distance / light_length, 0.0), 2.0);
     vec3 light = lighting_enabled > 0.5
         ? STREAMEE_LIGHT_EDGES_tex(vec2(clamp(coordinate, 0.05, 0.95),

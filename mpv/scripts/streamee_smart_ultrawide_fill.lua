@@ -104,6 +104,7 @@ local lookahead_purpose = nil
 local efficient_interval_timer = nil
 local efficient_poll_timer = nil
 local efficient_scan_start_timer = nil
+local efficient_live_scan_active = false
 local render_lead_estimate = tonumber(opts.lookahead_render_lead) or 0.060
 local pending_render_sample = nil
 local topology_timer = nil
@@ -116,6 +117,7 @@ local lighting_shader_opts_updating = false
 local lighting_shader_opts_timer = nil
 local saved_keepaspect = nil
 local fixed_canvas_crop = nil
+local lighting_content_crop = nil
 local svp_shadow_path = nil
 local svp_shadow_source = nil
 local svp_lighting_suppressed = false
@@ -144,6 +146,16 @@ end
 
 local function renderer_requested()
     return enabled or lighting_enabled
+end
+
+local function effective_detection_mode()
+    if enabled then return active_mode end
+    if lighting_enabled then return "efficient" end
+    return "off"
+end
+
+local function detection_requested()
+    return effective_detection_mode() ~= "off"
 end
 
 local function normalized_path(value)
@@ -332,7 +344,7 @@ end
 local function start_lookahead(purpose)
     purpose = purpose or "dynamic"
     if not option_enabled(opts.lookahead_enabled)
-        or not enabled
+        or not detection_requested()
         or not file_loaded
         or mp.get_property_bool("pause", false) then
         return
@@ -765,6 +777,8 @@ end
 local function update_lighting_shader_opts(coordinates)
     coordinates = coordinates or fixed_canvas_coordinates(fixed_canvas_crop)
     if not coordinates then return false end
+    local lighting_coordinates = fixed_canvas_coordinates(lighting_content_crop or fixed_canvas_crop)
+    if not lighting_coordinates then return false end
     local dimensions = mp.get_property_native("osd-dimensions") or {}
     local canvas_width, canvas_height = tonumber(dimensions.w), tonumber(dimensions.h)
     if not canvas_width or not canvas_height or canvas_width <= 0 or canvas_height <= 0 then
@@ -777,6 +791,11 @@ local function update_lighting_shader_opts(coordinates)
         ["streamee_ultrawide_lighting/crop_y"] = string.format("%.9f", coordinates.y),
         ["streamee_ultrawide_lighting/crop_w"] = string.format("%.9f", coordinates.w),
         ["streamee_ultrawide_lighting/crop_h"] = string.format("%.9f", coordinates.h),
+        ["streamee_ultrawide_lighting/light_x"] = string.format("%.9f", lighting_coordinates.x),
+        ["streamee_ultrawide_lighting/light_y"] = string.format("%.9f", lighting_coordinates.y),
+        ["streamee_ultrawide_lighting/light_w"] = string.format("%.9f", lighting_coordinates.w),
+        ["streamee_ultrawide_lighting/light_h"] = string.format("%.9f", lighting_coordinates.h),
+        ["streamee_ultrawide_lighting/content_guard"] = lighting_content_crop and "1" or "0",
         ["streamee_ultrawide_lighting/source_aspect"] = string.format("%.9f", coordinates.source_aspect),
         ["streamee_ultrawide_lighting/canvas_aspect"] = string.format("%.9f", canvas_width / canvas_height),
         ["streamee_ultrawide_lighting/lighting_enabled"] = lighting_enabled and "1" or "0",
@@ -882,6 +901,34 @@ local function set_crop(crop, reason, force)
         msg.info("Adaptive crop restored (" .. reason .. ")")
         set_user_state("watching")
     end
+end
+
+local function current_detection_crop()
+    return enabled and applied_crop or lighting_content_crop
+end
+
+local function apply_detection_result(crop, reason, force)
+    if not force and crops_equivalent(crop, current_detection_crop()) then
+        return false
+    end
+    lighting_content_crop = crop
+    if enabled then
+        set_crop(crop, reason, force)
+        return true
+    end
+    if not lighting_enabled or not file_loaded or (base_crop or "") ~= "" then
+        return false
+    end
+    fixed_canvas_crop = nil
+    if apply_fixed_canvas_crop(nil) then
+        msg.info(string.format(
+            "Black Bar Lighting content bounds: %s (%s)",
+            crop or "full frame",
+            reason
+        ))
+        return true
+    end
+    return false
 end
 
 local function add_detector()
@@ -1088,19 +1135,20 @@ local function apply_pending_lookahead()
         playback_time - command_pts,
         render_lead_estimate
     )
+    local current_crop = current_detection_crop()
     if lookahead_pending.crop == "none" then
-        if applied_crop then
-            set_crop(nil, transition_reason)
+        if current_crop then
+            apply_detection_result(nil, transition_reason)
         end
-    elseif lookahead_pending.crop ~= applied_crop then
-        set_crop(lookahead_pending.crop, transition_reason)
+    elseif not crops_equivalent(lookahead_pending.crop, current_crop) then
+        apply_detection_result(lookahead_pending.crop, transition_reason)
     end
     lookahead_baseline_crop = lookahead_pending.crop
     lookahead_pending = nil
 end
 
 local function poll_detector()
-    if not enabled or not file_loaded then
+    if not detection_requested() or not file_loaded then
         return
     end
     poll_lookahead_result()
@@ -1114,7 +1162,7 @@ local function poll_detector()
         -- makes the live output unsuitable for baseline synchronization.
         remove_detector()
         lookahead_ready = true
-        set_crop(
+        apply_detection_result(
             lookahead_baseline_crop ~= "none" and lookahead_baseline_crop or nil,
             "independent lookahead baseline for SVP lighting"
         )
@@ -1147,11 +1195,11 @@ local function poll_detector()
         -- crop. Before synchronization the fast live fallback may have
         -- applied a transient boundary while the probe was still settling.
         if candidate == "none" then
-            if applied_crop then
-                set_crop(nil, "lookahead baseline synchronized")
+            if current_detection_crop() then
+                apply_detection_result(nil, "lookahead baseline synchronized")
             end
-        elseif candidate ~= applied_crop then
-            set_crop(candidate, "lookahead baseline synchronized")
+        elseif not crops_equivalent(candidate, current_detection_crop()) then
+            apply_detection_result(candidate, "lookahead baseline synchronized")
         end
         lookahead_baseline_crop = candidate
         apply_pending_lookahead()
@@ -1170,11 +1218,17 @@ local function poll_detector()
             return
         end
         if candidate == "none" then
-            if applied_crop then
-                set_crop(nil, "stable full-height image")
+            if current_detection_crop() then
+                apply_detection_result(nil, "stable full-height image")
             end
-        elseif candidate ~= applied_crop then
-            set_crop(candidate, "transition-confirmed symmetric letterbox")
+        elseif not crops_equivalent(candidate, current_detection_crop()) then
+            apply_detection_result(candidate, "transition-confirmed symmetric letterbox")
+        end
+        if efficient_live_scan_active then
+            efficient_live_scan_active = false
+            if timer then timer:stop() end
+            remove_detector()
+            msg.info("Smart Black Bar Fill efficient live fallback scan completed")
         end
     end
 end
@@ -1194,6 +1248,7 @@ local function stop_timer()
 end
 
 local function stop_efficient_timers()
+    efficient_live_scan_active = false
     if efficient_interval_timer then
         efficient_interval_timer:stop()
     end
@@ -1207,7 +1262,7 @@ local function stop_efficient_timers()
 end
 
 local function poll_efficient_scan()
-    if active_mode ~= "efficient" or lookahead_purpose ~= "efficient" then
+    if effective_detection_mode() ~= "efficient" or lookahead_purpose ~= "efficient" then
         return
     end
 
@@ -1217,12 +1272,13 @@ local function poll_efficient_scan()
     end
 
     local crop = tostring(event.crop)
+    local current_crop = current_detection_crop()
     if crop == "none" then
-        if applied_crop then
-            set_crop(nil, "efficient periodic scan")
+        if current_crop then
+            apply_detection_result(nil, "efficient periodic scan")
         end
-    elseif crop ~= applied_crop then
-        set_crop(crop, "efficient periodic scan")
+    elseif not crops_equivalent(crop, current_crop) then
+        apply_detection_result(crop, "efficient periodic scan")
     end
     msg.info("Smart Black Bar Fill efficient scan completed: crop=" .. crop)
     stop_lookahead()
@@ -1232,11 +1288,12 @@ local function poll_efficient_scan()
 end
 
 local function start_efficient_scan()
-    if active_mode ~= "efficient"
+    if effective_detection_mode() ~= "efficient"
         or not file_loaded
         or not viewport_allows_fill()
         or mp.get_property_bool("pause", false)
-        or lookahead_running then
+        or lookahead_running
+        or efficient_live_scan_active then
         return
     end
 
@@ -1248,6 +1305,18 @@ local function start_efficient_scan()
             )
         else
             efficient_poll_timer:resume()
+        end
+    else
+        suppress_svp_outer_lighting()
+        efficient_live_scan_active = true
+        reset_candidate()
+        add_detector()
+        if filter_installed then
+            start_timer()
+            msg.info("Smart Black Bar Fill efficient scan using live detector fallback")
+        else
+            efficient_live_scan_active = false
+            msg.warn("Smart Black Bar Fill efficient live detector fallback was unavailable")
         end
     end
 end
@@ -1285,7 +1354,7 @@ local function reconcile_filter_topology()
     topology_reconciling = true
 
     suppress_svp_outer_lighting()
-    local lighting = svp_lighting_suppressed or svp_outer_lighting_active()
+    local lighting = svp_outer_lighting_active()
     if lighting then
         local had_detector = filter_installed
         remove_detector()
@@ -1345,14 +1414,19 @@ local function set_mode(mode, show_osd)
             install_lighting_shader()
             fixed_canvas_crop = nil
             update_lighting_shader_opts()
+            start_efficient_schedule()
             schedule_topology_reconcile()
         else
+            lighting_content_crop = nil
             remove_lighting_shader()
             restore_svp_outer_lighting()
         end
         set_user_state("off")
     elseif mode == "dynamic" then
         if file_loaded then
+            if lighting_content_crop then
+                set_crop(lighting_content_crop, "reusing lighting detection")
+            end
             add_detector()
             start_timer()
             schedule_lookahead_restart(0.25)
@@ -1360,6 +1434,9 @@ local function set_mode(mode, show_osd)
         set_user_state("watching")
     else
         if file_loaded then
+            if lighting_content_crop then
+                set_crop(lighting_content_crop, "reusing lighting detection")
+            end
             start_efficient_schedule()
         end
         set_user_state("watching")
@@ -1388,8 +1465,11 @@ local function set_lighting(value, show_osd)
             install_lighting_shader()
             if not enabled then fixed_canvas_crop = nil end
             update_lighting_shader_opts()
+            if not enabled then start_efficient_schedule() end
             schedule_topology_reconcile()
         else
+            stop_mode_runtime()
+            lighting_content_crop = nil
             remove_lighting_shader()
             restore_svp_outer_lighting()
         end
@@ -1418,6 +1498,7 @@ mp.register_event("file-loaded", function()
     pre_svp_crop_installed = false
     lighting_cache_file = nil
     lighting_cache_time = -math.huge
+    lighting_content_crop = nil
     base_crop = mp.get_property("video-crop", "")
     reset_render_lead_estimate()
     reset_candidate()
@@ -1431,6 +1512,8 @@ mp.register_event("file-loaded", function()
         start_timer()
         schedule_lookahead_restart(0.25)
     elseif active_mode == "efficient" then
+        start_efficient_schedule()
+    elseif lighting_enabled then
         start_efficient_schedule()
     end
     set_user_state(enabled and "watching" or "off")
@@ -1455,6 +1538,7 @@ mp.register_event("end-file", function()
     applied_crop = nil
     crop_application = nil
     pre_svp_crop_installed = false
+    lighting_content_crop = nil
     pending_render_sample = nil
     reset_candidate()
     active_mode = saved_mode
@@ -1510,15 +1594,15 @@ end)
 
 mp.register_event("seek", function()
     reset_candidate()
-    if active_mode == "dynamic" then
+    if effective_detection_mode() == "dynamic" then
         schedule_lookahead_restart(0.35)
-    elseif active_mode == "efficient" then
+    elseif effective_detection_mode() == "efficient" then
         stop_lookahead()
         schedule_efficient_scan(0.35)
     end
 end)
 mp.observe_property("pause", "bool", function(_, paused)
-    if not enabled or not file_loaded then
+    if not detection_requested() or not file_loaded then
         return
     end
     if paused then
@@ -1527,26 +1611,26 @@ mp.observe_property("pause", "bool", function(_, paused)
             efficient_poll_timer:stop()
         end
     else
-        if active_mode == "dynamic" then
+        if effective_detection_mode() == "dynamic" then
             schedule_lookahead_restart(0.20)
-        elseif active_mode == "efficient" then
+        elseif effective_detection_mode() == "efficient" then
             schedule_efficient_scan(0.20)
         end
     end
 end)
 mp.observe_property("window-minimized", "bool", function(_, minimized)
-    if not enabled or not file_loaded then return end
+    if not detection_requested() or not file_loaded then return end
     if minimized then
         stop_lookahead()
-    elseif active_mode == "dynamic" then
+    elseif effective_detection_mode() == "dynamic" then
         schedule_lookahead_restart(0.20)
-    elseif active_mode == "efficient" then
+    elseif effective_detection_mode() == "efficient" then
         schedule_efficient_scan(0.20)
     end
 end)
 mp.observe_property("speed", "number", function()
-    if enabled and file_loaded and lookahead_running then
-        if active_mode == "dynamic" then
+    if detection_requested() and file_loaded and lookahead_running then
+        if effective_detection_mode() == "dynamic" then
             schedule_lookahead_restart(0.20)
         else
             stop_lookahead()

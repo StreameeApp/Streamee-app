@@ -6,6 +6,7 @@ local o = {
     rtx_hdr = false,
     hdr_contrast_boost = false,
     before_svp = true,
+    rife_before_upscaling = true,
     max_width = 2560,
     max_height = 1440,
 }
@@ -13,7 +14,9 @@ local o = {
 options.read_options(o, "streamee_vsr")
 
 local FILTER_LABEL = "@streamee-vsr"
+local HDR_FILTER_LABEL = "@streamee-rtx-hdr"
 local SVP_FILTER_LABEL = "svp"
+local RIFE_FILTER_LABEL = "streamee-rife"
 local last_mode = nil
 local order_check_pending = false
 
@@ -24,6 +27,7 @@ end
 local vsr_available = option_enabled(o.enabled)
 local vsr_enabled = vsr_available
 local rtx_hdr_enabled = option_enabled(o.rtx_hdr)
+local rtx_hdr_active = false
 local base_contrast = mp.get_property_number("contrast", 0)
 
 local function publish_menu_state()
@@ -43,7 +47,7 @@ local function apply_hdr_contrast()
 
     local windows_hdr_enabled =
         mp.get_property_native("user-data/streamee-hdr-state", "off") == "on"
-    local target = rtx_hdr_enabled and windows_hdr_enabled and 15 or base_contrast
+    local target = rtx_hdr_active and windows_hdr_enabled and 15 or base_contrast
     if mp.get_property_number("contrast", base_contrast) ~= target then
         mp.set_property_number("contrast", target)
     end
@@ -53,21 +57,19 @@ local function bm3dcuda_enabled()
     return mp.get_property_number("user-data/streamee-bm3dcuda-enabled", 0) == 1
 end
 
-local function should_run_before_svp()
-    return option_enabled(o.before_svp) and not bm3dcuda_enabled()
-end
-
-local function source_dimensions()
+local function source_video_params()
     local params = mp.get_property_native("video-params")
     if type(params) ~= "table" then
-        return nil, nil
+        return nil, nil, false
     end
 
-    return tonumber(params.w), tonumber(params.h)
+    local transfer = tostring(params.gamma or params.transfer or ""):lower()
+    local native_hdr = transfer == "pq" or transfer == "hlg"
+    return tonumber(params.w), tonumber(params.h), native_hdr
 end
 
 local function desired_mode()
-    local width, height = source_dimensions()
+    local width, height, native_hdr = source_video_params()
     if not width or not height then
         return nil, nil, nil
     end
@@ -77,11 +79,15 @@ local function desired_mode()
     if vsr_enabled
         and long_edge <= tonumber(o.max_width)
         and short_edge <= tonumber(o.max_height) then
-        return "vsr", width, height
+        return native_hdr and "vsr-native-hdr" or "vsr", width, height
     end
 
-    if rtx_hdr_enabled then
+    if rtx_hdr_enabled and not native_hdr then
         return "hdr", width, height
+    end
+
+    if native_hdr then
+        return "native-hdr", width, height
     end
 
     return "off", width, height
@@ -95,7 +101,7 @@ local function run_vf(operation, value, report_error)
     return ok
 end
 
-local function filter_is_present()
+local function filter_is_present(label)
     local filters = mp.get_property_native("vf")
     if type(filters) ~= "table" then
         return false
@@ -103,7 +109,7 @@ local function filter_is_present()
 
     for _, filter in ipairs(filters) do
         if type(filter) == "table"
-            and (filter.label == FILTER_LABEL or filter.label == FILTER_LABEL:sub(2)) then
+            and (filter.label == label or filter.label == label:sub(2)) then
             return true
         end
     end
@@ -127,35 +133,61 @@ local function filter_position(label)
 end
 
 local function vsr_filter()
-    local filter = FILTER_LABEL .. ":d3d11vpp=scale=2:format=nv12:scaling-mode=nvidia"
-    if rtx_hdr_enabled then
-        filter = filter .. ":nvidia-true-hdr"
-    end
-    return filter
+    return FILTER_LABEL .. ":d3d11vpp=scale=2:format=nv12:scaling-mode=nvidia"
 end
 
-local function enforce_vsr_order()
+local function hdr_filter()
+    return HDR_FILTER_LABEL .. ":d3d11vpp=format=nv12:nvidia-true-hdr"
+end
+
+local function frame_generation_target()
+    if filter_position(RIFE_FILTER_LABEL) then
+        return RIFE_FILTER_LABEL, "RIFE"
+    end
+    if filter_position(SVP_FILTER_LABEL) then
+        return SVP_FILTER_LABEL, "SVP"
+    end
+    return nil, nil
+end
+
+local function vsr_before_frame_generation(target_label)
+    if target_label == RIFE_FILTER_LABEL then
+        return not option_enabled(o.rife_before_upscaling)
+    end
+    return option_enabled(o.before_svp) and not bm3dcuda_enabled()
+end
+
+local function enforce_filter_order()
     order_check_pending = false
-    if last_mode ~= "vsr" then
+    if last_mode == "off" or not last_mode then
         return
     end
 
     local vsr_position = filter_position(FILTER_LABEL:sub(2))
-    local svp_position = filter_position(SVP_FILTER_LABEL)
-    if not vsr_position or not svp_position then
-        return
+    local target_label, target_name = frame_generation_target()
+    local target_position = target_label and filter_position(target_label) or nil
+    if last_mode:find("^vsr") and vsr_position and target_position then
+        local before_target = vsr_before_frame_generation(target_label)
+        local correctly_ordered = before_target and vsr_position < target_position
+            or not before_target and vsr_position > target_position
+        if not correctly_ordered then
+            run_vf("remove", FILTER_LABEL, false)
+            run_vf(before_target and "pre" or "add", vsr_filter(), true)
+            mp.msg.info("RTX VSR filter moved " .. (before_target and "before " or "after ") .. target_name)
+        end
     end
 
-    local before_svp = should_run_before_svp()
-    local correctly_ordered = before_svp and vsr_position < svp_position
-        or not before_svp and vsr_position > svp_position
-    if correctly_ordered then
-        return
+    local hdr_position = filter_position(HDR_FILTER_LABEL:sub(2))
+    if rtx_hdr_enabled and hdr_position then
+        vsr_position = filter_position(FILTER_LABEL:sub(2))
+        target_position = target_label and filter_position(target_label) or nil
+        if (vsr_position and hdr_position < vsr_position)
+            or (target_position and hdr_position < target_position) then
+            run_vf("remove", HDR_FILTER_LABEL, false)
+            run_vf("add", hdr_filter(), true)
+            mp.msg.info("RTX Video HDR filter moved after frame generation and upscaling")
+        end
     end
-
-    run_vf("remove", FILTER_LABEL, false)
-    run_vf(before_svp and "pre" or "add", vsr_filter(), true)
-    mp.msg.info("RTX VSR filter moved " .. (before_svp and "before" or "after") .. " SVP")
 end
 
 local function schedule_order_check()
@@ -164,7 +196,7 @@ local function schedule_order_check()
     end
 
     order_check_pending = true
-    mp.add_timeout(0, enforce_vsr_order)
+    mp.add_timeout(0, enforce_filter_order)
 end
 
 local function apply_for_source()
@@ -178,26 +210,42 @@ local function apply_for_source()
     end
 
     last_mode = mode
-    if filter_is_present() then
+    if filter_is_present(FILTER_LABEL) then
         run_vf("remove", FILTER_LABEL, false)
     end
+    if filter_is_present(HDR_FILTER_LABEL) then
+        run_vf("remove", HDR_FILTER_LABEL, false)
+    end
+    rtx_hdr_active = false
 
-    if mode == "vsr" then
-        local before_svp = should_run_before_svp()
-        run_vf(before_svp and "pre" or "add", vsr_filter(), true)
+    if mode == "vsr" or mode == "vsr-native-hdr" then
+        local target_label, target_name = frame_generation_target()
+        local before_target = vsr_before_frame_generation(target_label)
+        run_vf(before_target and "pre" or "add", vsr_filter(), true)
         mp.msg.info(string.format(
-            "RTX VSR 2x enabled for %dx%d source (%s SVP)",
+            "RTX VSR 2x enabled for %dx%d source (%s%s)",
             width,
             height,
-            before_svp and "before" or "after"
+            before_target and "before " or "after ",
+            target_name or "frame-generation slot"
         ))
-        schedule_order_check()
     elseif mode == "hdr" then
-        run_vf("add", FILTER_LABEL .. ":d3d11vpp=format=nv12:nvidia-true-hdr", true)
         mp.msg.info(string.format("RTX VSR bypassed for %dx%d source; RTX HDR retained", width, height))
+    elseif mode == "native-hdr" then
+        mp.msg.info(string.format(
+            "RTX VSR bypassed for %dx%d native HDR source; RTX Video HDR bypassed",
+            width,
+            height
+        ))
     else
         mp.msg.info(string.format("RTX VSR bypassed for %dx%d source", width, height))
     end
+
+    if rtx_hdr_enabled and (mode == "vsr" or mode == "hdr") then
+        rtx_hdr_active = run_vf("add", hdr_filter(), true)
+    end
+    apply_hdr_contrast()
+    schedule_order_check()
 end
 
 local function reapply_for_source()

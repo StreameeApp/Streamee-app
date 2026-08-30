@@ -2012,6 +2012,170 @@
   border-bottom: 1px solid var(--border-subtle);
 }
 
+.settings-runtime-installer {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.9fr) minmax(250px, 1.1fr);
+  gap: 18px 28px;
+  align-items: center;
+  min-height: 112px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.settings-runtime-copy,
+.settings-runtime-control {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.settings-runtime-copy {
+  gap: 5px;
+}
+
+.settings-runtime-control {
+  justify-self: end;
+  width: min(100%, 410px);
+  gap: 9px;
+}
+
+.settings-runtime-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.settings-runtime-badge {
+  padding: 3px 7px;
+  background: rgba(148, 163, 184, 0.08);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: var(--radius-full);
+  color: var(--text-muted);
+  font-size: 9.5px;
+  font-weight: 750;
+  letter-spacing: 0.045em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.settings-runtime-installer.is-ready .settings-runtime-badge {
+  background: rgba(52, 211, 153, 0.08);
+  border-color: rgba(52, 211, 153, 0.2);
+  color: var(--green);
+}
+
+.settings-runtime-installer.is-installing .settings-runtime-badge {
+  background: var(--accent-muted);
+  border-color: rgba(255, 107, 53, 0.24);
+  color: var(--accent);
+}
+
+.settings-runtime-installer.is-error .settings-runtime-badge {
+  background: var(--red-muted);
+  border-color: rgba(251, 113, 133, 0.2);
+  color: var(--red);
+}
+
+.settings-runtime-description,
+.settings-runtime-detail {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.settings-runtime-detail {
+  color: var(--text-tertiary);
+}
+
+.settings-runtime-actions {
+  display: flex;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.settings-runtime-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  min-width: 0;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.settings-runtime-status svg {
+  width: 13px;
+  height: 13px;
+  margin-top: 1px;
+  flex: 0 0 13px;
+  color: var(--text-muted);
+}
+
+.settings-runtime-installer.is-ready .settings-runtime-status svg {
+  color: var(--green);
+}
+
+.settings-runtime-installer.is-error .settings-runtime-status,
+.settings-runtime-installer.is-error .settings-runtime-status svg {
+  color: var(--red);
+}
+
+.settings-runtime-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+}
+
+.settings-runtime-progress-track {
+  position: relative;
+  height: 7px;
+  overflow: hidden;
+  background: rgba(148, 163, 184, 0.13);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: var(--radius-full);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.34);
+}
+
+.settings-runtime-progress-track > span {
+  display: block;
+  height: 100%;
+  min-width: 3px;
+  background: linear-gradient(90deg, var(--accent), #ff9a70);
+  border-radius: inherit;
+  box-shadow: 0 0 10px rgba(255, 107, 53, 0.34);
+  transition: width 180ms ease;
+}
+
+.settings-runtime-progress-track.is-indeterminate > span {
+  position: absolute;
+  width: 38%;
+  animation: settings-runtime-progress 1.25s ease-in-out infinite;
+}
+
+.settings-runtime-progress-label {
+  min-width: 76px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  text-align: right;
+}
+
+@keyframes settings-runtime-progress {
+  0% {
+    transform: translateX(-110%);
+  }
+
+  100% {
+    transform: translateX(300%);
+  }
+}
+
 .settings-trakt-connect,
 .settings-sync {
   margin: 0;
@@ -2397,10 +2561,16 @@
   .settings-advanced-grid > .settings-toggle,
   .settings-form > .settings-combined-setting,
   .settings-advanced-grid > .settings-combined-setting,
+  .settings-runtime-installer,
   .settings-data-card,
   .settings-data-card-critical {
     grid-template-columns: 1fr;
     gap: 10px;
+  }
+
+  .settings-runtime-control {
+    justify-self: stretch;
+    width: 100%;
   }
 
   .settings-form > .settings-field > label,

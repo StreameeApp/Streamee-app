@@ -26,7 +26,7 @@ Streamee combines a polished discovery library with a highly tuned desktop playb
 - Automatic intro and recap skipping, outro-aware next-episode playback, and local detection fallbacks
 - Smart Next preparation that can warm the next aired episode before the current one ends
 - A real-time LUFS-based Audio Normalizer with adaptive gating, gain riding, and final peak protection
-- Configurable upscaling, sharpening, denoising, debanding, HDR handling, Smart Black Bar Fill with optional edge lighting, and optional SVP integration
+- Configurable RIFE frame generation, upscaling, sharpening, denoising, debanding, HDR handling, Smart Black Bar Fill with optional edge lighting, and optional SVP integration
 - Direct playback of local video files and folders through the same MPV experience
 - Cache-only seekbar thumbnails, reusable stream caching, playback statistics, and a local phone remote
 
@@ -151,10 +151,25 @@ Streamee exposes a configurable MPV processing chain rather than locking playbac
 - **Sharpening** — Standard, Adaptive, Ultra, and UltraCustom presets, plus automatic source-aware selection.
 - **Denoising** — Bilateral and advanced MPV/VapourSynth processing with selectable strength and GPU-oriented BM3D modes where supported.
 - **Debanding** — Optional MPV debanding for visible color gradients.
-- **Smart Black Bar Fill** — Detects embedded black bars and fits the active picture to displays of any aspect ratio. It handles side bars on ultrawide displays and top/bottom bars on standard displays without moving soft subtitles or player controls. Independent **Black Bar Lighting** extends averaged edge colours into unused space even when fill detection is off; disabling lighting keeps smooth fixed-canvas cropping with black surroundings. Settings provide saved defaults, while the MPV right-click menu can override both features for the current title.
-- **Efficient aspect detection** — **Efficient** scans briefly at playback start, after seeking, and periodically. **Dynamic** follows aspect-ratio changes using a low-resolution, reduced-frame-rate lookahead probe. When Smart Black Bar Fill is active, duplicate SVP lighting is suppressed only for the current playback pipeline so SVP does not render an unnecessarily enlarged intermediate frame; SVP's generated source script and global settings remain unchanged.
+- **RIFE frame generation** — Optional TensorRT-powered 2x or 3x frame generation runs directly in Streamee's MPV pipeline without requiring or starting SVP. Choose among RIFE 4.6, 4.9, 4.16 Lite, 4.18, and 4.25 models, tune processing resolution and GPU concurrency, and place RIFE before or after RTX VSR.
+- **Smart Black Bar Fill** — Detects embedded black bars and fits the active picture to displays of any aspect ratio. It handles side bars on ultrawide displays and top/bottom bars on standard displays without moving soft subtitles or player controls. Independent **Black Bar Lighting** can detect and replace embedded bars while leaving the full picture uncropped, or extend averaged edge colours into naturally unused canvas space. Disabling lighting keeps smooth fixed-canvas cropping with black surroundings. Settings provide saved defaults, while the MPV right-click menu can override both features for the current title.
+- **Efficient aspect detection** — **Efficient** scans briefly at playback start, after seeking, and periodically. Lighting-only playback uses the same low-cost schedule without enabling Fill. **Dynamic** follows aspect-ratio changes using a low-resolution, reduced-frame-rate lookahead probe. When either fixed-canvas feature is active, duplicate SVP lighting is suppressed only for the current playback pipeline so SVP does not render an unnecessarily enlarged intermediate frame; SVP's generated source script and global settings remain unchanged.
 - **Season-aware settings** — Player-menu processing changes can carry through later episodes of the same season without becoming a global default.
 - **SVP integration** — Start, restart, and close SmoothVideo Project with playback, and control whether RTX VSR runs before or after frame interpolation.
+
+#### RIFE frame generation
+
+Streamee can generate intermediate frames locally with RIFE through VapourSynth, vs-mlrt, and NVIDIA TensorRT. This is a separate playback path from SmoothVideo Project: enabling Streamee RIFE neither requires nor launches SVP.
+
+- Open **Settings → Integrations → RIFE Frame Generation**, select a model, and install the optional managed runtime. The initial download is about 2.8 GB and requires at least 6.5 GB of free space while installing.
+- Downloads can resume after interruption and every runtime or model archive is checked against its pinned SHA-256 digest before activation. Additional models can be installed individually after the base runtime is ready.
+- **RIFE 4.6** is the recommended starting model, especially for 4K sources. RIFE 4.9, 4.16 Lite, 4.18, and 4.25 provide alternatives with different detail, stability, and processing-cost tradeoffs.
+- The **2x** multiplier generates one intermediate frame between source frames; **3x** generates two and needs more GPU throughput. One TensorRT stream reduces VRAM pressure, while two can improve throughput on high-end GPUs.
+- **Auto** processing keeps the original input and output resolution. For 4K with RIFE 4.6, motion estimation runs internally at half scale by default; advanced users can select another RIFE 4.6 motion-analysis scale or compare native, 1080p, and 720p processing modes.
+- RIFE normally runs before upscaling to reduce GPU cost. RTX VSR users can reverse that order for comparison; renderer-based upscalers remain after RIFE. RTX Video HDR runs after frame generation for SDR sources and is skipped for native HDR.
+- Scene-cut detection prevents interpolation across hard cuts, and the generated frames are converted back using the source colour matrix and range.
+
+RIFE currently requires Windows, a supported NVIDIA GPU and driver, and substantial GPU memory and processing headroom. The first playback after changing the model, resolution, scale, or GPU-specific configuration can pause while TensorRT compiles and caches an engine; later playback reuses that cache.
 
 #### Smart Black Bar Fill and edge lighting
 
@@ -221,7 +236,7 @@ These controls reduce accidental credential exposure and unsafe network access, 
 
 - Windows 10 or Windows 11
 - `ffmpeg` on `PATH` only when using WhisperLive
-- Optional: an OMDb API key, Trakt account, compatible source add-ons, NVIDIA RTX features, or SVP
+- Optional: an OMDb API key, Trakt account, compatible source add-ons, a supported NVIDIA GPU for RIFE or RTX features, or SVP
 
 MPV and TMDB catalog access are bundled or managed by Streamee; no personal TMDB key is required.
 

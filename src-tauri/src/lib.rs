@@ -8,6 +8,7 @@ mod introdb;
 mod logging;
 mod mpv_ipc;
 mod remote_server;
+mod rife_runtime;
 mod torrent;
 mod whisperlive;
 #[cfg(target_os = "windows")]
@@ -2137,7 +2138,10 @@ fn pick_qbittorrent_video_file(
 static SMART_NEXT_WARMUP_GENERATION: AtomicU64 = AtomicU64::new(1);
 static QBITTORRENT_TRANSFER_MONITORS: Lazy<Mutex<HashSet<String>>> =
     Lazy::new(|| Mutex::new(HashSet::new()));
-const STREAM_CACHE_CLIENT_WRITE_TIMEOUT_SECONDS: u64 = 5;
+// First-use GPU filters such as RIFE can pause MPV's local stream reads while
+// TensorRT compiles an engine. Keep the proxy connection alive through that
+// one-time stall instead of treating local back-pressure as a source failure.
+const STREAM_CACHE_CLIENT_WRITE_TIMEOUT_SECONDS: u64 = 120;
 const SINGLE_FILE_CACHE_BLOCK_BYTES: u64 = 1024 * 1024;
 const SINGLE_FILE_CACHE_WRITE_BYTES: usize = 256 * 1024;
 // Advertise a broad local snapshot so MPV rarely reconnects, but stream it in
@@ -3772,6 +3776,11 @@ fn is_client_disconnect_error(message: &str) -> bool {
         || message.contains("connection aborted")
 }
 
+fn is_addon_cache_client_write_error(message: &str) -> bool {
+    message.starts_with("Failed to write Addon cache response headers:")
+        || message.starts_with("Failed to stream single-file cache:")
+}
+
 fn resolve_public_addon_url(url: &reqwest::Url) -> Result<(String, Vec<SocketAddr>), String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err("Addon stream must use HTTP or HTTPS".to_string());
@@ -4943,7 +4952,9 @@ fn handle_addon_proxy_connection(mut stream: TcpStream) {
         if let Err(error) =
             serve_addon_cached_range(&mut stream, &entry, request_start, response_end, head_only)
         {
-            if !is_client_disconnect_error(&error) {
+            if is_client_disconnect_error(&error) || is_addon_cache_client_write_error(&error) {
+                debug!("Addon single-file cache client finished: {error}");
+            } else {
                 warn!("Addon single-file cache response failed: {error}");
                 emit_addon_stream_error(
                     &entry,
@@ -6314,6 +6325,21 @@ async fn test_whisperlive_runtime(
 }
 
 #[tauri::command]
+async fn get_rife_runtime_info(
+    model: Option<String>,
+) -> Result<rife_runtime::RifeRuntimeInfo, String> {
+    rife_runtime::runtime_info(model.as_deref().unwrap_or("4.6"))
+}
+
+#[tauri::command]
+async fn install_rife_runtime(
+    app: AppHandle,
+    model: Option<String>,
+) -> Result<rife_runtime::RifeRuntimeInfo, String> {
+    rife_runtime::install(app, model.unwrap_or_else(|| "4.6".to_string())).await
+}
+
+#[tauri::command]
 async fn stop_whisperlive_server(
     wl_state: tauri::State<'_, SharedWhisperLiveState>,
 ) -> Result<(), String> {
@@ -6640,6 +6666,59 @@ async fn launch_mpv_process(
     let black_bar_lighting_enabled =
         get_store_setting(app, "mpvBlackBarLightingEnabled").as_deref() != Some("false");
     let vsr_before_svp = get_store_setting(app, "mpvVsrBeforeSvp").as_deref() != Some("false");
+    let rife_requested = get_store_setting(app, "mpvRifeEnabled").as_deref() == Some("true");
+    let rife_runtime_path = rife_runtime::managed_runtime_dir()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let rife_model = match get_store_setting(app, "mpvRifeModel")
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("4.6") => "4.6",
+        Some("4.9") => "4.9",
+        Some("4.16-lite") => "4.16-lite",
+        Some("4.18") => "4.18",
+        Some("4.25") => "4.25",
+        _ => "4.6",
+    };
+    let rife_multiplier = if get_store_setting(app, "mpvRifeMultiplier").as_deref() == Some("3") {
+        3
+    } else {
+        2
+    };
+    let rife_gpu_streams = if get_store_setting(app, "mpvRifeGpuStreams").as_deref() == Some("1") {
+        1
+    } else {
+        2
+    };
+    let rife_processing_mode = match get_store_setting(app, "mpvRifeProcessingResolution")
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("native") => "native",
+        Some("720") => "720",
+        Some("1080") => "1080",
+        _ => "auto",
+    };
+    let rife_scale = match get_store_setting(app, "mpvRifeScale").as_deref() {
+        Some("0.2") => "0.2",
+        Some("0.25") => "0.25",
+        Some("0.4") => "0.4",
+        Some("0.5") => "0.5",
+        Some("1.0") => "1.0",
+        _ => "auto",
+    };
+    let rife_before_upscaling_requested =
+        get_store_setting(app, "mpvRifeBeforeUpscaling").as_deref() != Some("false");
+    let rife_before_upscaling =
+        upscaler != VideoUpscaler::RtxVsr || rife_before_upscaling_requested;
+    let rife_filter_concurrency = if rife_model == "4.6" && rife_processing_mode == "auto" {
+        12
+    } else {
+        4
+    };
     info!("Selected video upscaler: {}", upscaler.label());
     info!(
         "MPV video processing defaults: sharpen={} ({}), denoise={} ({}), deband={}, smart_black_bar_fill={}, black_bar_lighting={}, vsr_before_svp={}",
@@ -6673,6 +6752,41 @@ async fn launch_mpv_process(
         .parent()
         .ok_or_else(|| "Could not determine MPV directory".to_string())?
         .to_path_buf();
+    let rife_script_path = mpv_dir.join("scripts").join("streamee_rife.py");
+    let rife_runtime_dir = PathBuf::from(&rife_runtime_path);
+    let rife_model_filename = format!("rife_v{}.onnx", rife_model.replace('-', "_"));
+    let rife_required_paths = [
+        rife_script_path.clone(),
+        rife_runtime_dir.join("vstrt.dll"),
+        rife_runtime_dir.join("vsmlrt.py"),
+        rife_runtime_dir.join("vsmlrt-cuda").join("nvinfer_10.dll"),
+        rife_runtime_dir
+            .join("models")
+            .join("rife")
+            .join(&rife_model_filename),
+    ];
+    let missing_rife_path = rife_required_paths.iter().find(|path| !path.exists());
+    let rife_enabled = rife_requested && missing_rife_path.is_none();
+    if rife_requested {
+        if let Some(path) = missing_rife_path {
+            error!(
+                "Streamee RIFE disabled for this MPV session because a runtime file is missing: {}",
+                path.display()
+            );
+        } else {
+            info!(
+                "Streamee RIFE enabled: model={}, multiplier={}x, gpu_streams={}, processing_mode={}, scale={}, filter_concurrency={}, before_upscaling={}, runtime={}",
+                rife_model,
+                rife_multiplier,
+                rife_gpu_streams,
+                rife_processing_mode,
+                rife_scale,
+                rife_filter_concurrency,
+                rife_before_upscaling,
+                rife_runtime_dir.display()
+            );
+        }
+    }
 
     let mut cmd_args = Vec::new();
     let is_remote_initial_stream = initial_url
@@ -6769,7 +6883,7 @@ async fn launch_mpv_process(
     match upscaler {
         VideoUpscaler::RtxVsr => {}
         VideoUpscaler::SSimSuperRes => {
-            if rtx_hdr_enabled {
+            if rtx_hdr_enabled && !rife_enabled {
                 cmd_args.push("--vf=d3d11vpp=nvidia-true-hdr".to_string());
             }
             cmd_args.push("--scale=ewa_lanczossharp".to_string());
@@ -6780,7 +6894,7 @@ async fn launch_mpv_process(
             ));
         }
         VideoUpscaler::Fsr => {
-            if rtx_hdr_enabled {
+            if rtx_hdr_enabled && !rife_enabled {
                 cmd_args.push("--vf=d3d11vpp=nvidia-true-hdr".to_string());
             }
             cmd_args.push("--scale=ewa_lanczossharp".to_string());
@@ -6789,6 +6903,20 @@ async fn launch_mpv_process(
                 "--glsl-shader={}",
                 mpv_dir.join("shaders").join("fsr.glsl").display()
             ));
+        }
+    }
+    if rife_enabled {
+        let normalized_rife_script =
+            normalize_path_for_mpv_script_opt(&rife_script_path.to_string_lossy());
+        cmd_args.push(format!(
+            "--vf-add=@streamee-rife:vapoursynth=file=%{}%{}:buffered-frames={}:concurrent-frames={}",
+            normalized_rife_script.len(),
+            normalized_rife_script,
+            rife_filter_concurrency,
+            rife_filter_concurrency
+        ));
+        if rtx_hdr_enabled && upscaler != VideoUpscaler::RtxVsr {
+            cmd_args.push("--vf-add=@streamee-rtx-hdr:d3d11vpp=nvidia-true-hdr".to_string());
         }
     }
     let mut script_opts = vec![
@@ -6831,6 +6959,10 @@ async fn launch_mpv_process(
         format!(
             "streamee_vsr-before_svp={}",
             if vsr_before_svp { "yes" } else { "no" }
+        ),
+        format!(
+            "streamee_vsr-rife_before_upscaling={}",
+            if rife_before_upscaling { "yes" } else { "no" }
         ),
     ];
 
@@ -6900,6 +7032,14 @@ async fn launch_mpv_process(
     let mut cmd = std::process::Command::new(&mpv_path);
     hide_console_std(&mut cmd);
     cmd.args(&cmd_args);
+    if rife_enabled {
+        cmd.env("STREAMEE_RIFE_RUNTIME", &rife_runtime_path)
+            .env("STREAMEE_RIFE_MODEL", rife_model)
+            .env("STREAMEE_RIFE_MULTIPLIER", rife_multiplier.to_string())
+            .env("STREAMEE_RIFE_GPU_STREAMS", rife_gpu_streams.to_string())
+            .env("STREAMEE_RIFE_PROCESSING_MODE", rife_processing_mode)
+            .env("STREAMEE_RIFE_SCALE", rife_scale);
+    }
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -8307,6 +8447,8 @@ pub fn run() {
             transcribe_with_whisperlive,
             install_whisperlive,
             test_whisperlive_runtime,
+            get_rife_runtime_info,
+            install_rife_runtime,
             stop_whisperlive_server,
             stop_whisperlive_client,
             stop_audio_normalizer_runtime,
@@ -8392,6 +8534,19 @@ mod stream_cache_tests {
         assert_eq!(parse_http_range("bytes=100-", 100), None);
         assert_eq!(parse_http_range("bytes=20-10", 100), None);
         assert_eq!(parse_http_range("bytes=0-1,4-5", 100), None);
+    }
+
+    #[test]
+    fn addon_cache_client_backpressure_does_not_become_a_source_failure() {
+        assert!(is_addon_cache_client_write_error(
+            "Failed to stream single-file cache: A connection attempt failed (os error 10060)"
+        ));
+        assert!(is_addon_cache_client_write_error(
+            "Failed to write Addon cache response headers: Broken pipe"
+        ));
+        assert!(!is_addon_cache_client_write_error(
+            "Failed to read Addon cache producer: operation timed out"
+        ));
     }
 
     #[test]
