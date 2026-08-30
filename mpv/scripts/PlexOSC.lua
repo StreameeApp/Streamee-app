@@ -949,7 +949,11 @@ function render_elements(master_ass)
 
             if pos and not has_segments then
                 xp = get_slider_ele_pos_for(element, pos)
-				ass_draw_cir_cw(elem_ass, xp, elem_geo.h/2, rh)
+				if slider_lo.square_handle then
+					elem_ass:rect_cw(xp - rh, 0, xp + rh, elem_geo.h)
+				else
+					ass_draw_cir_cw(elem_ass, xp, elem_geo.h/2, rh)
+				end
 				elem_ass:rect_cw(0, slider_lo.gap, xp, elem_geo.h - slider_lo.gap)
             elseif pos then
                 xp = get_slider_ele_pos_for(element, pos)
@@ -1038,15 +1042,24 @@ function render_elements(master_ass)
                             pstart = math.max(pstart, fill_x)
                         end
                         if pend > pstart and range_height > 0 then
-                            ass_draw_rr_h_cw(
-                                elem_ass,
-                                pstart,
-                                inset,
-                                pend,
-                                elem_geo.h - inset,
-                                math.min(range_height / 2, (pend - pstart) / 2),
-                                false
-                            )
+                            if slider_lo.square_ranges then
+                                elem_ass:rect_cw(
+                                    pstart,
+                                    inset,
+                                    pend,
+                                    elem_geo.h - inset
+                                )
+                            else
+                                ass_draw_rr_h_cw(
+                                    elem_ass,
+                                    pstart,
+                                    inset,
+                                    pend,
+                                    elem_geo.h - inset,
+                                    math.min(range_height / 2, (pend - pstart) / 2),
+                                    false
+                                )
+                            end
                         end
                     end
                     elem_ass:draw_stop()
@@ -1125,7 +1138,11 @@ function render_elements(master_ass)
                 elem_ass:draw_start()
                 elem_ass:rect_cw(0, 0, elem_geo.w, elem_geo.h)
                 elem_ass:rect_ccw(0, 0, elem_geo.w, elem_geo.h)
-                ass_draw_cir_cw(elem_ass, xp, elem_geo.h / 2, rh)
+                if slider_lo.square_handle then
+                    elem_ass:rect_cw(xp - rh, 0, xp + rh, elem_geo.h)
+                else
+                    ass_draw_cir_cw(elem_ass, xp, elem_geo.h / 2, rh)
+                end
                 elem_ass:draw_stop()
             end
             
@@ -1672,6 +1689,8 @@ layouts = function ()
 	lo.mouse_hitbox_height = 24
 	lo.style = osc_styles.SeekbarFg
     lo.slider.gap = 0
+    lo.slider.square_handle = true
+    lo.slider.square_ranges = true
     lo.slider.handle_style = osc_styles.SeekbarHandle
     lo.slider.seekrange_style = osc_styles.SeekbarCached
     lo.slider.seekrange_alpha = 145

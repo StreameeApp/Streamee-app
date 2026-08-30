@@ -221,6 +221,7 @@ const resetNativeSettings = async () => {
     window.electronAPI.settings.setSetting('mpvDenoiseStrength', 'medium'),
     window.electronAPI.settings.setSetting('mpvDebandEnabled', 'true'),
     window.electronAPI.settings.setSetting('mpvSmartUltrawideFillMode', 'off'),
+    window.electronAPI.settings.setSetting('mpvBlackBarLightingEnabled', 'true'),
     window.electronAPI.settings.setSetting('mpvSeekPreviewEnabled', 'false'),
     window.electronAPI.settings.setSetting('mpvForceStereoEnabled', 'true'),
     window.electronAPI.settings.setSetting('mpvRtxHdrEnabled', 'false'),
@@ -326,6 +327,7 @@ const Settings: React.FC = () => {
   const [mpvDenoiseStrength, setMpvDenoiseStrength] = useState<DenoiseStrength>('medium');
   const [mpvDebandEnabled, setMpvDebandEnabled] = useState(true);
   const [mpvSmartUltrawideFillMode, setMpvSmartUltrawideFillMode] = useState<SmartUltrawideFillMode>('off');
+  const [mpvBlackBarLightingEnabled, setMpvBlackBarLightingEnabled] = useState(true);
   const [mpvSeekPreviewEnabled, setMpvSeekPreviewEnabled] = useState(false);
   const [mpvForceStereoEnabled, setMpvForceStereoEnabled] = useState(true);
   const [mpvRtxHdrEnabled, setMpvRtxHdrEnabled] = useState(false);
@@ -556,6 +558,7 @@ const Settings: React.FC = () => {
           setMpvDenoiseStrength(normalizeDenoiseStrength(settings.mpvDenoiseStrength));
           setMpvDebandEnabled(settings.mpvDebandEnabled !== false);
           setMpvSmartUltrawideFillMode(normalizeSmartUltrawideFillMode(settings.mpvSmartUltrawideFillMode));
+          setMpvBlackBarLightingEnabled(settings.mpvBlackBarLightingEnabled !== false);
           setMpvSeekPreviewEnabled(!!settings.mpvSeekPreviewEnabled);
           setMpvForceStereoEnabled(settings.mpvForceStereoEnabled !== false);
           setMpvRtxHdrEnabled(!!settings.mpvRtxHdrEnabled);
@@ -602,6 +605,7 @@ const Settings: React.FC = () => {
             denoiseStrength,
             debandEnabled,
             smartUltrawideFillMode,
+            blackBarLightingEnabled,
             seekPreviewEnabled,
             forceStereoEnabled,
             rtxHdrEnabled,
@@ -640,6 +644,7 @@ const Settings: React.FC = () => {
             window.electronAPI.settings.getSetting('mpvDenoiseStrength'),
             window.electronAPI.settings.getSetting('mpvDebandEnabled'),
             window.electronAPI.settings.getSetting('mpvSmartUltrawideFillMode'),
+            window.electronAPI.settings.getSetting('mpvBlackBarLightingEnabled'),
             window.electronAPI.settings.getSetting('mpvSeekPreviewEnabled'),
             window.electronAPI.settings.getSetting('mpvForceStereoEnabled'),
             window.electronAPI.settings.getSetting('mpvRtxHdrEnabled'),
@@ -679,6 +684,7 @@ const Settings: React.FC = () => {
           setMpvDenoiseStrength(normalizeDenoiseStrength(denoiseStrength));
           setMpvDebandEnabled(debandEnabled !== 'false');
           setMpvSmartUltrawideFillMode(normalizeSmartUltrawideFillMode(smartUltrawideFillMode));
+          setMpvBlackBarLightingEnabled(blackBarLightingEnabled !== 'false');
           setMpvSeekPreviewEnabled(seekPreviewEnabled === 'true');
           setMpvForceStereoEnabled(forceStereoEnabled !== 'false');
           setMpvRtxHdrEnabled(rtxHdrEnabled === 'true');
@@ -834,6 +840,7 @@ const Settings: React.FC = () => {
       mpvDenoiseStrength,
       mpvDebandEnabled,
       mpvSmartUltrawideFillMode,
+      mpvBlackBarLightingEnabled,
       mpvSeekPreviewEnabled,
       mpvForceStereoEnabled,
       mpvRtxHdrEnabled,
@@ -876,6 +883,7 @@ const Settings: React.FC = () => {
     await window.electronAPI.settings.setSetting('mpvDenoiseStrength', mpvDenoiseStrength);
     await window.electronAPI.settings.setSetting('mpvDebandEnabled', String(mpvDebandEnabled));
     await window.electronAPI.settings.setSetting('mpvSmartUltrawideFillMode', mpvSmartUltrawideFillMode);
+    await window.electronAPI.settings.setSetting('mpvBlackBarLightingEnabled', String(mpvBlackBarLightingEnabled));
     await window.electronAPI.settings.setSetting('mpvSeekPreviewEnabled', String(mpvSeekPreviewEnabled));
     await window.electronAPI.settings.setSetting('mpvForceStereoEnabled', String(mpvForceStereoEnabled));
     await window.electronAPI.settings.setSetting('mpvRtxHdrEnabled', String(mpvRtxHdrEnabled));
@@ -948,6 +956,7 @@ const Settings: React.FC = () => {
     mpvDenoiseStrength,
     mpvDebandEnabled,
     mpvSmartUltrawideFillMode,
+    mpvBlackBarLightingEnabled,
     mpvSeekPreviewEnabled,
     mpvForceStereoEnabled,
     mpvRtxHdrEnabled,
@@ -2219,20 +2228,37 @@ const Settings: React.FC = () => {
           </div>
 
           <div className="settings-field">
-            <label>Smart Ultrawide Fill</label>
+            <label>Smart Black Bar Fill</label>
             <select
               className="settings-select"
               value={mpvSmartUltrawideFillMode}
               onChange={(e) => setMpvSmartUltrawideFillMode(e.target.value as SmartUltrawideFillMode)}
-              aria-label="Default Smart Ultrawide Fill mode"
+              aria-label="Default Smart Black Bar Fill mode"
             >
               <option value="off">Off</option>
               <option value="efficient">Efficient (recommended)</option>
               <option value="dynamic">Dynamic (continuous detection)</option>
             </select>
             <span className="settings-hint">
-              Fills ultrawide displays by detecting black bars. Efficient checks periodically; Dynamic continuously follows aspect-ratio changes and uses more processing power. Player menu changes apply to the current title.
+              Detects embedded black bars and fits the active picture to your display. Efficient checks periodically; Dynamic continuously follows aspect-ratio changes and uses more processing power. Player menu changes apply to the current title.
             </span>
+          </div>
+
+          <div className="settings-toggle">
+            <div className="settings-toggle-info">
+              <label>Black bar lighting</label>
+              <span className="settings-toggle-desc">
+                Independently extends colours from the active picture into unused screen space, even when Smart Black Bar Fill is off. Applies from the next playback session.
+              </span>
+            </div>
+            <button
+              className={`toggle-btn ${mpvBlackBarLightingEnabled ? 'active' : ''}`}
+              onClick={() => setMpvBlackBarLightingEnabled((previous) => !previous)}
+              aria-label="Toggle black bar lighting"
+              type="button"
+            >
+              <span className="toggle-slider" />
+            </button>
           </div>
             </div>
         </div>

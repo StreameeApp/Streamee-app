@@ -1,9 +1,10 @@
--- Adaptive top/bottom letterbox removal for ultrawide playback.
+-- Adaptive black-bar removal and edge lighting for displays of any aspect.
 --
 -- Detection is intentionally conservative: FFmpeg cropdetect supplies a crop
 -- candidate, while this script requires symmetric bars and a stable result
--- before changing MPV's renderer-side video-crop property. Soft subtitles and
--- the OSC remain outside the cropped video image.
+-- before changing the renderer's fixed-canvas crop coordinates. The video
+-- filter dimensions stay constant so SVP does not drain and rebuild at aspect
+-- transitions. Soft subtitles and the OSC remain outside the cropped image.
 
 local mp = require "mp"
 local msg = require "mp.msg"
@@ -16,7 +17,7 @@ local opts = {
     limit = 0.08,
     round = 2,
     reset_count = 6,
-    poll_interval = 0.01,
+    poll_interval = 0.05,
     stable_time = 0.18,
     restore_time = 0.50,
     change_cooldown = 1.00,
@@ -25,7 +26,9 @@ local opts = {
     max_total_crop_fraction = 0.35,
     symmetry_tolerance_fraction = 0.02,
     min_content_aspect = 1.8,
-    min_viewport_aspect = 2.0,
+    -- Zero allows both standard and wide displays. The option name remains
+    -- compatible with existing script-opts configurations.
+    min_viewport_aspect = 0,
     lookahead_enabled = true,
     lookahead_seconds = 2.25,
     lookahead_schedule_tolerance = 0.005,
@@ -34,13 +37,16 @@ local opts = {
     lookahead_render_lead_max = 0.150,
     lookahead_render_lead_padding = 0.010,
     lookahead_render_lead_alpha = 0.35,
-    lookahead_probe_width = 640,
+    lookahead_probe_width = 480,
+    lookahead_probe_fps = 6,
     lookahead_crop_tolerance = 12,
     lookahead_scene_threshold = 8.0,
     lookahead_scene_gate_window = 0.75,
     lookahead_stable_time = 0.90,
     efficient_scan_interval = 60,
     efficient_scan_lead = 0.25,
+    fixed_canvas_lighting = true,
+    lighting_enabled = true,
 }
 
 options.read_options(opts, "streamee_smart_ultrawide_fill")
@@ -48,7 +54,11 @@ options.read_options(opts, "streamee_smart_ultrawide_fill")
 local FILTER_LABEL = "streamee_adaptive_crop_detector"
 local FILTER_METADATA = "vf-metadata/" .. FILTER_LABEL
 local FILTER_REFERENCE = "@" .. FILTER_LABEL
+local PRE_SVP_CROP_LABEL = "streamee_adaptive_pre_svp_crop"
+local PRE_SVP_CROP_REFERENCE = "@" .. PRE_SVP_CROP_LABEL
 local SVP_FILTER_LABEL = "svp"
+local VSR_FILTER_LABEL = "streamee-vsr"
+local LIGHTING_SHADER_NAME = "streamee_ultrawide_lighting.glsl"
 
 local function directory_name(path)
     return type(path) == "string" and path:match("^(.*)[/\\][^/\\]+$") or nil
@@ -61,14 +71,22 @@ local script_path = type(script_source) == "string"
     or nil
 local script_directory = directory_name(script_path)
 local bundled_mpv_directory = directory_name(script_directory)
+local lighting_shader_path = bundled_mpv_directory
+    and utils.join_path(utils.join_path(bundled_mpv_directory, "shaders"), LIGHTING_SHADER_NAME)
+    or nil
 
 local active_mode = "off"
 local saved_mode = "off"
 local enabled = false
+local saved_lighting_enabled = false
+local lighting_enabled = false
 local filter_installed = false
+local detector_svp_file = nil
 local file_loaded = false
 local base_crop = ""
 local applied_crop = nil
+local crop_application = nil
+local pre_svp_crop_installed = false
 local candidate_key = nil
 local candidate_since = nil
 local last_crop_change_at = -math.huge
@@ -88,6 +106,20 @@ local efficient_poll_timer = nil
 local efficient_scan_start_timer = nil
 local render_lead_estimate = tonumber(opts.lookahead_render_lead) or 0.060
 local pending_render_sample = nil
+local topology_timer = nil
+local topology_reconciling = false
+local lighting_cache_file = nil
+local lighting_cache_time = -math.huge
+local lighting_cache_active = false
+local lighting_shader_installed = false
+local lighting_shader_opts_updating = false
+local lighting_shader_opts_timer = nil
+local saved_keepaspect = nil
+local fixed_canvas_crop = nil
+local svp_shadow_path = nil
+local svp_shadow_source = nil
+local svp_lighting_suppressed = false
+local svp_shadow_generation = 0
 
 local function now()
     return mp.get_time()
@@ -108,6 +140,69 @@ end
 
 local function option_enabled(value)
     return value == true or value == "yes" or value == "true" or value == "1"
+end
+
+local function renderer_requested()
+    return enabled or lighting_enabled
+end
+
+local function normalized_path(value)
+    return type(value) == "string" and value:gsub("/", "\\"):lower() or ""
+end
+
+local function lighting_shader_available()
+    return option_enabled(opts.fixed_canvas_lighting)
+        and lighting_shader_path ~= nil
+        and utils.file_info(lighting_shader_path) ~= nil
+        and mp.get_property("vo", ""):find("gpu%-next") ~= nil
+end
+
+local function shader_list()
+    local shaders = mp.get_property_native("glsl-shaders")
+    if type(shaders) == "table" then return shaders end
+    if type(shaders) == "string" and shaders ~= "" then return { shaders } end
+    return {}
+end
+
+local function install_lighting_shader()
+    if lighting_shader_installed then return true end
+    if not lighting_shader_available() then return false end
+    local target = normalized_path(lighting_shader_path)
+    local shaders = shader_list()
+    local present = false
+    for _, path in ipairs(shaders) do
+        if normalized_path(path) == target then
+            present = true
+            break
+        end
+    end
+    if not present then
+        shaders[#shaders + 1] = lighting_shader_path
+        local ok, err = pcall(mp.set_property_native, "glsl-shaders", shaders)
+        if not ok then
+            msg.error("Failed to install fixed-canvas lighting shader: " .. tostring(err))
+            return false
+        end
+    end
+    if saved_keepaspect == nil then saved_keepaspect = mp.get_property("keepaspect", "yes") end
+    mp.set_property("keepaspect", "no")
+    lighting_shader_installed = true
+    msg.info("Fixed-canvas crop and lighting renderer installed")
+    return true
+end
+
+
+local function remove_lighting_shader()
+    if not lighting_shader_installed then return end
+    local target, shaders, retained = normalized_path(lighting_shader_path), shader_list(), {}
+    for _, path in ipairs(shaders) do
+        if normalized_path(path) ~= target then retained[#retained + 1] = path end
+    end
+    pcall(mp.set_property_native, "glsl-shaders", retained)
+    if saved_keepaspect ~= nil then pcall(mp.set_property, "keepaspect", saved_keepaspect) end
+    saved_keepaspect = nil
+    lighting_shader_installed = false
+    fixed_canvas_crop = nil
 end
 
 local function crop_geometry(value)
@@ -174,6 +269,8 @@ local function load_default_mode()
     saved_mode = normalized_mode(opts.default_mode)
     active_mode = option_enabled(opts.enabled) and "dynamic" or saved_mode
     enabled = active_mode ~= "off"
+    saved_lighting_enabled = option_enabled(opts.lighting_enabled)
+    lighting_enabled = saved_lighting_enabled
 end
 
 local function initialize_lookahead_paths()
@@ -292,6 +389,7 @@ local function start_lookahead(purpose)
         "streamee_smart_ultrawide_fill_probe-control_path=" .. lookahead_control_path:gsub("\\", "/"),
         "streamee_smart_ultrawide_fill_probe-generation=" .. generation,
         "streamee_smart_ultrawide_fill_probe-probe_width=" .. tostring(opts.lookahead_probe_width),
+        "streamee_smart_ultrawide_fill_probe-probe_fps=" .. tostring(opts.lookahead_probe_fps),
         "streamee_smart_ultrawide_fill_probe-crop_tolerance=" .. tostring(opts.lookahead_crop_tolerance),
         "streamee_smart_ultrawide_fill_probe-scene_threshold=" .. tostring(opts.lookahead_scene_threshold),
         "streamee_smart_ultrawide_fill_probe-scene_gate_window=" .. tostring(opts.lookahead_scene_gate_window),
@@ -323,7 +421,7 @@ local function start_lookahead(purpose)
     }
 
     msg.info(string.format(
-        "Smart Ultrawide Fill %s probe started: lead=%.2fs scene_threshold=%.2f gate=%.2fs generation=%s",
+        "Smart Black Bar Fill %s probe started: lead=%.2fs scene_threshold=%.2f gate=%.2fs generation=%s",
         purpose,
         lead,
         opts.lookahead_scene_threshold,
@@ -344,7 +442,7 @@ local function start_lookahead(purpose)
         lookahead_pending = nil
         local status = type(result) == "table" and tonumber(result.status) or nil
         msg.info(string.format(
-            "Smart Ultrawide Fill %s probe stopped: success=%s status=%s",
+            "Smart Black Bar Fill %s probe stopped: success=%s status=%s",
             purpose,
             tostring(success),
             tostring(status)
@@ -407,6 +505,7 @@ local function set_user_state(state)
     )
     mp.set_property("user-data/streamee-adaptive-crop-mode", active_mode)
     mp.set_property("user-data/streamee-adaptive-crop-state", state)
+    mp.set_property_number("user-data/streamee-black-bar-lighting-enabled", lighting_enabled and 1 or 0)
 end
 
 local function reset_candidate()
@@ -414,9 +513,311 @@ local function reset_candidate()
     candidate_since = nil
 end
 
-local function set_crop(crop, reason)
+local function filter_position(filters, label)
+    if type(filters) ~= "table" then
+        return nil
+    end
+    for index, filter in ipairs(filters) do
+        if type(filter) == "table" and filter.label == label then
+            return index
+        end
+    end
+    return nil
+end
+
+local function pre_svp_scale(filters, svp_position)
+    local scale = 1
+    if not svp_position then
+        return scale
+    end
+    for index, filter in ipairs(filters) do
+        if index >= svp_position then
+            break
+        end
+        if type(filter) == "table" and filter.label == VSR_FILTER_LABEL then
+            local params = type(filter.params) == "table" and filter.params or nil
+            scale = scale * (tonumber(params and params.scale) or 1)
+        end
+    end
+    return scale
+end
+
+local function ffmpeg_software_format(value)
+    value = type(value) == "string" and value:lower() or nil
+    if value == "p010" then
+        return "p010le"
+    end
+    if value == "p016" then
+        return "p016le"
+    end
+    return value
+end
+
+local function hardware_download_prefix(filters, insertion_position)
+    local previous = insertion_position and filters[insertion_position - 1] or nil
+    local format = nil
+    if type(previous) == "table" and previous.name == "d3d11vpp" then
+        local params = type(previous.params) == "table" and previous.params or nil
+        format = ffmpeg_software_format(params and params.format) or "nv12"
+    elseif previous == nil then
+        local source = mp.get_property_native("video-params")
+        if type(source) == "table" and source.pixelformat == "d3d11" then
+            format = ffmpeg_software_format(source["hw-pixelformat"]) or "nv12"
+        end
+    end
+
+    return format and ("hwdownload,format=" .. format .. ",") or ""
+end
+
+local function svp_file(filters, svp_position)
+    local filter = svp_position and filters[svp_position] or nil
+    local params = type(filter) == "table" and filter.params or nil
+    return type(params) == "table" and params.file or nil
+end
+
+local function discard_svp_shadow()
+    if svp_shadow_path then os.remove(svp_shadow_path) end
+    svp_shadow_path = nil
+    svp_shadow_source = nil
+    svp_lighting_suppressed = false
+end
+
+local function suppress_svp_outer_lighting()
+    if not renderer_requested() or not lighting_shader_available() then return false end
+    local filters = mp.get_property_native("vf") or {}
+    local position = filter_position(filters, SVP_FILTER_LABEL)
+    local path = svp_file(filters, position)
+    if not position or not path then return false end
+    if svp_shadow_path and normalized_path(path) == normalized_path(svp_shadow_path) then
+        svp_lighting_suppressed = true
+        return true
+    end
+    local script = read_text(path)
+    if not script or not script:match("light%s*:%s*%b{}") then return false end
+    local fixed, replacements = script:gsub(",%s*light%s*:%s*%b{}", "")
+    if replacements == 0 then
+        fixed, replacements = script:gsub("light%s*:%s*%b{}%s*,?", "")
+    end
+    if replacements == 0 then return false end
+    discard_svp_shadow()
+    local temp_dir = os.getenv("TEMP") or os.getenv("TMP")
+    if not temp_dir then return false end
+    local basename = path:match("([^/\\]+)$") or "svp.py"
+    svp_shadow_generation = svp_shadow_generation + 1
+    svp_shadow_path = utils.join_path(temp_dir,
+        "streamee_svp_fixed_canvas_" .. mp.get_property("pid", "0") .. "_"
+            .. svp_shadow_generation .. "_" .. basename)
+    if not write_text(svp_shadow_path, fixed) then
+        discard_svp_shadow()
+        return false
+    end
+    svp_shadow_source = path
+    filters[position].params.file = svp_shadow_path
+    local ok, err = pcall(mp.set_property_native, "vf", filters)
+    if not ok then
+        msg.warn("Could not suppress duplicate SVP lighting: " .. tostring(err))
+        discard_svp_shadow()
+        return false
+    end
+    svp_lighting_suppressed = true
+    msg.info("SVP outer lighting suppressed for fixed-canvas rendering")
+    return true
+end
+
+local function restore_svp_outer_lighting()
+    if not svp_shadow_path or not svp_shadow_source then
+        discard_svp_shadow()
+        return
+    end
+    local filters = mp.get_property_native("vf") or {}
+    local position = filter_position(filters, SVP_FILTER_LABEL)
+    if position and normalized_path(svp_file(filters, position)) == normalized_path(svp_shadow_path) then
+        filters[position].params.file = svp_shadow_source
+        pcall(mp.set_property_native, "vf", filters)
+    end
+    -- The active VapourSynth instance may still be opening the shadow file.
+    local old_path = svp_shadow_path
+    mp.add_timeout(2, function() os.remove(old_path) end)
+    svp_shadow_path = nil
+    svp_shadow_source = nil
+    svp_lighting_suppressed = false
+end
+
+local function svp_outer_lighting_active()
+    local filters = mp.get_property_native("vf")
+    local position = filter_position(filters, SVP_FILTER_LABEL)
+    if not position then
+        return false
+    end
+
+    local path = svp_file(filters, position)
+    if path then
+        if path == lighting_cache_file and now() - lighting_cache_time < 0.5 then
+            return lighting_cache_active
+        end
+        local script = read_text(path)
+        if script then
+            lighting_cache_file = path
+            lighting_cache_time = now()
+            lighting_cache_active = script:match("light%s*:%s*{%s*aspect%s*:") ~= nil
+            return lighting_cache_active
+        end
+    end
+
+    local source_width = mp.get_property_number("video-params/w")
+    local source_height = mp.get_property_number("video-params/h")
+    local output_width = mp.get_property_number("video-out-params/w")
+    local output_height = mp.get_property_number("video-out-params/h")
+    if not source_width or not source_height or not output_width or not output_height
+        or source_width <= 0 or source_height <= 0 or output_width <= 0 or output_height <= 0 then
+        return false
+    end
+
+    local source_aspect = source_width / source_height
+    local output_aspect = output_width / output_height
+    return math.abs(output_aspect - source_aspect) >= 0.015
+end
+
+local function remove_pre_svp_crop()
+    if not pre_svp_crop_installed then
+        return
+    end
+    pcall(mp.commandv, "vf", "remove", PRE_SVP_CROP_REFERENCE)
+    pre_svp_crop_installed = false
+end
+
+local function apply_pre_svp_crop(crop)
+    local width, height, x, y = crop_geometry(crop)
+    local filters = mp.get_property_native("vf")
+    local svp_position = filter_position(filters, SVP_FILTER_LABEL)
+    if not width or not svp_position then
+        return false
+    end
+
+    for index = #filters, 1, -1 do
+        local filter = filters[index]
+        if type(filter) == "table" and filter.label == PRE_SVP_CROP_LABEL then
+            table.remove(filters, index)
+        end
+    end
+    svp_position = filter_position(filters, SVP_FILTER_LABEL)
+    if not svp_position then
+        return false
+    end
+
+    local scale = pre_svp_scale(filters, svp_position)
+    local graph = hardware_download_prefix(filters, svp_position) .. string.format(
+        "crop=w=%d:h=%d:x=%d:y=%d",
+        math.floor(width * scale + 0.5),
+        math.floor(height * scale + 0.5),
+        math.floor(x * scale + 0.5),
+        math.floor(y * scale + 0.5)
+    )
+    table.insert(filters, svp_position, {
+        name = "lavfi",
+        label = PRE_SVP_CROP_LABEL,
+        enabled = true,
+        params = { graph = graph },
+    })
+
+    local ok, err = pcall(mp.set_property_native, "vf", filters)
+    if not ok then
+        msg.error("Failed to apply pre-SVP adaptive crop: " .. tostring(err))
+        return false
+    end
+    pre_svp_crop_installed = true
+    return true
+end
+
+local function fixed_canvas_coordinates(crop)
+    local source_width = mp.get_property_number("video-params/w")
+    local source_height = mp.get_property_number("video-params/h")
+    local output_width = mp.get_property_number("video-out-params/w")
+    local output_height = mp.get_property_number("video-out-params/h")
+    if not source_width or not source_height or not output_width or not output_height
+        or source_width <= 0 or source_height <= 0 or output_width <= 0 or output_height <= 0 then
+        return nil
+    end
+
+    local filters = mp.get_property_native("vf") or {}
+    local scale = pre_svp_scale(filters, filter_position(filters, SVP_FILTER_LABEL))
+    local picture_width, picture_height = source_width * scale, source_height * scale
+    local placement_scale = math.min(output_width / picture_width, output_height / picture_height)
+    picture_width, picture_height = picture_width * placement_scale, picture_height * placement_scale
+    local picture_x = (output_width - picture_width) * 0.5
+    local picture_y = (output_height - picture_height) * 0.5
+
+    local width, height, x, y = source_width, source_height, 0, 0
+    if crop then
+        width, height, x, y = crop_geometry(crop)
+        if not width then return nil end
+    end
+    local source_scale_x, source_scale_y = picture_width / source_width, picture_height / source_height
+    return {
+        x = (picture_x + x * source_scale_x) / output_width,
+        y = (picture_y + y * source_scale_y) / output_height,
+        w = width * source_scale_x / output_width,
+        h = height * source_scale_y / output_height,
+        source_aspect = output_width / output_height,
+    }
+end
+
+local function update_lighting_shader_opts(coordinates)
+    coordinates = coordinates or fixed_canvas_coordinates(fixed_canvas_crop)
+    if not coordinates then return false end
+    local dimensions = mp.get_property_native("osd-dimensions") or {}
+    local canvas_width, canvas_height = tonumber(dimensions.w), tonumber(dimensions.h)
+    if not canvas_width or not canvas_height or canvas_width <= 0 or canvas_height <= 0 then
+        return false
+    end
+    local values = mp.get_property_native("glsl-shader-opts")
+    if type(values) ~= "table" then values = {} end
+    local desired = {
+        ["streamee_ultrawide_lighting/crop_x"] = string.format("%.9f", coordinates.x),
+        ["streamee_ultrawide_lighting/crop_y"] = string.format("%.9f", coordinates.y),
+        ["streamee_ultrawide_lighting/crop_w"] = string.format("%.9f", coordinates.w),
+        ["streamee_ultrawide_lighting/crop_h"] = string.format("%.9f", coordinates.h),
+        ["streamee_ultrawide_lighting/source_aspect"] = string.format("%.9f", coordinates.source_aspect),
+        ["streamee_ultrawide_lighting/canvas_aspect"] = string.format("%.9f", canvas_width / canvas_height),
+        ["streamee_ultrawide_lighting/lighting_enabled"] = lighting_enabled and "1" or "0",
+    }
+    local changed = false
+    for key, value in pairs(desired) do
+        if tostring(values[key]) ~= value then values[key], changed = value, true end
+    end
+    if changed then
+        lighting_shader_opts_updating = true
+        local ok, err = pcall(mp.set_property_native, "glsl-shader-opts", values)
+        lighting_shader_opts_updating = false
+        if not ok then
+            msg.error("Failed to update fixed-canvas lighting: " .. tostring(err))
+            return false
+        end
+    end
+    return true
+end
+
+local function apply_fixed_canvas_crop(crop)
+    if not install_lighting_shader() then return false end
+    remove_pre_svp_crop()
+    local ok, err = pcall(mp.set_property, "video-crop", base_crop or "")
+    if not ok then
+        msg.error("Failed to clear renderer crop for fixed canvas: " .. tostring(err))
+        return false
+    end
+    fixed_canvas_crop = crop
+    return update_lighting_shader_opts(fixed_canvas_coordinates(crop))
+end
+
+local function set_crop(crop, reason, force)
     local value = crop or base_crop or ""
-    if mp.get_property("video-crop", "") == value then
+    local use_fixed_canvas = (base_crop or "") == "" and lighting_shader_available()
+    local use_pre_svp = not use_fixed_canvas and crop ~= nil
+        and (base_crop or "") == ""
+        and svp_outer_lighting_active()
+    local desired_application = use_fixed_canvas and "fixed-canvas"
+        or crop and (use_pre_svp and "pre-svp" or "renderer") or nil
+    if not force and applied_crop == crop and crop_application == desired_application then
         applied_crop = crop
         return
     end
@@ -425,7 +826,40 @@ local function set_crop(crop, reason)
         started_at = now(),
         crop = value == "" and "none" or value,
     }
-    local ok, err = pcall(mp.set_property, "video-crop", value)
+    if use_fixed_canvas then
+        -- Dynamic uniforms are consumed on the next rendered frame; there is
+        -- no filter drain/reconfiguration delay to predict.
+        render_lead_estimate = 0.010
+        pending_render_sample = nil
+    end
+    local ok, err
+    if use_fixed_canvas then
+        ok = apply_fixed_canvas_crop(crop)
+        if not ok then
+            msg.warn("Fixed-canvas renderer was unavailable; using the existing crop path")
+            use_pre_svp = crop ~= nil and svp_outer_lighting_active()
+            desired_application = crop and (use_pre_svp and "pre-svp" or "renderer") or nil
+            if use_pre_svp then
+                ok, err = pcall(mp.set_property, "video-crop", base_crop or "")
+                if ok then ok = apply_pre_svp_crop(crop) end
+            else
+                ok, err = pcall(mp.set_property, "video-crop", value)
+            end
+        end
+    elseif use_pre_svp then
+        ok, err = pcall(mp.set_property, "video-crop", base_crop or "")
+        if ok then
+            ok = apply_pre_svp_crop(crop)
+            if not ok then
+                msg.warn("Pre-SVP adaptive crop was unavailable; using renderer crop")
+                desired_application = "renderer"
+                ok, err = pcall(mp.set_property, "video-crop", value)
+            end
+        end
+    else
+        remove_pre_svp_crop()
+        ok, err = pcall(mp.set_property, "video-crop", value)
+    end
     if not ok then
         pending_render_sample = nil
         msg.error("Failed to set adaptive video crop: " .. tostring(err))
@@ -434,9 +868,15 @@ local function set_crop(crop, reason)
     end
 
     applied_crop = crop
+    crop_application = desired_application
     last_crop_change_at = now()
     if crop then
-        msg.info("Adaptive crop applied: " .. crop .. " (" .. reason .. ")")
+        msg.info(string.format(
+            "Adaptive crop applied: %s via %s (%s)",
+            crop,
+            desired_application,
+            reason
+        ))
         set_user_state("cropped")
     else
         msg.info("Adaptive crop restored (" .. reason .. ")")
@@ -448,30 +888,31 @@ local function add_detector()
     if filter_installed or not file_loaded then
         return
     end
+    if svp_outer_lighting_active() then
+        return
+    end
 
-    local graph = string.format(
+    local detector = string.format(
         "cropdetect=limit=%.4f:round=%d:reset_count=%d",
         opts.limit,
         opts.round,
         opts.reset_count
     )
-    local filters = mp.get_property_native("vf")
-    local svp_position = nil
-    if type(filters) == "table" then
-        for index, filter in ipairs(filters) do
-            if type(filter) == "table" and filter.label == SVP_FILTER_LABEL then
-                svp_position = index
-                break
-            end
-        end
-    end
+    local filters = mp.get_property_native("vf") or {}
+    local svp_position = filter_position(filters, SVP_FILTER_LABEL)
+    local active_svp_file = svp_file(filters, svp_position)
+    local insertion_position = svp_position or (#filters + 1)
+    local graph = hardware_download_prefix(filters, insertion_position) .. detector
 
     local ok, err
     if svp_position then
-        -- SVP produces software frames, while the RTX d3d11vpp stage that
-        -- normally follows it produces hardware surfaces cropdetect cannot
-        -- inspect. Insert at that boundary instead of appending to the chain.
-        table.insert(filters, svp_position + 1, {
+        -- Inspect the original picture before SVP can synthesize outer-lighting
+        -- pixels into its bars. The crop itself is inserted after this detector
+        -- and immediately before SVP when lighting changes the output aspect.
+        local pre_svp_crop_position = filter_position(filters, PRE_SVP_CROP_LABEL)
+        insertion_position = pre_svp_crop_position or svp_position
+        graph = hardware_download_prefix(filters, insertion_position) .. detector
+        table.insert(filters, insertion_position, {
             name = "lavfi",
             label = FILTER_LABEL,
             enabled = true,
@@ -489,9 +930,10 @@ local function add_detector()
     end
 
     filter_installed = true
+    detector_svp_file = active_svp_file
     msg.info(
         "Adaptive crop detector started"
-            .. (svp_position and " after SVP software output" or " at filter-chain end")
+            .. (svp_position and " before SVP processing" or " at filter-chain end")
     )
     set_user_state("watching")
 end
@@ -503,9 +945,10 @@ local function remove_detector()
 
     pcall(mp.commandv, "vf", "remove", FILTER_REFERENCE)
     filter_installed = false
+    detector_svp_file = nil
 end
 
-local function viewport_is_ultrawide()
+local function viewport_allows_fill()
     if mp.get_property_bool("fullscreen", false) then
         return true
     end
@@ -558,7 +1001,7 @@ local function detected_rectangle()
 end
 
 local function validated_candidate()
-    if not viewport_is_ultrawide() then
+    if not viewport_allows_fill() then
         return "none"
     end
 
@@ -566,6 +1009,13 @@ local function validated_candidate()
     local source_height = mp.get_property_number("video-params/h")
     local detector_width = mp.get_property_number("video-out-params/w")
     local detector_height = mp.get_property_number("video-out-params/h")
+    local filters = mp.get_property_native("vf")
+    local svp_position = filter_position(filters, SVP_FILTER_LABEL)
+    if svp_position then
+        local scale = pre_svp_scale(filters, svp_position)
+        detector_width = source_width and source_width * scale or nil
+        detector_height = source_height and source_height * scale or nil
+    end
     local width, height, x, y = detected_rectangle()
     if not source_width or not source_height or not detector_width or not detector_height
         or not width or not height or not x or not y then
@@ -650,7 +1100,7 @@ local function apply_pending_lookahead()
 end
 
 local function poll_detector()
-    if not enabled or not file_loaded or not filter_installed then
+    if not enabled or not file_loaded then
         return
     end
     poll_lookahead_result()
@@ -659,8 +1109,24 @@ local function poll_detector()
         return
     end
 
+    if svp_outer_lighting_active() and lookahead_baseline_crop and not lookahead_ready then
+        -- The independent probe sees the original cached source. SVP lighting
+        -- makes the live output unsuitable for baseline synchronization.
+        remove_detector()
+        lookahead_ready = true
+        set_crop(
+            lookahead_baseline_crop ~= "none" and lookahead_baseline_crop or nil,
+            "independent lookahead baseline for SVP lighting"
+        )
+        msg.info("Adaptive crop lookahead authoritative for SVP lighting")
+    end
+
     if lookahead_ready then
         apply_pending_lookahead()
+        return
+    end
+
+    if not filter_installed then
         return
     end
 
@@ -758,7 +1224,7 @@ local function poll_efficient_scan()
     elseif crop ~= applied_crop then
         set_crop(crop, "efficient periodic scan")
     end
-    msg.info("Smart Ultrawide Fill efficient scan completed: crop=" .. crop)
+    msg.info("Smart Black Bar Fill efficient scan completed: crop=" .. crop)
     stop_lookahead()
     if efficient_poll_timer then
         efficient_poll_timer:stop()
@@ -768,7 +1234,7 @@ end
 local function start_efficient_scan()
     if active_mode ~= "efficient"
         or not file_loaded
-        or not viewport_is_ultrawide()
+        or not viewport_allows_fill()
         or mp.get_property_bool("pause", false)
         or lookahead_running then
         return
@@ -811,6 +1277,57 @@ local function stop_mode_runtime()
     reset_candidate()
 end
 
+local function reconcile_filter_topology()
+    topology_timer = nil
+    if not file_loaded or not renderer_requested() or topology_reconciling then
+        return
+    end
+    topology_reconciling = true
+
+    suppress_svp_outer_lighting()
+    local lighting = svp_lighting_suppressed or svp_outer_lighting_active()
+    if lighting then
+        local had_detector = filter_installed
+        remove_detector()
+        if had_detector then
+            msg.info("Adaptive crop live detector suspended; SVP lighting uses the independent probe")
+        end
+        if applied_crop and (crop_application ~= "pre-svp" or had_detector) then
+            set_crop(applied_crop, "SVP lighting filter attached", true)
+        end
+    else
+        if applied_crop and crop_application == "pre-svp" then
+            set_crop(applied_crop, "SVP lighting filter detached", true)
+        end
+        if active_mode == "dynamic" then
+            local filters = mp.get_property_native("vf") or {}
+            local svp_position = filter_position(filters, SVP_FILTER_LABEL)
+            local detector_position = filter_position(filters, FILTER_LABEL)
+            local wrong_order = svp_position and detector_position
+                and detector_position > svp_position
+            if not filter_installed or not detector_position or wrong_order
+                or detector_svp_file ~= svp_file(filters, svp_position) then
+                remove_detector()
+                add_detector()
+                reset_candidate()
+            end
+        end
+    end
+
+    topology_reconciling = false
+end
+
+local function schedule_topology_reconcile()
+    if not file_loaded or not renderer_requested() or topology_reconciling then
+        return
+    end
+    lighting_cache_time = -math.huge
+    if topology_timer then
+        topology_timer:kill()
+    end
+    topology_timer = mp.add_timeout(0.05, reconcile_filter_topology)
+end
+
 local function set_mode(mode, show_osd)
     if mode ~= "off" and mode ~= "dynamic" and mode ~= "efficient" then
         return
@@ -822,7 +1339,16 @@ local function set_mode(mode, show_osd)
 
     if mode == "off" then
         if applied_crop then
-            set_crop(nil, "Smart Ultrawide Fill disabled")
+            set_crop(nil, "Smart Black Bar Fill disabled")
+        end
+        if lighting_enabled and file_loaded and (base_crop or "") == "" then
+            install_lighting_shader()
+            fixed_canvas_crop = nil
+            update_lighting_shader_opts()
+            schedule_topology_reconcile()
+        else
+            remove_lighting_shader()
+            restore_svp_outer_lighting()
         end
         set_user_state("off")
     elseif mode == "dynamic" then
@@ -846,13 +1372,33 @@ local function set_mode(mode, show_osd)
         if mode ~= saved_mode then
             label = label .. " (this title)"
         end
-        mp.osd_message("Smart Ultrawide Fill: " .. label)
+        mp.osd_message("Smart Black Bar Fill: " .. label)
     end
     msg.info(string.format(
-        "Smart Ultrawide Fill mode: active=%s saved=%s",
+        "Smart Black Bar Fill mode: active=%s saved=%s",
         active_mode,
         saved_mode
     ))
+end
+
+local function set_lighting(value, show_osd)
+    lighting_enabled = value == true
+    if file_loaded and (base_crop or "") == "" then
+        if renderer_requested() then
+            install_lighting_shader()
+            if not enabled then fixed_canvas_crop = nil end
+            update_lighting_shader_opts()
+            schedule_topology_reconcile()
+        else
+            remove_lighting_shader()
+            restore_svp_outer_lighting()
+        end
+    end
+    mp.set_property_number("user-data/streamee-black-bar-lighting-enabled", lighting_enabled and 1 or 0)
+    if show_osd then
+        mp.osd_message("Black Bar Lighting: " .. (lighting_enabled and "On" or "Off") .. " (this title)")
+    end
+    msg.info("Black Bar Lighting: " .. (lighting_enabled and "on" or "off"))
 end
 
 local function toggle_dynamic()
@@ -866,10 +1412,20 @@ end
 mp.register_event("file-loaded", function()
     file_loaded = true
     filter_installed = false
+    detector_svp_file = nil
     applied_crop = nil
+    crop_application = nil
+    pre_svp_crop_installed = false
+    lighting_cache_file = nil
+    lighting_cache_time = -math.huge
     base_crop = mp.get_property("video-crop", "")
     reset_render_lead_estimate()
     reset_candidate()
+    if renderer_requested() and (base_crop or "") == "" and lighting_shader_available() then
+        install_lighting_shader()
+        fixed_canvas_crop = nil
+        update_lighting_shader_opts()
+    end
     if active_mode == "dynamic" then
         add_detector()
         start_timer()
@@ -881,23 +1437,35 @@ mp.register_event("file-loaded", function()
 end)
 
 mp.register_event("end-file", function()
+    if topology_timer then
+        topology_timer:kill()
+        topology_timer = nil
+    end
     stop_lookahead()
     stop_timer()
     stop_efficient_timers()
     if applied_crop then
         set_crop(nil, "playback ended")
     end
+    remove_lighting_shader()
+    restore_svp_outer_lighting()
     filter_installed = false
+    detector_svp_file = nil
     file_loaded = false
     applied_crop = nil
+    crop_application = nil
+    pre_svp_crop_installed = false
     pending_render_sample = nil
     reset_candidate()
     active_mode = saved_mode
     enabled = active_mode ~= "off"
+    lighting_enabled = saved_lighting_enabled
     set_user_state(enabled and "watching" or "off")
 end)
 
 mp.register_event("video-reconfig", function()
+    schedule_topology_reconcile()
+    if lighting_shader_installed then update_lighting_shader_opts() end
     if not pending_render_sample then
         return
     end
@@ -927,6 +1495,19 @@ mp.register_event("video-reconfig", function()
     ))
 end)
 
+mp.observe_property("vf", "native", schedule_topology_reconcile)
+mp.observe_property("osd-dimensions", "native", function()
+    if lighting_shader_installed and file_loaded then update_lighting_shader_opts() end
+end)
+mp.observe_property("glsl-shader-opts", "native", function()
+    if not lighting_shader_installed or not file_loaded or lighting_shader_opts_updating then return end
+    if lighting_shader_opts_timer then lighting_shader_opts_timer:kill() end
+    lighting_shader_opts_timer = mp.add_timeout(0, function()
+        lighting_shader_opts_timer = nil
+        update_lighting_shader_opts()
+    end)
+end)
+
 mp.register_event("seek", function()
     reset_candidate()
     if active_mode == "dynamic" then
@@ -953,6 +1534,16 @@ mp.observe_property("pause", "bool", function(_, paused)
         end
     end
 end)
+mp.observe_property("window-minimized", "bool", function(_, minimized)
+    if not enabled or not file_loaded then return end
+    if minimized then
+        stop_lookahead()
+    elseif active_mode == "dynamic" then
+        schedule_lookahead_restart(0.20)
+    elseif active_mode == "efficient" then
+        schedule_efficient_scan(0.20)
+    end
+end)
 mp.observe_property("speed", "number", function()
     if enabled and file_loaded and lookahead_running then
         if active_mode == "dynamic" then
@@ -964,8 +1555,18 @@ mp.observe_property("speed", "number", function()
     end
 end)
 mp.register_event("shutdown", function()
+    if topology_timer then
+        topology_timer:kill()
+        topology_timer = nil
+    end
     stop_lookahead()
     stop_efficient_timers()
+    if lighting_shader_opts_timer then
+        lighting_shader_opts_timer:kill()
+        lighting_shader_opts_timer = nil
+    end
+    remove_lighting_shader()
+    discard_svp_shadow()
     if lookahead_control_path then
         os.remove(lookahead_control_path)
     end
@@ -981,6 +1582,9 @@ mp.register_script_message("smart-ultrawide-fill-dynamic", function()
 end)
 mp.register_script_message("smart-ultrawide-fill-efficient", function()
     set_mode("efficient", true)
+end)
+mp.register_script_message("toggle-black-bar-lighting", function()
+    set_lighting(not lighting_enabled, true)
 end)
 mp.register_script_message("adaptive-crop-toggle", toggle_dynamic)
 mp.register_script_message("adaptive-crop-enable", function()

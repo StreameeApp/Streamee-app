@@ -11,11 +11,12 @@ local opts = {
     result_path = "",
     control_path = "",
     generation = "",
-    probe_width = 640,
+    probe_width = 480,
+    probe_fps = 6,
     limit = 0.08,
     round = 2,
     reset_count = 6,
-    poll_interval = 0.01,
+    poll_interval = 0.05,
     stable_time = 0.90,
     boundary_quantum = 4,
     crop_tolerance = 12,
@@ -296,8 +297,9 @@ if helper_configured then
         end
 
         local graph = string.format(
-            "scale=w=%d:h=-2,scdet=threshold=%.3f,cropdetect=limit=%.4f:round=%d:reset_count=%d",
+            "scale=w=%d:h=-2,fps=fps=%.3f,scdet=threshold=%.3f,cropdetect=limit=%.4f:round=%d:reset_count=%d",
             opts.probe_width,
+            opts.probe_fps,
             opts.scene_threshold,
             opts.limit,
             opts.round,

@@ -6637,16 +6637,19 @@ async fn launch_mpv_process(
         Some("dynamic") => "dynamic",
         _ => "off",
     };
+    let black_bar_lighting_enabled =
+        get_store_setting(app, "mpvBlackBarLightingEnabled").as_deref() != Some("false");
     let vsr_before_svp = get_store_setting(app, "mpvVsrBeforeSvp").as_deref() != Some("false");
     info!("Selected video upscaler: {}", upscaler.label());
     info!(
-        "MPV video processing defaults: sharpen={} ({}), denoise={} ({}), deband={}, smart_ultrawide_fill={}, vsr_before_svp={}",
+        "MPV video processing defaults: sharpen={} ({}), denoise={} ({}), deband={}, smart_black_bar_fill={}, black_bar_lighting={}, vsr_before_svp={}",
         sharpen_enabled,
         sharpen_mode,
         denoise_enabled,
         denoise_strength,
         deband_enabled,
         smart_ultrawide_fill_mode,
+        black_bar_lighting_enabled,
         vsr_before_svp
     );
     info!("RTX Video HDR for MPV: {}", rtx_hdr_enabled);
@@ -6797,6 +6800,14 @@ async fn launch_mpv_process(
         format!("streamee_sharpen-default_denoise_mode={denoise_mode}"),
         format!("streamee_sharpen-default_denoise_strength={denoise_strength}"),
         format!("streamee_smart_ultrawide_fill-default_mode={smart_ultrawide_fill_mode}"),
+        format!(
+            "streamee_smart_ultrawide_fill-lighting_enabled={}",
+            if black_bar_lighting_enabled {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
         format!(
             "streamee_vsr-enabled={}",
             if upscaler == VideoUpscaler::RtxVsr {

@@ -26,7 +26,7 @@ Streamee combines a polished discovery library with a highly tuned desktop playb
 - Automatic intro and recap skipping, outro-aware next-episode playback, and local detection fallbacks
 - Smart Next preparation that can warm the next aired episode before the current one ends
 - A real-time LUFS-based Audio Normalizer with adaptive gating, gain riding, and final peak protection
-- Configurable upscaling, sharpening, denoising, debanding, HDR handling, Smart Ultrawide Fill, and optional SVP integration
+- Configurable upscaling, sharpening, denoising, debanding, HDR handling, Smart Black Bar Fill with optional edge lighting, and optional SVP integration
 - Direct playback of local video files and folders through the same MPV experience
 - Cache-only seekbar thumbnails, reusable stream caching, playback statistics, and a local phone remote
 
@@ -42,6 +42,8 @@ Streamee combines a polished discovery library with a highly tuned desktop playb
 - **Release context** — Optional xREL and srrDB metadata helps interpret release names and quality details without supplying playable media.
 - **TMDB + OMDb** — Managed TMDB access powers the main catalog and artwork without requiring a personal key; OMDb can supplement it with IMDb ratings and extra details.
 
+![Streamee actor credits and filmography browser](assets/StreameeActorCredits.png)
+
 ### Library, Trakt, and statistics
 
 - **Watchlist and history** — Save titles, track completed playback, and return to previously watched media.
@@ -49,6 +51,17 @@ Streamee combines a polished discovery library with a highly tuned desktop playb
 - **Trakt integration** — Connect with an authorization code to sync watchlist and history and improve board recommendations. Streamee manages its own Trakt application credentials.
 - **TV Calendar** — See upcoming episodes from followed and watchlisted series in a weekly view.
 - **Viewing statistics** — Inspect watch time, completed titles, streamed data, activity heatmaps, movie-versus-TV totals, weekday habits, streaks, session counts, and lifetime summaries.
+
+<table>
+  <tr>
+    <td><img src="assets/StreameeCalendar.png" alt="Streamee TV calendar"></td>
+    <td><img src="assets/StreameeStatistic.png" alt="Streamee viewing statistics"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>Upcoming episodes in the TV Calendar</em></td>
+    <td align="center"><em>Viewing history, habits, and streaming activity</em></td>
+  </tr>
+</table>
 
 ### MPV playback built into the desktop experience
 
@@ -118,9 +131,22 @@ Streamee exposes a configurable MPV processing chain rather than locking playbac
 - **Sharpening** — Standard, Adaptive, Ultra, and UltraCustom presets, plus automatic source-aware selection.
 - **Denoising** — Bilateral and advanced MPV/VapourSynth processing with selectable strength and GPU-oriented BM3D modes where supported.
 - **Debanding** — Optional MPV debanding for visible color gradients.
-- **Smart Ultrawide Fill** — Detects top and bottom black bars and fills an ultrawide display without moving soft subtitles or the player controls. **Efficient** scans briefly at playback start, after seeking, and periodically; **Dynamic** continuously follows aspect-ratio changes at a higher processing cost. Off, Efficient, or Dynamic can be saved as the default in Settings, while the player menu provides a temporary override for the current title.
+- **Smart Black Bar Fill** — Detects embedded black bars and fits the active picture to displays of any aspect ratio. It handles side bars on ultrawide displays and top/bottom bars on standard displays without moving soft subtitles or player controls. Independent **Black Bar Lighting** extends averaged edge colours into unused space even when fill detection is off; disabling lighting keeps smooth fixed-canvas cropping with black surroundings. Settings provide saved defaults, while the MPV right-click menu can override both features for the current title.
+- **Efficient aspect detection** — **Efficient** scans briefly at playback start, after seeking, and periodically. **Dynamic** follows aspect-ratio changes using a low-resolution, reduced-frame-rate lookahead probe. When Smart Black Bar Fill is active, duplicate SVP lighting is suppressed only for the current playback pipeline so SVP does not render an unnecessarily enlarged intermediate frame; SVP's generated source script and global settings remain unchanged.
 - **Season-aware settings** — Player-menu processing changes can carry through later episodes of the same season without becoming a global default.
 - **SVP integration** — Start, restart, and close SmoothVideo Project with playback, and control whether RTX VSR runs before or after frame interpolation.
+
+#### Smart Black Bar Fill and edge lighting
+
+Smart Black Bar Fill adapts playback to both standard and ultrawide displays, while optional edge lighting extends scene colours into otherwise unused screen space.
+
+![Smart Black Bar Fill edge lighting on a standard display](assets/StreameeUltrawideLighting1.png)
+
+*Top and bottom unused space on a standard display.*
+
+![Smart Black Bar Fill edge lighting on an ultrawide display](assets/StreameeUltrawideLighting2.png)
+
+*Side-space handling on an ultrawide display.*
 
 Hardware-specific features require compatible drivers, displays, and third-party runtimes.
 
