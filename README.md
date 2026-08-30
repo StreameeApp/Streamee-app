@@ -42,7 +42,27 @@ Streamee combines a polished discovery library with a highly tuned desktop playb
 - **Release context** — Optional xREL and srrDB metadata helps interpret release names and quality details without supplying playable media.
 - **TMDB + OMDb** — Managed TMDB access powers the main catalog and artwork without requiring a personal key; OMDb can supplement it with IMDb ratings and extra details.
 
-![Streamee actor credits and filmography browser](assets/StreameeActorCredits.png)
+<table>
+  <tr>
+    <td><img src="assets/StreameeTraktList.png" alt="Searching public Trakt lists in Streamee"></td>
+    <td><img src="assets/StreameeTraktList2.png" alt="Browsing and filtering a Trakt list in Streamee"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>Search public Trakt lists</em></td>
+    <td align="center"><em>Browse and filter the titles inside a list</em></td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td><img src="assets/StreameeRecommendations.png" alt="Recommendations based on a selected title in Streamee"></td>
+    <td><img src="assets/StreameeActorCredits.png" alt="Actor credits and filmography browsing in Streamee"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>Explore recommendations based on a title</em></td>
+    <td align="center"><em>Discover more through cast and actor credits</em></td>
+  </tr>
+</table>
 
 ### Library, Trakt, and statistics
 
@@ -182,6 +202,8 @@ The flow is deliberately simple:
 4. **Use the first useful response** — An add-on may return an HTTP(S) stream or a protocol descriptor such as an info hash and file index. Streamee converts supported results into its common source list and can fall through to the next installed add-on when a higher-priority service is unavailable or returns no usable results.
 5. **Play locally** — After the user selects a result, Streamee's backend prepares the source for MPV and applies the same playback, cache, subtitle, and telemetry pipeline used elsewhere in the app.
 
+![Installing, prioritizing, and managing stream add-ons in Streamee](assets/StreameeAddon.png)
+
 ### Add-on security and privacy boundaries
 
 - Configured manifest URLs may contain private service configuration, so the complete URL is stored in **Windows Credential Manager**, never `localStorage`, frontend state, repository files, or normal logs.
@@ -195,7 +217,7 @@ These controls reduce accidental credential exposure and unsafe network access, 
 
 ## Getting started
 
-### Requirements
+### Before you begin
 
 - Windows 10 or Windows 11
 - `ffmpeg` on `PATH` only when using WhisperLive
@@ -203,21 +225,28 @@ These controls reduce accidental credential exposure and unsafe network access, 
 
 MPV and TMDB catalog access are bundled or managed by Streamee; no personal TMDB key is required.
 
-### First-time setup
+### Download and install Streamee
 
-1. Review **Settings → Providers & Accounts** and optionally choose a streaming region, connect Trakt, or add an OMDb key.
-2. Optionally configure a trusted, lawful source add-on on its own website, then install its manifest under **Settings → Stream Add-ons**. Local files and folders can be played without an add-on.
-3. Choose subtitle, audio, cache, and playback preferences.
-4. Browse to a title, select a source you are authorized to play, or choose **Play Local**.
+**[Download the latest Streamee release](https://github.com/StreameeApp/Streamee-app/releases/latest)**
 
-## Keyboard shortcuts
+You do not need a GitHub account. On the release page:
 
-| Key | Action |
-| --- | --- |
-| `D` | Toggle the in-app playback debug overlay |
-| `N` | Open the Audio Normalizer tuner |
+1. Scroll down to **Assets**. If the files are hidden, click **Assets** to expand the list.
+2. Download the file whose name ends in **`_x64-setup.exe`**. This is the recommended Windows installer. Do not download the **Source code**, `.json`, or `.sig` files.
+3. Open your browser's Downloads list or the Windows **Downloads** folder, then double-click the downloaded Streamee installer.
+4. Follow the installer prompts. Streamee installs for your Windows user account, so an administrator account is normally not required.
+5. Open **Streamee** from the Start menu after installation finishes.
 
-MPV also provides its standard playback shortcuts and Streamee-specific on-screen controls.
+An `.msi` installer is also provided under Assets for users or administrators who specifically prefer Windows Installer packages.
+
+### Set up Streamee for the first time
+
+1. Start on the **Board** or **Discover** page. Browsing the catalog works immediately; no TMDB key is required.
+2. Open **Settings → Providers & Accounts**. You can choose your streaming region and optionally connect Trakt or enter an OMDb key for additional ratings.
+3. To use a source add-on, configure a trusted service on its own website, copy its manifest URL, and install it under **Settings → Streamee Addon**. This step is optional—local video files and folders work without an add-on.
+4. Review **Playback**, **Subtitles**, and **Network & Storage** in Settings. The defaults are suitable for most users, so you can change only the options you understand or need.
+5. Choose a movie or episode and select a source you are authorized to play. To play your own files instead, choose **Play Local** and select a video or folder.
+6. Streamee will open the bundled MPV player inside the desktop experience. Playback progress is saved automatically so you can resume later.
 
 ## Development
 
