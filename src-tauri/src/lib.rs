@@ -65,7 +65,7 @@ static WEBVIEW_RECOVERY_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 const EMERGENCY_SCRAM_HOTKEY_ID: i32 = 0x5354;
-const MPV_STRUCTURED_LOGGING_ENABLED: bool = true;
+const MPV_STRUCTURED_LOGGING_ENABLED: bool = false;
 
 #[cfg(target_os = "windows")]
 fn emergency_scram_command(process_id: u32) -> String {

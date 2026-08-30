@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { FiChevronRight, FiHeart, FiEye, FiEyeOff, FiX, FiClock, FiBookmark, FiTrendingUp } from 'react-icons/fi';
 import { useStore, ContinueWatchingItem, ContinueWatchingViewItem, MetaPreview } from '../../store';
-import { enrichTmdbItemsById, EpisodeDetail, getTmdbBoardCatalogs, getTmdbEpisodes, getTmdbSeasons, isTmdbConfigured } from '../../services/tmdb';
+import { enrichTmdbItemsById, EpisodeDetail, getTmdbBoardCatalogs, getTmdbEpisodes, getTmdbSeriesSchedule, isTmdbConfigured } from '../../services/tmdb';
 import { getAnticipatedMovies, getAnticipatedShows, getTrendingMovies, getTrendingShows, hasTraktCredentials } from '../../services/trakt';
 import { pushUnwatchedToTrakt, pushWatchedToTrakt, pushWatchlistToTrakt } from '../../services/trakt-sync';
 import { createPerformanceTrace } from '../../services/performance';
@@ -18,6 +18,7 @@ import {
 import XrelQualityBadge from '../../components/XrelQualityBadge';
 import { scheduleAddonReleaseQualityProbes } from '../../services/addon-release-probes';
 import { getXrelQualitySnapshot, subscribeXrelQualitySnapshot } from '../../services/xrel';
+import { getUpNextNoResultCachePolicy, UP_NEXT_RESOLVED_RESULT_CACHE_TTL_MS } from '../../services/tmdb-request-policy';
 import './Board.css';
 
 function formatRelativeTime(dateStr: string): string {
@@ -83,10 +84,6 @@ const CATALOG_ORDER = [
 let boardCatalogSnapshot: CatalogRow[] = [];
 let boardCatalogSnapshotMode: DiscoveryContentMode | null = null;
 const CONTINUE_VIEW_REFRESH_TTL_MS = 6 * 60 * 60 * 1000;
-const UP_NEXT_RESULT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const UP_NEXT_NO_RESULT_CACHE_BASE_TTL_MS = 24 * 60 * 60 * 1000;
-const UP_NEXT_NO_RESULT_CACHE_STAGGER_MS = 6 * 60 * 60 * 1000;
-const UP_NEXT_NO_RESULT_CACHE_STAGGER_BUCKETS = 4;
 const UP_NEXT_DIAGNOSTIC_SHOW_LIMIT = 10;
 const BOARD_CATALOG_ITEM_LIMIT = 20;
 const ADDON_RELEASE_PROBE_RECHECK_MS = 12 * 60 * 60 * 1000;
@@ -160,11 +157,6 @@ function isAvailableEpisode(episode: EpisodeDetail): boolean {
 
 function getEpisodeKey(tmdbId: number, season: number, episode: number): string {
   return `${tmdbId}:${season}:${episode}`;
-}
-
-function getUpNextNoResultCacheTtlMs(tmdbId: number): number {
-  const staggerBucket = Math.abs(tmdbId) % UP_NEXT_NO_RESULT_CACHE_STAGGER_BUCKETS;
-  return UP_NEXT_NO_RESULT_CACHE_BASE_TTL_MS + staggerBucket * UP_NEXT_NO_RESULT_CACHE_STAGGER_MS;
 }
 
 function buildContinueViewFingerprint(
@@ -577,6 +569,11 @@ const Board: React.FC = () => {
       candidateSeasonCount: number;
       failed: boolean;
       errorKind?: string;
+      seriesStatus?: string | null;
+      inProduction?: boolean;
+      nextEpisodeAirDate?: string | null;
+      noResultCachePolicy?: string;
+      noResultCacheTtlMs?: number;
     }> => {
       if (!isCurrentRefresh()) {
         return {
@@ -592,6 +589,11 @@ const Board: React.FC = () => {
       const cacheKey = `board:up-next:v3:${show.tmdbId}:s${show.latestSeason}:e${show.latestEpisode}`;
       const cachedResolution = await readPersistentlyCachedValue<{
         nextEpisode: { season: number; episode: number } | null;
+        seriesStatus?: string | null;
+        inProduction?: boolean;
+        nextEpisodeAirDate?: string | null;
+        noResultCachePolicy?: string;
+        noResultCacheTtlMs?: number;
       }>(cacheKey);
       const cachedEpisode = cachedResolution?.nextEpisode;
       if (cachedResolution && cachedEpisode === null) {
@@ -602,6 +604,11 @@ const Board: React.FC = () => {
           episodeListLookups: 0,
           candidateSeasonCount: 0,
           failed: false,
+          seriesStatus: cachedResolution.seriesStatus,
+          inProduction: cachedResolution.inProduction,
+          nextEpisodeAirDate: cachedResolution.nextEpisodeAirDate,
+          noResultCachePolicy: cachedResolution.noResultCachePolicy,
+          noResultCacheTtlMs: cachedResolution.noResultCacheTtlMs,
         };
       }
       if (
@@ -630,8 +637,8 @@ const Board: React.FC = () => {
 
       try {
         seasonListLookups = 1;
-        const seasons = await getTmdbSeasons(show.tmdbId, { throwOnError: true });
-        const candidateSeasons = seasons
+        const schedule = await getTmdbSeriesSchedule(show.tmdbId, { throwOnError: true });
+        const candidateSeasons = schedule.seasons
           .filter((season) => season.episode_count > 0 && season.season_number >= show.latestSeason)
           .sort((a, b) => a.season_number - b.season_number);
         candidateSeasonCount = candidateSeasons.length;
@@ -658,8 +665,13 @@ const Board: React.FC = () => {
             };
             await writePersistentlyCachedValue(
               cacheKey,
-              { nextEpisode: resolvedEpisode },
-              UP_NEXT_RESULT_CACHE_TTL_MS,
+              {
+                nextEpisode: resolvedEpisode,
+                seriesStatus: schedule.status,
+                inProduction: schedule.inProduction,
+                nextEpisodeAirDate: schedule.nextEpisodeAirDate,
+              },
+              UP_NEXT_RESOLVED_RESULT_CACHE_TTL_MS,
             );
             return {
               nextEpisode: resolvedEpisode,
@@ -668,16 +680,40 @@ const Board: React.FC = () => {
               episodeListLookups,
               candidateSeasonCount,
               failed: false,
+              seriesStatus: schedule.status,
+              inProduction: schedule.inProduction,
+              nextEpisodeAirDate: schedule.nextEpisodeAirDate,
             };
           }
         }
 
         if (isCurrentRefresh()) {
+          const noResultCache = getUpNextNoResultCachePolicy(show.tmdbId, schedule);
           await writePersistentlyCachedValue(
             cacheKey,
-            { nextEpisode: null },
-            getUpNextNoResultCacheTtlMs(show.tmdbId),
+            {
+              nextEpisode: null,
+              seriesStatus: schedule.status,
+              inProduction: schedule.inProduction,
+              nextEpisodeAirDate: schedule.nextEpisodeAirDate,
+              noResultCachePolicy: noResultCache.policy,
+              noResultCacheTtlMs: noResultCache.ttlMs,
+            },
+            noResultCache.ttlMs,
           );
+          return {
+            nextEpisode: null,
+            cacheHit: false,
+            seasonListLookups,
+            episodeListLookups,
+            candidateSeasonCount,
+            failed: false,
+            seriesStatus: schedule.status,
+            inProduction: schedule.inProduction,
+            nextEpisodeAirDate: schedule.nextEpisodeAirDate,
+            noResultCachePolicy: noResultCache.policy,
+            noResultCacheTtlMs: noResultCache.ttlMs,
+          };
         }
         return {
           nextEpisode: null,
@@ -805,6 +841,11 @@ const Board: React.FC = () => {
         candidateSeasonCount: number;
         failed: boolean;
         errorKind?: string;
+        seriesStatus?: string | null;
+        inProduction?: boolean;
+        nextEpisodeAirDate?: string | null;
+        noResultCachePolicy?: string;
+        noResultCacheTtlMs?: number;
       }> = [];
       let nextCandidateIndex = 0;
       const workerCount = Math.min(4, upNextCandidates.length);
@@ -885,6 +926,12 @@ const Board: React.FC = () => {
         const cachedResultCount = resolvedEpisodes.filter((item) => item.cacheHit).length;
         const resolvedResultCount = resolvedEpisodes.filter((item) => item.nextEpisode).length;
         const failedResultCount = resolvedEpisodes.filter((item) => item.failed).length;
+        const noResultCachePolicyCounts = resolvedEpisodes.reduce<Record<string, number>>((counts, item) => {
+          if (item.noResultCachePolicy) {
+            counts[item.noResultCachePolicy] = (counts[item.noResultCachePolicy] ?? 0) + 1;
+          }
+          return counts;
+        }, {});
         const highestFanoutShows = [...resolvedEpisodes]
           .sort((a, b) => b.episodeListLookups - a.episodeListLookups)
           .slice(0, UP_NEXT_DIAGNOSTIC_SHOW_LIMIT)
@@ -904,6 +951,13 @@ const Board: React.FC = () => {
                 : item.nextEpisode
                   ? 'resolved'
                   : 'no_result',
+            series_status: item.seriesStatus ?? null,
+            in_production: item.inProduction ?? null,
+            next_episode_air_date: item.nextEpisodeAirDate ?? null,
+            no_result_cache_policy: item.noResultCachePolicy ?? null,
+            no_result_cache_ttl_hours: typeof item.noResultCacheTtlMs === 'number'
+              ? Math.round(item.noResultCacheTtlMs / (60 * 60 * 1000))
+              : null,
             error_kind: item.errorKind ?? null,
           }));
 
@@ -919,6 +973,7 @@ const Board: React.FC = () => {
           cached_result_count: cachedResultCount,
           season_list_lookups: seasonListLookups,
           episode_list_lookups: episodeListLookups,
+          no_result_cache_policy_counts: noResultCachePolicyCounts,
           metadata_preview_count: enrichedItems.length,
           highest_fanout_shows: highestFanoutShows,
         }, 'board.tmdb_up_next');

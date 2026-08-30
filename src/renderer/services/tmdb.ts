@@ -210,6 +210,14 @@ interface TmdbMetaData extends TmdbDetail {
     results?: Array<{ title?: string }>;
   };
   seasons?: TmdbSeasonData[];
+  status?: string | null;
+  in_production?: boolean;
+  next_episode_to_air?: {
+    air_date?: string | null;
+    episode_number?: number;
+    season_number?: number;
+  } | null;
+  last_air_date?: string | null;
   images?: { logos?: Array<{ file_path: string; iso_639_1: string | null; vote_average: number }> };
   videos?: { results?: TmdbVideo[] };
 }
@@ -1397,6 +1405,14 @@ export interface EpisodeDetail {
   vote_average: number;
 }
 
+export interface TmdbSeriesSchedule {
+  seasons: Season[];
+  status: string | null;
+  inProduction: boolean;
+  nextEpisodeAirDate: string | null;
+  lastAirDate: string | null;
+}
+
 function mapTmdbSeasons(seasons: Array<{
   id: number;
   season_number: number;
@@ -1417,6 +1433,48 @@ function mapTmdbSeasons(seasons: Array<{
       air_date: season.air_date || null,
       episode_count: season.episode_count
     }));
+}
+
+function mapTmdbSeriesSchedule(details: TmdbMetaData): TmdbSeriesSchedule {
+  return {
+    seasons: mapTmdbSeasons(details.seasons || []),
+    status: typeof details.status === 'string' ? details.status : null,
+    inProduction: details.in_production === true,
+    nextEpisodeAirDate: details.next_episode_to_air?.air_date || null,
+    lastAirDate: details.last_air_date || null,
+  };
+}
+
+export async function getTmdbSeriesSchedule(
+  tmdbId: number,
+  options: { throwOnError?: boolean } = {},
+): Promise<TmdbSeriesSchedule> {
+  try {
+    return await getPersistentlyCachedRequest(
+      `tmdb:series-schedule:v1:${tmdbId}`,
+      TMDB_SEASON_LIST_CACHE_TTL_MS,
+      async () => {
+        const cachedDetails = await readPersistentlyCachedValue<TmdbMetaData>(
+          titleDetailCacheKey('tv', tmdbId),
+        );
+        if (cachedDetails?.seasons) return mapTmdbSeriesSchedule(cachedDetails);
+
+        const response = await tmdbClient.get<TmdbMetaData>(`/tv/${tmdbId}`);
+        await persistSharedTitleData('tv', tmdbId, response.data);
+        return mapTmdbSeriesSchedule(response.data);
+      },
+    );
+  } catch (error) {
+    console.error('Failed to fetch TMDB series schedule:', error);
+    if (options.throwOnError) throw error;
+    return {
+      seasons: [],
+      status: null,
+      inProduction: false,
+      nextEpisodeAirDate: null,
+      lastAirDate: null,
+    };
+  }
 }
 
 export async function getTmdbSeasons(
