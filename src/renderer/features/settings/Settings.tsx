@@ -2788,7 +2788,7 @@ const Settings: React.FC = () => {
                 className="settings-select"
                 value={mpvRifeModel}
                 onChange={(event) => {
-                  setMpvRifeEnabled(false);
+                  setRifeRuntimeInfo(null);
                   setMpvRifeModel(event.target.value as RifeModel);
                 }}
                 disabled={rifeInstallStatus === 'installing'}
@@ -2799,7 +2799,7 @@ const Settings: React.FC = () => {
                 <option value="4.18">4.18</option>
                 <option value="4.25">4.25</option>
               </select>
-              <span className="settings-hint">Different models trade temporal stability, detail, and processing time.</span>
+              <span className="settings-hint">Different models trade temporal stability, detail, and processing time. Model changes apply to the next playback.</span>
             </div>
 
             <div className="settings-field">

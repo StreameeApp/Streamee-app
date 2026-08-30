@@ -24,6 +24,8 @@ test('RIFE controls persist playback choices and use the managed runtime install
   assert.match(settings, /Install RIFE Runtime/);
   assert.match(settings, /window\.electronAPI\.rife\.install/);
   assert.match(settings, /videoUpscaler !== 'rtx-vsr'/);
+  assert.match(settings, /setRifeRuntimeInfo\(null\);\s*setMpvRifeModel/);
+  assert.doesNotMatch(settings, /setMpvRifeEnabled\(false\);\s*setMpvRifeModel/);
   assert.match(runtime, /rife-runtime/);
   assert.match(runtime, /SHA-256 verification failed/);
   assert.match(runtime, /vsmlrt-cuda\.v15\.16\.7z\.001/);
