@@ -48,9 +48,10 @@
                                      "resources/LGPL-2.1.txt":  "LGPL-2.1.txt"
                                  },
                    "windows":  {
-                                   "nsis":  {
-                                                "installMode":  "currentUser"
-                                            }
+                                    "nsis":  {
+                                                 "installMode":  "currentUser",
+                                                 "compression":  "zlib"
+                                             }
                                }
                },
     "plugins":  {

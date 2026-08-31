@@ -7961,6 +7961,9 @@ async fn get_setting(
 const XREL_RELEASE_CACHE_STORE_FILE: &str = "xrel-release-cache.json";
 const XREL_RELEASE_CACHE_STORE_KEY: &str = "releaseQualityCacheV2";
 const XREL_RELEASE_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const REQUEST_CACHE_STORE_FILE: &str = "request-cache.json";
+const REQUEST_CACHE_STORE_KEY: &str = "responsesV1";
+const REQUEST_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 #[tauri::command]
 async fn read_xrel_release_cache(app: AppHandle) -> Result<Option<serde_json::Value>, String> {
@@ -8002,6 +8005,42 @@ async fn clear_xrel_release_cache(app: AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     store.delete(XREL_RELEASE_CACHE_STORE_KEY);
     store.save().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn read_request_cache(app: AppHandle) -> Result<Option<serde_json::Value>, String> {
+    let store = app
+        .store(REQUEST_CACHE_STORE_FILE)
+        .map_err(|error| error.to_string())?;
+    Ok(store.get(REQUEST_CACHE_STORE_KEY))
+}
+
+#[tauri::command]
+async fn write_request_cache(app: AppHandle, value: String) -> Result<(), String> {
+    if value.len() > REQUEST_CACHE_MAX_BYTES {
+        return Err(format!(
+            "Request cache is too large ({} bytes; maximum is {} bytes)",
+            value.len(),
+            REQUEST_CACHE_MAX_BYTES
+        ));
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(&value)
+        .map_err(|error| format!("Failed to parse request cache: {error}"))?;
+    if !parsed.is_array() {
+        return Err("Request cache must be a JSON array".to_string());
+    }
+
+    let store = app
+        .store(REQUEST_CACHE_STORE_FILE)
+        .map_err(|error| error.to_string())?;
+    store.set(REQUEST_CACHE_STORE_KEY, parsed);
+    store.save().map_err(|error| error.to_string())?;
+    info!(
+        subsystem = "storage",
+        "Saved shared request cache to AppData ({} bytes)",
+        value.len()
+    );
     Ok(())
 }
 
@@ -8670,6 +8709,8 @@ pub fn run() {
             read_xrel_release_cache,
             write_xrel_release_cache,
             clear_xrel_release_cache,
+            read_request_cache,
+            write_request_cache,
             configure_remote_control,
             get_remote_control_info,
             restart_svp,

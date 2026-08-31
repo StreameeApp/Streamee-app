@@ -3,6 +3,7 @@ import './services/logger';
 import './services/tauri';
 import './styles/global.css';
 import { initializeSharedRendererStorage } from './services/shared-storage';
+import { initializeSharedRequestCache } from './services/request-cache';
 import { migrateLegacyApiKeys } from './services/api-keys';
 
 import { Buffer } from 'buffer';
@@ -11,19 +12,21 @@ if (typeof window !== 'undefined') {
 }
 
 const bootstrap = async () => {
+  const isAudioNormalizerWindow = new URLSearchParams(window.location.search)
+    .get('window') === 'audio-normalizer';
   try {
     await migrateLegacyApiKeys();
   } catch (error) {
     console.error('Failed to migrate legacy API keys to secure storage:', error);
   }
   await initializeSharedRendererStorage();
+  if (!isAudioNormalizerWindow) {
+    await initializeSharedRequestCache();
+  }
   const container = document.getElementById('root');
 
   if (container) {
     const root = createRoot(container);
-    const isAudioNormalizerWindow = new URLSearchParams(window.location.search)
-      .get('window') === 'audio-normalizer';
-
     if (isAudioNormalizerWindow) {
       const { default: AudioNormalizer } = await import('./features/audio-normalizer/AudioNormalizer');
       root.render(

@@ -1,3 +1,5 @@
+import { invoke } from '@tauri-apps/api/core';
+
 interface RequestCacheEntry {
   expiresAt: number;
   promise: Promise<unknown>;
@@ -14,8 +16,14 @@ const DEFAULT_MAX_ENTRIES = 1_500;
 const DEFAULT_STALE_FALLBACK_TTL_MS = 15 * 60 * 1000;
 const PERSISTENT_CACHE_DATABASE = 'streamee-request-cache';
 const PERSISTENT_CACHE_STORE = 'responses';
+const SHARED_CACHE_SAVE_DELAY_MS = 100;
+const SHARED_CACHE_PATCH_FLAG = '__streameeSharedRequestCachePatchedV1';
 const requestCache = new Map<string, RequestCacheEntry>();
 let persistentCacheDatabasePromise: Promise<IDBDatabase> | null = null;
+let sharedCacheEntries: Map<string, PersistentRequestCacheEntry> | null = null;
+let sharedCacheInitializationPromise: Promise<void> | null = null;
+let sharedCacheSaveTimer: number | null = null;
+let sharedCacheWriteChain: Promise<unknown> = Promise.resolve();
 
 function openPersistentCacheDatabase(): Promise<IDBDatabase> {
   if (persistentCacheDatabasePromise) return persistentCacheDatabasePromise;
@@ -40,7 +48,126 @@ function openPersistentCacheDatabase(): Promise<IDBDatabase> {
   return persistentCacheDatabasePromise;
 }
 
+function isPersistentRequestCacheEntry(value: unknown): value is PersistentRequestCacheEntry {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const entry = value as Partial<PersistentRequestCacheEntry>;
+  return typeof entry.key === 'string'
+    && Number.isFinite(entry.expiresAt)
+    && Number.isFinite(entry.storedAt)
+    && Object.prototype.hasOwnProperty.call(entry, 'value');
+}
+
+function readAllPersistentRequests(database: IDBDatabase): Promise<PersistentRequestCacheEntry[]> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(PERSISTENT_CACHE_STORE, 'readonly');
+    const request = transaction.objectStore(PERSISTENT_CACHE_STORE).getAll();
+    request.onsuccess = () => resolve(
+      (request.result as unknown[]).filter(isPersistentRequestCacheEntry),
+    );
+    request.onerror = () => reject(request.error ?? new Error('Could not read the response cache.'));
+  });
+}
+
+function replacePersistentRequests(
+  database: IDBDatabase,
+  entries: PersistentRequestCacheEntry[],
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(PERSISTENT_CACHE_STORE, 'readwrite');
+    const store = transaction.objectStore(PERSISTENT_CACHE_STORE);
+    store.clear();
+    entries.forEach((entry) => store.put(entry));
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error('Could not synchronize the response cache.'));
+    transaction.onabort = () => reject(transaction.error ?? new Error('Response cache synchronization was aborted.'));
+  });
+}
+
+function pruneSharedCacheEntries(maxEntries: number, removeExpired: boolean): void {
+  if (!sharedCacheEntries) return;
+  const now = Date.now();
+  if (removeExpired) {
+    for (const [key, entry] of sharedCacheEntries) {
+      if (entry.expiresAt <= now) sharedCacheEntries.delete(key);
+    }
+  }
+  const oldestFirst = [...sharedCacheEntries.values()].sort((left, right) => left.storedAt - right.storedAt);
+  while (oldestFirst.length > maxEntries) {
+    const oldest = oldestFirst.shift();
+    if (oldest) sharedCacheEntries.delete(oldest.key);
+  }
+}
+
+function serializeSharedCache(): string {
+  return JSON.stringify(
+    [...(sharedCacheEntries?.values() ?? [])].sort((left, right) => left.key.localeCompare(right.key)),
+  );
+}
+
+function flushSharedCache(): void {
+  if (sharedCacheSaveTimer !== null) {
+    window.clearTimeout(sharedCacheSaveTimer);
+    sharedCacheSaveTimer = null;
+  }
+  const value = serializeSharedCache();
+  sharedCacheWriteChain = sharedCacheWriteChain
+    .catch(() => undefined)
+    .then(() => invoke<void>('write_request_cache', { value }))
+    .catch((error) => console.error('[Storage] Failed to save shared request cache:', error));
+}
+
+function scheduleSharedCacheSave(): void {
+  if (sharedCacheSaveTimer !== null) window.clearTimeout(sharedCacheSaveTimer);
+  sharedCacheSaveTimer = window.setTimeout(flushSharedCache, SHARED_CACHE_SAVE_DELAY_MS);
+}
+
+function installSharedCacheFlush(): void {
+  const patchedWindow = window as unknown as Record<string, unknown>;
+  if (patchedWindow[SHARED_CACHE_PATCH_FLAG]) return;
+  patchedWindow[SHARED_CACHE_PATCH_FLAG] = true;
+  window.addEventListener('pagehide', flushSharedCache);
+}
+
+export function initializeSharedRequestCache(): Promise<void> {
+  if (sharedCacheInitializationPromise) return sharedCacheInitializationPromise;
+
+  sharedCacheInitializationPromise = (async () => {
+    const database = await openPersistentCacheDatabase();
+    const localEntries = await readAllPersistentRequests(database);
+    let nativeEntries: PersistentRequestCacheEntry[] = [];
+    try {
+      const nativeValue = await invoke<unknown[] | null>('read_request_cache');
+      nativeEntries = (nativeValue ?? []).filter(isPersistentRequestCacheEntry);
+    } catch (error) {
+      console.warn('[Storage] Shared request cache is unavailable; using this origin\'s IndexedDB:', error);
+    }
+
+    const merged = new Map<string, PersistentRequestCacheEntry>();
+    for (const entry of [...localEntries, ...nativeEntries]) {
+      const current = merged.get(entry.key);
+      if (!current || entry.storedAt >= current.storedAt) merged.set(entry.key, entry);
+    }
+    sharedCacheEntries = merged;
+    pruneSharedCacheEntries(DEFAULT_MAX_ENTRIES, false);
+    const synchronizedEntries = [...sharedCacheEntries.values()];
+    await replacePersistentRequests(database, synchronizedEntries);
+    installSharedCacheFlush();
+    try {
+      await invoke<void>('write_request_cache', { value: serializeSharedCache() });
+    } catch (error) {
+      console.warn('[Storage] Could not initialize the shared request cache:', error);
+    }
+  })().catch((error) => {
+    sharedCacheEntries = new Map();
+    installSharedCacheFlush();
+    console.error('[Storage] Request cache synchronization failed; continuing without persistent cache:', error);
+  });
+
+  return sharedCacheInitializationPromise;
+}
+
 async function readPersistentRequest(key: string): Promise<PersistentRequestCacheEntry | null> {
+  await initializeSharedRequestCache();
   const database = await openPersistentCacheDatabase();
   return new Promise((resolve, reject) => {
     const transaction = database.transaction(PERSISTENT_CACHE_STORE, 'readwrite');
@@ -58,7 +185,13 @@ async function readPersistentRequest(key: string): Promise<PersistentRequestCach
       }
     };
     request.onerror = () => reject(request.error ?? new Error('Could not read the response cache.'));
-    transaction.oncomplete = () => resolve(result);
+    transaction.oncomplete = () => {
+      if (result && sharedCacheEntries) {
+        sharedCacheEntries.set(result.key, result);
+        scheduleSharedCacheSave();
+      }
+      resolve(result);
+    };
     transaction.onerror = () => reject(transaction.error ?? new Error('Could not refresh response cache recency.'));
     transaction.onabort = () => reject(transaction.error ?? new Error('Response cache recency update was aborted.'));
   });
@@ -79,6 +212,7 @@ async function writePersistentRequests<T>(
   maxEntries: number,
 ): Promise<void> {
   if (entries.length === 0) return;
+  await initializeSharedRequestCache();
   const database = await openPersistentCacheDatabase();
   await new Promise<void>((resolve, reject) => {
     const transaction = database.transaction(PERSISTENT_CACHE_STORE, 'readwrite');
@@ -117,6 +251,14 @@ async function writePersistentRequests<T>(
     transaction.onerror = () => reject(transaction.error ?? new Error('Could not write the response cache.'));
     transaction.onabort = () => reject(transaction.error ?? new Error('Response cache write was aborted.'));
   });
+  if (sharedCacheEntries) {
+    const storedAt = Date.now();
+    for (const { key, value } of entries) {
+      sharedCacheEntries.set(key, { key, value, expiresAt, storedAt });
+    }
+    pruneSharedCacheEntries(maxEntries, true);
+    scheduleSharedCacheSave();
+  }
 }
 
 function pruneRequestCache(maxEntries: number): void {
