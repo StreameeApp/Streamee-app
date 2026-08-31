@@ -274,6 +274,27 @@ fn source_durations_compatible(current: f64, reference: f64) -> bool {
     (current - reference).abs() <= (current.max(reference) * 0.15).max(180.0)
 }
 
+fn audio_identity_language(identity: &str) -> Option<&str> {
+    let language = identity
+        .split('|')
+        .find_map(|component| component.strip_prefix("lang="))?
+        .trim();
+    (!language.is_empty() && !matches!(language, "und" | "unknown" | "mul" | "zxx"))
+        .then_some(language)
+}
+
+fn audio_identities_compatible(current: &str, reference: &str) -> bool {
+    current == reference
+        || matches!(
+            (
+                audio_identity_language(current),
+                audio_identity_language(reference)
+            ),
+            (Some(current_language), Some(reference_language))
+                if current_language == reference_language
+        )
+}
+
 fn fingerprint_has_enough_detail(points: &[u32]) -> bool {
     if points.len() < (MIN_INTRO_SECONDS / SAMPLE_DURATION_SECONDS) as usize {
         return false;
@@ -1663,7 +1684,7 @@ pub async fn detect_intro_skipper_segment(
         .iter()
         .filter(|entry| {
             entry.episode != episode
-                && entry.audio_identity == selected_audio.identity
+                && audio_identities_compatible(&selected_audio.identity, &entry.audio_identity)
                 && entry.analysis_part == analysis_part
                 && (entry.source_identity == source_identity
                     || source_durations_compatible(duration_seconds, entry.duration_seconds))
@@ -1766,7 +1787,7 @@ pub async fn detect_intro_skipper_segment(
             .iter()
             .filter(|entry| {
                 entry.episode != episode
-                    && entry.audio_identity == selected_audio.identity
+                    && audio_identities_compatible(&selected_audio.identity, &entry.audio_identity)
                     && entry.analysis_part == analysis_part
                     && (entry.source_identity == source_identity
                         || source_durations_compatible(duration_seconds, entry.duration_seconds))
@@ -1797,6 +1818,8 @@ pub async fn detect_intro_skipper_segment(
                     episode,
                     analysis_part,
                     reference_episode = reference.episode,
+                    reference_audio_exact = reference.audio_identity == selected_audio.identity,
+                    reference_source_exact = reference.source_identity == source_identity,
                     match_method = range.method.as_str(),
                     match_duration_seconds,
                     minimum_duration_seconds,
@@ -2082,7 +2105,7 @@ pub async fn detect_intro_skipper_outro_segment(
             .iter()
             .filter(|entry| {
                 entry.episode != episode
-                    && entry.audio_identity == selected_audio.identity
+                    && audio_identities_compatible(&selected_audio.identity, &entry.audio_identity)
                     && (entry.source_identity == source_identity
                         || source_durations_compatible(duration_seconds, entry.duration_seconds))
             })
@@ -2557,6 +2580,22 @@ mod tests {
             opening_cache_buffered_seconds(Some(&partial), Some(839.0), 780.0),
             780.0
         );
+    }
+
+    #[test]
+    fn audio_identity_allows_same_language_across_release_encodes() {
+        let release_a = "lang=eng|title=english|codec=aac|channels=2|external=false";
+        let release_b = "lang=eng|title=english 5.1|codec=eac3|channels=6|external=false";
+        let different_language = "lang=jpn|title=japanese|codec=aac|channels=2|external=false";
+        let unknown_language = "lang=und|title=main|codec=aac|channels=2|external=false";
+
+        assert!(audio_identities_compatible(release_a, release_a));
+        assert!(audio_identities_compatible(release_a, release_b));
+        assert!(!audio_identities_compatible(release_a, different_language));
+        assert!(!audio_identities_compatible(
+            unknown_language,
+            "lang=und|title=main 5.1|codec=eac3|channels=6|external=false"
+        ));
     }
 
     #[test]

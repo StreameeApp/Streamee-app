@@ -6419,7 +6419,7 @@ async fn prepare_rife_engine(
     let mpv_dir = mpv_path
         .parent()
         .ok_or_else(|| "Could not determine MPV directory".to_string())?;
-    let script_path = mpv_dir.join("scripts").join("streamee_rife.py");
+    let script_path = find_rife_script(mpv_dir);
     rife_runtime::prepare_engine(app, mpv_path, script_path, request).await
 }
 
@@ -6508,6 +6508,34 @@ pub(crate) fn find_mpv(app: &AppHandle) -> Option<String> {
     }
 
     None
+}
+
+fn find_rife_script(mpv_dir: &Path) -> PathBuf {
+    let bundled_script = mpv_dir.join("scripts").join("streamee_rife.py");
+    if bundled_script.is_file() {
+        return bundled_script;
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let development_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("mpv")
+            .join("scripts")
+            .join("streamee_rife.py");
+        if development_script.is_file() {
+            let development_script = development_script
+                .canonicalize()
+                .unwrap_or(development_script);
+            warn!(
+                "Bundled RIFE script is missing; using development source: {}",
+                development_script.display()
+            );
+            return development_script;
+        }
+    }
+
+    bundled_script
 }
 
 #[cfg(target_os = "windows")]
@@ -6843,7 +6871,7 @@ async fn launch_mpv_process(
         .parent()
         .ok_or_else(|| "Could not determine MPV directory".to_string())?
         .to_path_buf();
-    let rife_script_path = mpv_dir.join("scripts").join("streamee_rife.py");
+    let rife_script_path = find_rife_script(&mpv_dir);
     let rife_runtime_dir = PathBuf::from(&rife_runtime_path);
     let rife_runtime_status = rife_requested
         .then(|| rife_runtime::runtime_info(rife_model))
@@ -7092,11 +7120,16 @@ async fn launch_mpv_process(
 
     let mpv_log_path = streamee_log_dir().join("MPV.log");
     let mpv_scratch_log_path = streamee_log_dir().join("MPV.raw.log");
+    let mpv_capture_path = if MPV_STRUCTURED_LOGGING_ENABLED {
+        &mpv_scratch_log_path
+    } else {
+        &mpv_log_path
+    };
+    cmd_args.push(format!("--log-file={}", mpv_capture_path.display()));
+    cmd_args.push("--msg-level=all=info".to_string());
     if MPV_STRUCTURED_LOGGING_ENABLED {
-        cmd_args.push(format!("--log-file={}", mpv_scratch_log_path.display()));
-        cmd_args.push("--msg-level=all=info".to_string());
         info!(
-            event = "mpv.logging_enabled",
+            event = "mpv.structured_logging_enabled",
             source = "backend",
             subsystem = "mpv.logging",
             path = %mpv_log_path.display(),
@@ -7105,10 +7138,12 @@ async fn launch_mpv_process(
         );
     } else {
         info!(
-            event = "mpv.logging_disabled",
+            event = "mpv.native_logging_enabled",
             source = "backend",
             subsystem = "mpv.logging",
-            "MPV structured log ingestion is disabled"
+            path = %mpv_log_path.display(),
+            level = "info",
+            "MPV native file logging enabled outside structured JSONL ingestion"
         );
     }
 
@@ -8675,6 +8710,17 @@ pub fn run() {
 #[cfg(test)]
 mod stream_cache_tests {
     use super::*;
+
+    #[test]
+    fn development_rife_script_falls_back_to_workspace_source() {
+        let missing_mpv_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("rife-fallback-test-missing");
+        let resolved = find_rife_script(&missing_mpv_dir);
+
+        assert!(resolved.is_file());
+        assert!(resolved.ends_with(Path::new("mpv/scripts/streamee_rife.py")));
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

@@ -62,7 +62,20 @@ test('background queue handles priority, freshness, retries, offline recovery, q
       version: 2,
       fetchedAt: 0,
       seenReleaseIds: [],
-      entries: [],
+      entries: [{
+        cacheKey: 'addon:stale:english:title',
+        xrelId: 'addon:stale',
+        mediaType: 'movie',
+        title: 'Stale Add-on Badge',
+        label: '4K',
+        rank: 80,
+        dirname: 'Stale.Addon.Badge.2160p',
+        updatedAt: now,
+        verifiedAt: now,
+        language: 'english',
+        provider: 'addon',
+        lookupTier: 'background',
+      }],
       negativeLookups: { 'movie:obsession:2026': now + 24 * 60 * 60 * 1000 },
       preciseLookups: {},
       identityAliases: {},
@@ -359,6 +372,12 @@ test('background queue handles priority, freshness, retries, offline recovery, q
   const migratedCache = JSON.parse(storage.get('streamee-xrel-release-quality-cache-v2') ?? '{}');
   assert.equal(migratedCache.negativeLookups?.['movie:obsession:2026'], undefined, 'pre-fix false negatives are invalidated');
   assert.equal(migratedCache.backgroundMatcherVersion, 4);
+  assert.equal(migratedCache.addonMatcherVersion, 2);
+  assert.equal(
+    migratedCache.entries.some((entry: { provider?: string }) => entry.provider === 'addon'),
+    false,
+    'pre-consensus add-on badges are invalidated',
+  );
   unsubscribeRestoredQueue();
   assert.equal(service.calculateXrelBackgroundDelay({
     now,
@@ -785,8 +804,16 @@ test('background queue handles priority, freshness, retries, offline recovery, q
   };
   assert.equal(service.shouldProbeAddonReleaseQuality(addonProbeItem), true);
   assert.equal(service.mergeAddonReleaseQualityObservations(addonProbeItem, [{
-    title: 'Add-on.Probe.Movie.2026.2160p.DV.HDR.HEVC',
-  }]), 1);
+    title: 'Add-on.Probe.Movie.2026.2160p.DV.HDR.HEVC-GROUPA.mkv',
+  }]), 0, 'one add-on observation cannot create a badge');
+  assert.equal(service.mergeAddonReleaseQualityObservations(addonProbeItem, [
+    { title: 'Add-on.Probe.Movie.2026.2160p.DV.HDR.HEVC-GROUPA.mkv' },
+    { title: 'Add-on.Probe.Movie.2026.2160p.DV.HDR.HEVC-GROUPA.mkv' },
+  ]), 0, 'duplicate add-on observations count once');
+  assert.equal(service.mergeAddonReleaseQualityObservations(addonProbeItem, [
+    { title: 'Add-on.Probe.Movie.2026.2160p.DV.HDR.HEVC-GROUPA.mkv' },
+    { title: 'Add-on.Probe.Movie.2026.2160p.DV.HDR.HEVC-GROUPB.mkv' },
+  ]), 1);
   assert.equal(service.getXrelQualityBadge(addonProbeItem)?.label, '4K DV');
   assert.equal(service.getXrelQualityBadge(addonProbeItem)?.provider, 'addon');
   assert.equal(service.shouldProbeAddonReleaseQuality(addonProbeItem), false);

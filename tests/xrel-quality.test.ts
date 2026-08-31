@@ -7,15 +7,109 @@ import {
   normalizeXrelTitle,
   xrelTitleYearKey,
 } from '../src/renderer/services/xrel-quality.ts';
+import { getAddonReleaseQualityConsensus } from '../src/renderer/services/addon-release-quality.ts';
 
-test('CAM and telesync sources override misleading resolution tokens', () => {
-  const cam = classifyXrelRelease({ dirname: 'Example.Movie.2026.1080p.HDCAM.x264-GROUP' });
-  const telesync = classifyXrelRelease({ dirname: 'Example.Movie.2026.x264-GROUP', video_type: 'TeleSync' });
+test('early-source tags override misleading 4K and HDR tokens', () => {
+  const cases = [
+    ['Example.Movie.2026.2160p.HDR.HDCAM.x264-GROUP', 'CAM', 'CAM'],
+    ['Example.Movie.2026.4K.HDTS.x264-GROUP', 'TS', 'Telesync'],
+    ['Example.Movie.2026.UHD.HQTS.x264-GROUP', 'TS', 'Telesync'],
+    ['Example.Movie.2026.2160p.HDTC.x264-GROUP', 'TC', 'Telecine'],
+    ['Example.Movie.2026.4K.DVDSCR.x264-GROUP', 'SCREENER', 'Screener'],
+    ['Example.Movie.2026.2160p.WORKPRINT.x264-GROUP', 'WORKPRINT', 'Workprint'],
+  ] as const;
 
-  assert.equal(cam?.label, 'CAM');
-  assert.equal(cam?.source, 'CAM');
-  assert.equal(telesync?.label, 'TS');
-  assert.equal(telesync?.source, 'Telesync');
+  for (const [dirname, label, source] of cases) {
+    const quality = classifyXrelRelease({ dirname });
+    assert.equal(quality?.label, label, dirname);
+    assert.equal(quality?.source, source, dirname);
+    assert.notEqual(quality?.resolution, '4K', dirname);
+  }
+
+  const videoType = classifyXrelRelease({
+    dirname: 'Example.Movie.2026.2160p.x264-GROUP',
+    video_type: 'TeleSync',
+  });
+  assert.equal(videoType?.label, 'TS');
+});
+
+test('excludes trailers from release-quality badges', () => {
+  assert.equal(
+    classifyXrelRelease({ dirname: 'Example.Movie.2026.Official.Trailer.2160p.HDR.WEB-DL' }),
+    null,
+  );
+  assert.equal(
+    classifyXrelRelease({ dirname: 'Example.Movie.2026.4K.WEB-DL', video_type: 'Trailer' }),
+    null,
+  );
+});
+
+test('add-on badges require two unique releases agreeing on the exact tier', () => {
+  const item = { type: 'movie' as const, name: 'Example Movie', year: '2026' };
+  const consensus = getAddonReleaseQualityConsensus(item, [
+    { title: 'Example.Movie.2026.2160p.WEB-DL.H265-GROUPA.mkv' },
+    { title: 'Example.Movie.2026.4K.WEB.H265-GROUPB.mkv' },
+  ]);
+  assert.equal(consensus?.quality.label, '4K');
+  assert.equal(consensus?.support, 2);
+
+  assert.equal(getAddonReleaseQualityConsensus(item, [
+    { title: 'Example.Movie.2026.2160p.WEB-DL.H265-GROUPA.mkv' },
+    { title: 'Example.Movie.2026.2160p.DV.HDR.WEB-DL.H265-GROUPB.mkv' },
+  ]), null, 'different displayed tiers do not confirm each other');
+
+  assert.equal(getAddonReleaseQualityConsensus(item, [
+    { title: 'Example.Movie.2026.2160p.WEB-DL.H265-SAME.mkv' },
+    { title: 'Example.Movie.2026.2160p.WEB-DL.H265-SAME.mkv', description: 'duplicate provider row' },
+  ]), null, 'duplicate filenames count once');
+});
+
+test('add-on consensus rejects promos, unrelated titles, mismatched years, and description-only quality', () => {
+  assert.equal(getAddonReleaseQualityConsensus(
+    { type: 'movie', name: 'Moana', year: '2026' },
+    [
+      { title: 'MOANA-2026_TLR-1_4K-Scope_HEVC.mkv' },
+      { title: 'MOANA-2026_TLR-2_4K-Scope_HEVC.mkv' },
+    ],
+  ), null);
+  assert.equal(getAddonReleaseQualityConsensus(
+    { type: 'movie', name: 'The Odyssey', year: '2026' },
+    [
+      { title: 'The.Odyssey.Prologue.2025.IMAX.4K.mov' },
+      { title: 'The.Odyssey.First.Look.2026.2160p.mov' },
+    ],
+  ), null);
+  assert.equal(getAddonReleaseQualityConsensus(
+    { type: 'movie', name: 'Insidious: Out of the Further', year: '2026' },
+    [
+      { title: 'Insidious.The.Last.Key.2018.1080p.BluRay.mkv' },
+      { title: 'Insidious.Chapter.2.2013.1080p.BluRay.mkv' },
+    ],
+  ), null);
+  assert.equal(getAddonReleaseQualityConsensus(
+    { type: 'movie', name: 'Example Movie', year: '2026' },
+    [
+      { title: 'Example.Movie.2020.2160p.WEB-DL-GROUPA.mkv' },
+      { title: 'Example.Movie.2020.4K.WEB-DL-GROUPB.mkv' },
+      { title: 'Example Movie source A', description: '2160p WEB-DL' },
+      { title: 'Example Movie source B', description: '4K WEB-DL' },
+    ],
+  ), null);
+});
+
+test('add-on consensus requires the requested episode and preserves lower-tier overrides', () => {
+  const item = { type: 'series' as const, name: 'Example Show' };
+  assert.equal(getAddonReleaseQualityConsensus(item, [
+    { title: 'Example.Show.S01E02.2160p.WEB-DL-GROUPA.mkv' },
+    { title: 'Example.Show.S01E03.2160p.WEB-DL-GROUPB.mkv' },
+  ], { season: 1, episode: 2 }), null);
+
+  const cam = getAddonReleaseQualityConsensus(item, [
+    { title: 'Example.Show.S01E02.2160p.HDCAM-GROUPA.mkv' },
+    { title: 'Example.Show.S01E02.4K.CAMRip-GROUPB.mkv' },
+  ], { season: 1, episode: 2 });
+  assert.equal(cam?.quality.label, 'CAM');
+  assert.equal(cam?.support, 2);
 });
 
 test('recognizes common web and high-definition quality tiers', () => {

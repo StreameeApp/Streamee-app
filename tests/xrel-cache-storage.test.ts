@@ -7,6 +7,7 @@ test('xREL cache migrates to AppData and leaves localStorage state small', async
   const cacheValue = JSON.stringify({
     version: 2,
     backgroundMatcherVersion: 4,
+    addonMatcherVersion: 2,
     fetchedAt: 123,
     seenReleaseIds: ['release-1'],
     entries: [],

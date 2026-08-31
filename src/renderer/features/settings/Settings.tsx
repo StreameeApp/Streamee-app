@@ -2456,6 +2456,14 @@ const Settings: React.FC = () => {
         </p>
 
         <div className="settings-form">
+          <div className="video-processing-group">
+            <div className="video-processing-group-header">
+              <span>
+                <strong>Scale &amp; interpolate</strong>
+                <small>{videoUpscaler === 'rtx-vsr' ? 'RTX VSR' : videoUpscaler === 'ssim-superres' ? 'SSimSuperRes' : 'FSR'} · playback pipeline</small>
+              </span>
+            </div>
+            <div className="settings-advanced-grid">
           <div className="settings-field">
             <label>Upscaler</label>
             <select
@@ -2489,7 +2497,17 @@ const Settings: React.FC = () => {
               <span className="toggle-slider" />
             </button>
           </div>
+            </div>
+          </div>
 
+          <div className="video-processing-group">
+            <div className="video-processing-group-header">
+              <span>
+                <strong>HDR</strong>
+                <small>{mpvAutoHdrEnabled ? 'Automatic display HDR' : 'Display HDR stays unchanged'} · {mpvRtxHdrEnabled ? 'SDR conversion on' : 'SDR conversion off'}</small>
+              </span>
+            </div>
+            <div className="settings-advanced-grid">
           <div className="settings-toggle">
             <div className="settings-toggle-info">
               <label>Auto-enable Windows HDR for HDR or Dolby Vision</label>
@@ -2507,7 +2525,6 @@ const Settings: React.FC = () => {
             </button>
           </div>
 
-          <div className="settings-advanced-grid settings-always-visible">
           <div className="settings-toggle">
             <div className="settings-toggle-info">
               <label>Turn off Windows HDR when MPV exits</label>
@@ -2558,6 +2575,17 @@ const Settings: React.FC = () => {
               <span className="toggle-slider" />
             </button>
           </div>
+            </div>
+          </div>
+
+          <div className="video-processing-group">
+            <div className="video-processing-group-header">
+              <span>
+                <strong>Picture cleanup</strong>
+                <small>{[mpvSharpenEnabled, mpvDenoiseEnabled, mpvDebandEnabled].filter(Boolean).length} of 3 enhancements enabled</small>
+              </span>
+            </div>
+            <div className="settings-advanced-grid">
           <div className="settings-combined-setting">
             <div className="settings-toggle-info">
               <label>Enable sharpener by default</label>
@@ -2636,7 +2664,17 @@ const Settings: React.FC = () => {
               <span className="toggle-slider" />
             </button>
           </div>
+            </div>
+          </div>
 
+          <div className="video-processing-group">
+            <div className="video-processing-group-header">
+              <span>
+                <strong>Screen fit</strong>
+                <small>{mpvSmartUltrawideFillMode === 'off' ? 'Black bar fill off' : mpvSmartUltrawideFillMode === 'efficient' ? 'Efficient black bar fill' : 'Dynamic black bar fill'} · {mpvBlackBarLightingEnabled ? 'lighting on' : 'lighting off'}</small>
+              </span>
+            </div>
+            <div className="settings-advanced-grid">
           <div className="settings-field">
             <label>Smart Black Bar Fill</label>
             <select
@@ -2671,6 +2709,7 @@ const Settings: React.FC = () => {
             </button>
           </div>
             </div>
+          </div>
         </div>
       </section>
 

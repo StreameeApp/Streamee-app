@@ -3,7 +3,13 @@ import { FiChevronRight, FiHeart, FiEye, FiEyeOff, FiX, FiClock, FiBookmark, FiT
 import { useStore, ContinueWatchingItem, ContinueWatchingViewItem, MetaPreview } from '../../store';
 import { enrichTmdbItemsById, EpisodeDetail, getTmdbBoardCatalogs, getTmdbEpisodes, getTmdbSeriesSchedule, isTmdbConfigured } from '../../services/tmdb';
 import { getAnticipatedMovies, getAnticipatedShows, getTrendingMovies, getTrendingShows, hasTraktCredentials } from '../../services/trakt';
-import { pushUnwatchedToTrakt, pushWatchedToTrakt, pushWatchlistToTrakt } from '../../services/trakt-sync';
+import {
+  getStartupTraktSyncState,
+  pushUnwatchedToTrakt,
+  pushWatchedToTrakt,
+  pushWatchlistToTrakt,
+  subscribeStartupTraktSyncState,
+} from '../../services/trakt-sync';
 import { createPerformanceTrace } from '../../services/performance';
 import { logger } from '../../services/logger';
 import { readPersistentlyCachedValue, writePersistentlyCachedValue } from '../../services/request-cache';
@@ -85,6 +91,8 @@ let boardCatalogSnapshot: CatalogRow[] = [];
 let boardCatalogSnapshotMode: DiscoveryContentMode | null = null;
 const CONTINUE_VIEW_REFRESH_TTL_MS = 6 * 60 * 60 * 1000;
 const UP_NEXT_DIAGNOSTIC_SHOW_LIMIT = 10;
+const UP_NEXT_PENDING_SYNC_GRACE_MS = 5_000;
+const UP_NEXT_SETTLED_REFRESH_DELAY_MS = 1_200;
 const BOARD_CATALOG_ITEM_LIMIT = 20;
 const ADDON_RELEASE_PROBE_RECHECK_MS = 12 * 60 * 60 * 1000;
 
@@ -299,6 +307,11 @@ const Board: React.FC = () => {
     subscribeXrelQualitySnapshot,
     getXrelQualitySnapshot,
     getXrelQualitySnapshot,
+  );
+  const startupTraktSyncState = useSyncExternalStore(
+    subscribeStartupTraktSyncState,
+    getStartupTraktSyncState,
+    getStartupTraktSyncState,
   );
   const { setSelectedMeta, continueWatching, continueWatchingView, continueWatchingViewFingerprint, continueWatchingViewUpdatedAt, setContinueWatchingView, setContinueWatchingViewRefresh, addToContinueWatching, removeFromContinueWatching, setSelectedCatalog, setCatalogItems, setCatalogPage, setCatalogCacheKey, watchlist, addToWatchlist, removeFromWatchlist, watched, addToWatched, removeFromWatched, boardScrollPosition, setBoardScrollPosition, traktConnected, watchedEpisodes } = useStore();
   const continueRefreshFingerprint = useMemo(
@@ -544,11 +557,30 @@ const Board: React.FC = () => {
 
   useEffect(() => {
     if (loading) return;
+    if (startupTraktSyncState === 'running') {
+      logger.info('board.up_next_refresh.deferred', '[TMDB Up Next] Refresh deferred for startup sync', {
+        status: 'deferred',
+        startup_sync_state: startupTraktSyncState,
+      }, 'board.tmdb_up_next');
+      return;
+    }
+    const refreshDelayMs = startupTraktSyncState === 'pending'
+      ? UP_NEXT_PENDING_SYNC_GRACE_MS
+      : UP_NEXT_SETTLED_REFRESH_DELAY_MS;
     if (
       continueWatchingViewFingerprint === continueRefreshFingerprint
       && continueWatchingViewUpdatedAt > 0
       && Date.now() - continueWatchingViewUpdatedAt < CONTINUE_VIEW_REFRESH_TTL_MS
     ) {
+      if (import.meta.env.DEV) {
+        logger.debug('board.up_next_refresh.skipped', '[TMDB Up Next] Refresh skipped for fresh view cache', {
+          status: 'skipped',
+          reason: 'fresh_view_cache',
+          startup_sync_state: startupTraktSyncState,
+          view_cache_age_ms: Date.now() - continueWatchingViewUpdatedAt,
+          view_cache_ttl_ms: CONTINUE_VIEW_REFRESH_TTL_MS,
+        }, 'board.tmdb_up_next');
+      }
       return;
     }
 
@@ -572,6 +604,7 @@ const Board: React.FC = () => {
     ): Promise<{
       nextEpisode: { season: number; episode: number } | null;
       cacheHit: boolean;
+      cacheState: 'not_checked' | 'miss' | 'hit_episode' | 'hit_no_result' | 'invalid_episode';
       seasonListLookups: number;
       episodeListLookups: number;
       candidateSeasonCount: number;
@@ -587,6 +620,7 @@ const Board: React.FC = () => {
         return {
           nextEpisode: null,
           cacheHit: false,
+          cacheState: 'not_checked',
           seasonListLookups: 0,
           episodeListLookups: 0,
           candidateSeasonCount: 0,
@@ -608,6 +642,7 @@ const Board: React.FC = () => {
         return {
           nextEpisode: null,
           cacheHit: true,
+          cacheState: 'hit_no_result',
           seasonListLookups: 0,
           episodeListLookups: 0,
           candidateSeasonCount: 0,
@@ -632,6 +667,7 @@ const Board: React.FC = () => {
         return {
           nextEpisode: cachedEpisode,
           cacheHit: true,
+          cacheState: 'hit_episode',
           seasonListLookups: 0,
           episodeListLookups: 0,
           candidateSeasonCount: 0,
@@ -642,6 +678,7 @@ const Board: React.FC = () => {
       let seasonListLookups = 0;
       let episodeListLookups = 0;
       let candidateSeasonCount = 0;
+      const cacheState = cachedResolution ? 'invalid_episode' : 'miss';
 
       try {
         seasonListLookups = 1;
@@ -684,6 +721,7 @@ const Board: React.FC = () => {
             return {
               nextEpisode: resolvedEpisode,
               cacheHit: false,
+              cacheState,
               seasonListLookups,
               episodeListLookups,
               candidateSeasonCount,
@@ -712,6 +750,7 @@ const Board: React.FC = () => {
           return {
             nextEpisode: null,
             cacheHit: false,
+            cacheState,
             seasonListLookups,
             episodeListLookups,
             candidateSeasonCount,
@@ -726,6 +765,7 @@ const Board: React.FC = () => {
         return {
           nextEpisode: null,
           cacheHit: false,
+          cacheState,
           seasonListLookups,
           episodeListLookups,
           candidateSeasonCount,
@@ -735,6 +775,7 @@ const Board: React.FC = () => {
         return {
           nextEpisode: null,
           cacheHit: false,
+          cacheState,
           seasonListLookups,
           episodeListLookups,
           candidateSeasonCount,
@@ -748,12 +789,26 @@ const Board: React.FC = () => {
       const watchedEpisodeKeys = new Set<string>();
       const watchedShows = new Map<number, {
         tmdbId: number;
+        title: string;
         lastWatchedAt: string;
         lastWatchedTime: number;
         latestSeason: number;
         latestEpisode: number;
       }>();
       const watchedMovieIds = new Set(watched.filter((item) => item.type === 'movie').map((item) => item.id));
+      const watchedShowTitles = new Map<number, string>();
+      for (const item of watched) {
+        if (item.type !== 'series') continue;
+        const tmdbId = parseTmdbId(item.id);
+        if (tmdbId !== null) watchedShowTitles.set(tmdbId, item.name);
+      }
+      for (const item of continueWatching) {
+        if (item.type !== 'series') continue;
+        const tmdbId = parseTmdbId(item.metaId);
+        if (tmdbId !== null && !watchedShowTitles.has(tmdbId)) {
+          watchedShowTitles.set(tmdbId, item.title);
+        }
+      }
 
       for (const [key, value] of Object.entries(watchedEpisodes)) {
         const parsed = parseWatchedEpisodeKey(key);
@@ -769,6 +824,7 @@ const Board: React.FC = () => {
         if (!current) {
           watchedShows.set(parsed.tmdbId, {
             tmdbId: parsed.tmdbId,
+            title: watchedShowTitles.get(parsed.tmdbId) ?? `TMDB ${parsed.tmdbId}`,
             lastWatchedAt: watchedAt,
             lastWatchedTime: watchedTime,
             latestSeason: parsed.season,
@@ -827,6 +883,8 @@ const Board: React.FC = () => {
         candidate_count: upNextCandidates.length,
         resume_show_count: resumeShowIds.size,
         refresh_generation: refreshGeneration,
+        startup_sync_state: startupTraktSyncState,
+        settle_delay_ms: refreshDelayMs,
       }, 'board.tmdb_up_next');
 
       if (isCurrentRefresh()) {
@@ -844,6 +902,7 @@ const Board: React.FC = () => {
         show: typeof upNextCandidates[number];
         nextEpisode: { season: number; episode: number } | null;
         cacheHit: boolean;
+        cacheState: 'not_checked' | 'miss' | 'hit_episode' | 'hit_no_result' | 'invalid_episode';
         seasonListLookups: number;
         episodeListLookups: number;
         candidateSeasonCount: number;
@@ -915,6 +974,42 @@ const Board: React.FC = () => {
             show,
             ...resolution,
           });
+          if (import.meta.env.DEV) {
+            const resolutionStatus = !isCurrentRefresh()
+              ? 'cancelled'
+              : resolution.failed
+                ? 'failed'
+                : resolution.cacheHit
+                  ? 'cache_hit'
+                  : resolution.nextEpisode
+                    ? 'resolved'
+                    : 'no_result';
+            logger.debug('board.up_next_title.resolved', '[TMDB Up Next] Title resolution recorded', {
+              request_id: refreshRequestId,
+              status: resolutionStatus,
+              title: show.title,
+              tmdb_id: show.tmdbId,
+              cache_key: `board:up-next:v3:${show.tmdbId}:s${show.latestSeason}:e${show.latestEpisode}`,
+              cache_state: resolution.cacheState,
+              cache_hit: resolution.cacheHit,
+              watched_season: show.latestSeason,
+              watched_episode: show.latestEpisode,
+              tmdb_lookup_attempted: resolution.seasonListLookups > 0 || resolution.episodeListLookups > 0,
+              season_list_lookups: resolution.seasonListLookups,
+              episode_list_lookups: resolution.episodeListLookups,
+              candidate_season_count: resolution.candidateSeasonCount,
+              resolved_season: resolution.nextEpisode?.season ?? null,
+              resolved_episode: resolution.nextEpisode?.episode ?? null,
+              series_status: resolution.seriesStatus ?? null,
+              in_production: resolution.inProduction ?? null,
+              next_episode_air_date: resolution.nextEpisodeAirDate ?? null,
+              no_result_cache_policy: resolution.noResultCachePolicy ?? null,
+              no_result_cache_ttl_hours: typeof resolution.noResultCacheTtlMs === 'number'
+                ? Math.round(resolution.noResultCacheTtlMs / (60 * 60 * 1000))
+                : null,
+              error_kind: resolution.errorKind ?? null,
+            }, 'board.tmdb_up_next');
+          }
         }
       });
       await Promise.all(workers);
@@ -1026,13 +1121,13 @@ const Board: React.FC = () => {
           error_kind: error instanceof Error ? error.name : 'UnknownError',
         }, 'board.tmdb_up_next');
       });
-    }, 1200);
+    }, refreshDelayMs);
 
     return () => {
       cancelled = true;
       window.clearTimeout(refreshTimeout);
     };
-  }, [continueRefreshFingerprint, continueWatching, continueWatchingViewFingerprint, continueWatchingViewUpdatedAt, loading, setContinueWatchingView, setContinueWatchingViewRefresh, watched, watchedEpisodes]);
+  }, [continueRefreshFingerprint, continueWatching, continueWatchingViewFingerprint, continueWatchingViewUpdatedAt, loading, setContinueWatchingView, setContinueWatchingViewRefresh, startupTraktSyncState, watched, watchedEpisodes]);
 
   const sortedContinueWatching = [...continueWatchingView].sort((a, b) => {
     if (!a.pausedAt && !b.pausedAt) return 0;

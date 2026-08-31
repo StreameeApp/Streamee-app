@@ -28,6 +28,26 @@ import {
 import { enrichTmdbItemsById } from '../services/tmdb';
 import { useStore, MetaPreview, ContinueWatchingItem, PendingTraktHistoryAction, PendingTraktWatchlistAction } from '../store';
 
+export type StartupTraktSyncState = 'pending' | 'running' | 'settled';
+
+let startupTraktSyncState: StartupTraktSyncState = 'pending';
+const startupTraktSyncListeners = new Set<() => void>();
+
+function setStartupTraktSyncState(state: StartupTraktSyncState): void {
+  if (startupTraktSyncState === state) return;
+  startupTraktSyncState = state;
+  startupTraktSyncListeners.forEach((listener) => listener());
+}
+
+export function getStartupTraktSyncState(): StartupTraktSyncState {
+  return startupTraktSyncState;
+}
+
+export function subscribeStartupTraktSyncState(listener: () => void): () => void {
+  startupTraktSyncListeners.add(listener);
+  return () => startupTraktSyncListeners.delete(listener);
+}
+
 function mergeContinueWatching(
   local: ContinueWatchingItem[],
   remote: ContinueWatchingItem[],
@@ -1327,55 +1347,60 @@ function showSyncToast(result: SyncResult, onConflict?: (msg: string) => void): 
 }
 
 export async function autoSyncOnStart(onConflict?: (msg: string) => void): Promise<void> {
+  setStartupTraktSyncState('running');
   try {
-    if (!(await hasTraktAccess())) return;
-  } catch (error) {
-    const authResult: SyncResult = { success: false, conflicts: [], warnings: [] };
-    if (applyRateLimitFailure(authResult, error)) {
-      showSyncToast(authResult, onConflict);
-      onConflict?.(`Trakt asked Streamee to wait until ${new Date(authResult.retryAt!).toLocaleTimeString()}.`);
-    } else {
-      console.error(
-        '[Sync] Unable to verify Trakt access on startup:',
-        getTraktErrorDiagnostics(error)
-      );
-    }
-    return;
-  }
-
-  const store = useStore.getState();
-  const hasStartupPushBaseline = localStorage.getItem(TRAKT_STARTUP_BASELINE_KEY) === 'true';
-  const hasPendingStartupPush =
-    !hasStartupPushBaseline ||
-    store.pendingTraktHistory.length > 0 ||
-    store.pendingTraktWatchlist.length > 0 ||
-    store.continueWatching.some((item) => item.progress >= 80);
-
-  if (hasPendingStartupPush) {
-    console.log('[Sync] Pushing pending local changes to Trakt...');
-    const pushResult = await syncToTrakt();
-    if (pushResult.success) {
-      console.log('[Sync] Pending local changes pushed to Trakt successfully');
-      localStorage.setItem(TRAKT_STARTUP_BASELINE_KEY, 'true');
-    } else {
-      console.warn('[Sync] Some pending local changes failed to push to Trakt');
-      showSyncToast(pushResult, onConflict);
-      onConflict?.('Trakt push was not completed. Local changes were kept for the next retry.');
+    try {
+      if (!(await hasTraktAccess())) return;
+    } catch (error) {
+      const authResult: SyncResult = { success: false, conflicts: [], warnings: [] };
+      if (applyRateLimitFailure(authResult, error)) {
+        showSyncToast(authResult, onConflict);
+        onConflict?.(`Trakt asked Streamee to wait until ${new Date(authResult.retryAt!).toLocaleTimeString()}.`);
+      } else {
+        console.error(
+          '[Sync] Unable to verify Trakt access on startup:',
+          getTraktErrorDiagnostics(error)
+        );
+      }
       return;
     }
-  } else {
-    console.log('[Sync] No pending local changes; skipping startup push');
-  }
-  
-  console.log('[Sync] Pulling from Trakt...');
-  const result = await syncFromTrakt(onConflict, { fullHistory: false });
-  if (result.success) {
-    showSyncToast(result, onConflict);
-  } else {
-    showSyncToast(result, onConflict);
-    onConflict?.(result.retryAt
-      ? `Trakt asked Streamee to wait until ${new Date(result.retryAt).toLocaleTimeString()}.`
-      : 'Trakt sync failed. Local data was left unchanged and will retry later.');
+
+    const store = useStore.getState();
+    const hasStartupPushBaseline = localStorage.getItem(TRAKT_STARTUP_BASELINE_KEY) === 'true';
+    const hasPendingStartupPush =
+      !hasStartupPushBaseline ||
+      store.pendingTraktHistory.length > 0 ||
+      store.pendingTraktWatchlist.length > 0 ||
+      store.continueWatching.some((item) => item.progress >= 80);
+
+    if (hasPendingStartupPush) {
+      console.log('[Sync] Pushing pending local changes to Trakt...');
+      const pushResult = await syncToTrakt();
+      if (pushResult.success) {
+        console.log('[Sync] Pending local changes pushed to Trakt successfully');
+        localStorage.setItem(TRAKT_STARTUP_BASELINE_KEY, 'true');
+      } else {
+        console.warn('[Sync] Some pending local changes failed to push to Trakt');
+        showSyncToast(pushResult, onConflict);
+        onConflict?.('Trakt push was not completed. Local changes were kept for the next retry.');
+        return;
+      }
+    } else {
+      console.log('[Sync] No pending local changes; skipping startup push');
+    }
+
+    console.log('[Sync] Pulling from Trakt...');
+    const result = await syncFromTrakt(onConflict, { fullHistory: false });
+    if (result.success) {
+      showSyncToast(result, onConflict);
+    } else {
+      showSyncToast(result, onConflict);
+      onConflict?.(result.retryAt
+        ? `Trakt asked Streamee to wait until ${new Date(result.retryAt).toLocaleTimeString()}.`
+        : 'Trakt sync failed. Local data was left unchanged and will retry later.');
+    }
+  } finally {
+    setStartupTraktSyncState('settled');
   }
 }
 

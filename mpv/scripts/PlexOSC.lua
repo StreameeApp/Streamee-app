@@ -147,12 +147,13 @@ local osc_param = { -- calculated by osc_init()
 local osc_styles = {
     TransBg = '{\\blur100\\bord150\\1c&H000000&\\3c&H000000&}',
     SeekbarBg = '{\\blur0\\bord0\\1c&H2A2A2A&}',
+    SeekbarSegmentGap = '{\\blur0\\bord0\\1c&H000000&}',
     SeekbarFg = '{\\blur1\\bord1\\1c&H356BFF&}',
     SeekbarHandle = '{\\blur0\\bord1\\1c&H356BFF&\\3c&HF3F3F3&}',
     SeekbarChapterA = '{\\blur0\\bord0\\1c&H356BFF&}',
-    SeekbarChapterB = '{\\blur0\\bord0\\1c&H244BC9&}',
-    SeekbarChapterDimA = '{\\blur0\\bord0\\1c&H1F2124&}',
-    SeekbarChapterDimB = '{\\blur0\\bord0\\1c&H191A1C&}',
+    SeekbarChapterB = '{\\blur0\\bord0\\1c&H163AB8&}',
+    SeekbarChapterDimA = '{\\blur0\\bord0\\1c&H403B38&}',
+    SeekbarChapterDimB = '{\\blur0\\bord0\\1c&H262220&}',
     SeekbarChapterSpecial = '{\\blur0\\bord0\\1c&HFFFFFF&}',
     SeekbarChapterSpecialDim = '{\\blur0\\bord0\\1c&HFFFFFF&}',
     SeekbarCached = '{\\blur0\\bord0.7\\1c&H243F8C&\\3c&H2F56C2&}',
@@ -1197,6 +1198,42 @@ function render_elements(master_ass)
 
             elem_ass:draw_stop()
 
+            local segment_gap = math.max(0, slider_lo.segment_gap or 0)
+            if segment_gap > 0 and (has_segments or has_semantic_segments) then
+                local boundaries = {}
+                local function add_segment_boundaries(segment)
+                    for _, boundary in ipairs({segment.start, segment.finish}) do
+                        if boundary > 0 and boundary < elem_geo.w then
+                            boundaries[math.floor(boundary * 10 + 0.5)] = boundary
+                        end
+                    end
+                end
+                for _, segment in ipairs(segments) do add_segment_boundaries(segment) end
+                for _, segment in ipairs(semantic_segments) do add_segment_boundaries(segment) end
+
+                elem_ass:new_event()
+                elem_ass:pos(element.hitbox.x1, element.hitbox.y1)
+                elem_ass:an(7)
+                elem_ass:append(slider_lo.segment_gap_style or osc_styles.SeekbarBg)
+                ass_append_alpha(
+                    elem_ass,
+                    element.layout.alpha,
+                    slider_lo.segment_gap_alpha or 0
+                )
+                elem_ass:draw_start()
+                elem_ass:rect_cw(0, 0, elem_geo.w, elem_geo.h)
+                elem_ass:rect_ccw(0, 0, elem_geo.w, elem_geo.h)
+                for _, boundary in pairs(boundaries) do
+                    elem_ass:rect_cw(
+                        boundary - segment_gap / 2,
+                        0,
+                        boundary + segment_gap / 2,
+                        elem_geo.h
+                    )
+                end
+                elem_ass:draw_stop()
+            end
+
             if (has_segments or has_semantic_segments) and xp then
                 elem_ass:new_event()
                 elem_ass:pos(element.hitbox.x1, element.hitbox.y1)
@@ -1757,6 +1794,9 @@ layouts = function ()
 	lo.mouse_hitbox_height = 24
 	lo.style = osc_styles.SeekbarFg
     lo.slider.gap = 0
+    lo.slider.segment_gap = 3
+    lo.slider.segment_gap_style = osc_styles.SeekbarSegmentGap
+    lo.slider.segment_gap_alpha = 0
     lo.slider.square_handle = true
     lo.slider.square_ranges = true
     lo.slider.handle_style = osc_styles.SeekbarHandle

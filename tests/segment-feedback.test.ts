@@ -5,6 +5,7 @@ import test from 'node:test';
 const detector = readFileSync('src-tauri/src/intro_skipper.rs', 'utf8');
 const mpvIpc = readFileSync('src-tauri/src/mpv_ipc.rs', 'utf8');
 const player = readFileSync('src/renderer/features/player/Player.tsx', 'utf8');
+const feedback = readFileSync('src/renderer/services/segment-feedback.ts', 'utf8');
 const tauri = readFileSync('src/renderer/services/tauri.ts', 'utf8');
 const osc = readFileSync('mpv/scripts/PlexOSC.lua', 'utf8');
 
@@ -33,7 +34,29 @@ test('feedback prompting is bounded and does not treat timeouts as negative feed
   assert.match(player, /segmentFeedbackPromptedKeys\.has\(slotKey\)/);
   assert.match(player, /segmentFeedbackSeekSuppressedUntil = Date\.now\(\) \+ 10_000/);
   assert.match(player, /if \(payload\.response === 'dismissed'\) return;/);
-  assert.match(player, /SEGMENT_FEEDBACK_STORAGE_LIMIT = 400/);
+  assert.match(feedback, /SEGMENT_FEEDBACK_STORAGE_LIMIT = 400/);
   assert.match(player, /candidate\.kind === 'intro'[\s\S]*seekTime\(candidate\.end_sec/);
   assert.match(player, /const advanced = await handleSmartNextRequest\(active\.filename\)/);
+});
+
+test('shadow learning stays non-acting and emits correlation-friendly diagnostics', () => {
+  assert.match(player, /segment_feedback\.prompt_shown/);
+  assert.match(player, /segment_feedback\.response_received/);
+  assert.match(player, /segment_feedback\.shadow_promoted/);
+  assert.match(player, /segment_feedback\.shadow_would_act/);
+  assert.match(player, /action: 'none-shadow-only'/);
+  assert.match(player, /request_id: payload\.request_id/);
+  assert.match(player, /candidate_id: active\.key/);
+  assert.doesNotMatch(player, /shadow_would_act[\s\S]{0,1200}(seekTime|handleSmartNextRequest)/);
+});
+
+test('chapter fallback decision is logged only when a real scan starts', () => {
+  assert.equal(
+    player.match(/Remote data incomplete; local chapter scan started/g)?.length,
+    1,
+  );
+  assert.match(
+    player,
+    /if \(chapterLookupKey !== key \|\| !chapterLookupPromise\)[\s\S]{0,400}Remote data incomplete; local chapter scan started/,
+  );
 });

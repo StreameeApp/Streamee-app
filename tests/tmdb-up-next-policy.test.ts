@@ -18,6 +18,10 @@ const loggerSource = fs.readFileSync(
   new URL('../src/renderer/services/logger.ts', import.meta.url),
   'utf8',
 );
+const traktSyncSource = fs.readFileSync(
+  new URL('../src/renderer/services/trakt-sync.ts', import.meta.url),
+  'utf8',
+);
 
 test('Up Next applies the tested status-aware cache policy and logs its decision', () => {
   assert.match(boardSource, /board:up-next:v3:/);
@@ -46,6 +50,28 @@ test('cancelled Up Next scans retain enough counters and reason to explain Worke
   assert.match(boardSource, /if \(!boardMountedRef\.current\) return 'board_unmounted'/);
   assert.match(boardSource, /logCancelledRefresh\('candidate_resolution'\)/);
   assert.match(boardSource, /logCancelledRefresh\('metadata_enrichment'\)/);
+});
+
+test('Up Next waits for startup Trakt sync to settle before scanning', () => {
+  assert.match(traktSyncSource, /export type StartupTraktSyncState = 'pending' \| 'running' \| 'settled'/);
+  assert.match(traktSyncSource, /setStartupTraktSyncState\('running'\)/);
+  assert.match(traktSyncSource, /finally \{\s*setStartupTraktSyncState\('settled'\)/);
+  assert.match(boardSource, /useSyncExternalStore\(\s*subscribeStartupTraktSyncState/);
+  assert.match(boardSource, /if \(startupTraktSyncState === 'running'\)/);
+  assert.match(boardSource, /board\.up_next_refresh\.deferred/);
+  assert.match(boardSource, /UP_NEXT_PENDING_SYNC_GRACE_MS = 5_000/);
+  assert.match(boardSource, /UP_NEXT_SETTLED_REFRESH_DELAY_MS = 1_200/);
+});
+
+test('DEV Up Next diagnostics identify every title cache decision and lookup boundary', () => {
+  assert.match(boardSource, /if \(import\.meta\.env\.DEV\) \{\s*logger\.debug\('board\.up_next_refresh\.skipped'/);
+  assert.match(boardSource, /if \(import\.meta\.env\.DEV\) \{[\s\S]*board\.up_next_title\.resolved/);
+  assert.match(boardSource, /title: show\.title/);
+  assert.match(boardSource, /cache_key: `board:up-next:v3:/);
+  assert.match(boardSource, /cache_state: resolution\.cacheState/);
+  assert.match(boardSource, /tmdb_lookup_attempted: resolution\.seasonListLookups > 0 \|\| resolution\.episodeListLookups > 0/);
+  assert.match(boardSource, /season_list_lookups: resolution\.seasonListLookups/);
+  assert.match(boardSource, /episode_list_lookups: resolution\.episodeListLookups/);
 });
 
 test('Up Next gets lifecycle metadata with the existing TV details lookup', () => {

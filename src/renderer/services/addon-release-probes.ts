@@ -17,7 +17,7 @@ import {
   shouldProbeAddonReleaseQuality,
 } from './xrel';
 
-const STORAGE_KEY = 'streamee-addon-release-probes-v1';
+const STORAGE_KEY = 'streamee-addon-release-probes-v2';
 const SUCCESS_FRESH_MS = 24 * 60 * 60 * 1000;
 const EMPTY_FRESH_MS = 12 * 60 * 60 * 1000;
 const MIN_PROVIDER_RETRY_MS = 5 * 60 * 1000;

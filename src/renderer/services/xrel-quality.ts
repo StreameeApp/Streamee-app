@@ -1,6 +1,8 @@
 export type XrelQualityLabel =
+  | 'WORKPRINT'
   | 'CAM'
   | 'TS'
+  | 'TC'
   | 'SCREENER'
   | 'SD'
   | 'WEB'
@@ -53,9 +55,14 @@ export function classifyXrelRelease(
   release: XrelReleaseForClassification
 ): XrelQuality | null {
   const text = releaseText(release);
-  const hasCam = /(?:^|[. _-])(?:HD[- ]?)?CAM(?:RIP)?(?:[. _-]|$)/.test(text);
-  const hasTelesync = /(?:^|[. _-])(?:HD[- ]?)?(?:TS|TELESYNC)(?:[. _-]|$)/.test(text);
-  const hasScreener = /(?:^|[. _-])(?:DVD|WEB)?SCREENER(?:[. _-]|$)|(?:^|[. _-])SCR(?:[. _-]|$)/.test(text);
+  const isTrailer = /(?:^|[. _-])TRAILER(?:S|\d+)?(?:[. _-]|$)/.test(text);
+  if (isTrailer) return null;
+
+  const hasWorkprint = /(?:^|[. _-])(?:WORK[. _-]?PRINT|WP)(?:[. _-]|$)/.test(text);
+  const hasCam = /(?:^|[. _-])(?:HD|HQ)?[. _-]?CAM(?:[. _-]?RIP)?(?:[. _-]|$)/.test(text);
+  const hasTelesync = /(?:^|[. _-])(?:HD|HQ)?[. _-]?(?:TS|TELE[. _-]?SYNC)(?:[. _-]|$)/.test(text);
+  const hasTelecine = /(?:^|[. _-])(?:HD|HQ)?[. _-]?(?:TC|TELE[. _-]?CINE)(?:[. _-]|$)/.test(text);
+  const hasScreener = /(?:^|[. _-])(?:(?:DVD|WEB|BD|BLU[. _-]?RAY)[. _-]?)?(?:SCREENER|SCR)(?:[. _-]|$)/.test(text);
 
   const codec = /(?:^|[. _-])AV1(?:[. _-]|$)/.test(text)
     ? 'AV1'
@@ -76,8 +83,10 @@ export function classifyXrelRelease(
             ? 'Dolby Digital Plus'
             : undefined;
 
+  if (hasWorkprint) return { label: 'WORKPRINT', rank: 5, source: 'Workprint', codec, audio };
   if (hasCam) return { label: 'CAM', rank: 10, source: 'CAM', codec, audio };
   if (hasTelesync) return { label: 'TS', rank: 20, source: 'Telesync', codec, audio };
+  if (hasTelecine) return { label: 'TC', rank: 25, source: 'Telecine', codec, audio };
   if (hasScreener) return { label: 'SCREENER', rank: 30, source: 'Screener', codec, audio };
 
   const isDolbyVision = /(?:^|[. _-])(?:DV|DOVI)(?:[. _-]|$)|DOLBY[. _-]?VISION/.test(text);

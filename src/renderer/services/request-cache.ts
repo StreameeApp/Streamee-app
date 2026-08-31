@@ -43,10 +43,24 @@ function openPersistentCacheDatabase(): Promise<IDBDatabase> {
 async function readPersistentRequest(key: string): Promise<PersistentRequestCacheEntry | null> {
   const database = await openPersistentCacheDatabase();
   return new Promise((resolve, reject) => {
-    const transaction = database.transaction(PERSISTENT_CACHE_STORE, 'readonly');
-    const request = transaction.objectStore(PERSISTENT_CACHE_STORE).get(key);
-    request.onsuccess = () => resolve((request.result as PersistentRequestCacheEntry | undefined) ?? null);
+    const transaction = database.transaction(PERSISTENT_CACHE_STORE, 'readwrite');
+    const store = transaction.objectStore(PERSISTENT_CACHE_STORE);
+    const request = store.get(key);
+    const now = Date.now();
+    let result: PersistentRequestCacheEntry | null = null;
+
+    request.onsuccess = () => {
+      const entry = (request.result as PersistentRequestCacheEntry | undefined) ?? null;
+      result = entry;
+      if (entry && entry.expiresAt > now && entry.storedAt < now) {
+        result = { ...entry, storedAt: now };
+        store.put(result);
+      }
+    };
     request.onerror = () => reject(request.error ?? new Error('Could not read the response cache.'));
+    transaction.oncomplete = () => resolve(result);
+    transaction.onerror = () => reject(transaction.error ?? new Error('Could not refresh response cache recency.'));
+    transaction.onabort = () => reject(transaction.error ?? new Error('Response cache recency update was aborted.'));
   });
 }
 

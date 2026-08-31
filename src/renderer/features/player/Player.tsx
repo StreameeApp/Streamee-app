@@ -36,6 +36,15 @@ import {
   shouldAutoSkipIntroDbSegment,
   validateIntroDbSegment,
 } from '../../services/introdb';
+import { logger } from '../../services/logger';
+import {
+  buildSegmentFeedbackKey,
+  evaluateSegmentFeedbackShadowMatch,
+  hasStoredSegmentFeedback,
+  readStoredSegmentFeedback,
+  storeSegmentFeedback,
+  type SegmentFeedbackContext,
+} from '../../services/segment-feedback';
 import type { IntroDbSegment, IntroDbSegments, IntroSkipperDetectionResult, PlayerChapterSegments, PlayerDetectedSegment, PlayerPlaylistChangedPayload, PlayerSegmentFeedbackPayload, PreparedQbittorrentStreamResult, SegmentFeedbackCandidate, StreamLaunchResult, StreamPlaylistItem, SubtitleProgressEvent, SubtitleSegment, TorrentStartupState } from '../../services/tauri';
 import './Player.css';
 
@@ -148,46 +157,7 @@ const LOCAL_INTRO_MAX_FAILURE_RETRIES = 30;
 const LOCAL_INTRO_SLOW_RETRY_MS = 60_000;
 const SEGMENT_ACTION_RETRY_MS = 1_000;
 const OUTRO_SMART_NEXT_RETRY_MS = 15_000;
-const SEGMENT_FEEDBACK_STORAGE_KEY = 'streamee:segment-feedback:v1';
-const SEGMENT_FEEDBACK_STORAGE_LIMIT = 400;
 const localIntroPlaybackMax = new Map<string, number>();
-
-type StoredSegmentFeedback = {
-  key: string;
-  response: 'yes' | 'no' | 'not-sure';
-  candidate: SegmentFeedbackCandidate;
-  recordedAt: string;
-};
-
-const readStoredSegmentFeedback = (): StoredSegmentFeedback[] => {
-  try {
-    const parsed = JSON.parse(window.localStorage.getItem(SEGMENT_FEEDBACK_STORAGE_KEY) || '[]');
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-};
-
-const hasStoredSegmentFeedback = (key: string): boolean => (
-  readStoredSegmentFeedback().some((entry) => entry?.key === key)
-);
-
-const storeSegmentFeedback = (
-  key: string,
-  response: StoredSegmentFeedback['response'],
-  candidate: SegmentFeedbackCandidate,
-): void => {
-  const retained = readStoredSegmentFeedback().filter((entry) => entry?.key !== key);
-  retained.push({ key, response, candidate, recordedAt: new Date().toISOString() });
-  try {
-    window.localStorage.setItem(
-      SEGMENT_FEEDBACK_STORAGE_KEY,
-      JSON.stringify(retained.slice(-SEGMENT_FEEDBACK_STORAGE_LIMIT)),
-    );
-  } catch {
-    // Feedback is optional; private/limited-storage sessions must not affect playback.
-  }
-};
 
 const isAiredEpisode = (airDate: string | null): boolean => {
   if (!airDate) return false;
@@ -1704,12 +1674,14 @@ const Player: React.FC = () => {
     const segmentDetectionLoggedKeys = new Set<string>();
     const segmentDecisionLoggedKeys = new Set<string>();
     const segmentFeedbackPromptedKeys = new Set<string>();
+    const segmentFeedbackShadowLoggedKeys = new Set<string>();
     let segmentFeedbackRequestSequence = Date.now();
     let segmentFeedbackSeekSuppressedUntil = 0;
     let activeSegmentFeedbackPrompt: {
       requestId: number;
       key: string;
       candidate: SegmentFeedbackCandidate;
+      context: SegmentFeedbackContext;
       filename: string;
     } | null = null;
     let lastPublishedDetectedSegmentsSignature = '';
@@ -2740,7 +2712,7 @@ const Player: React.FC = () => {
       };
       const maybeShowSegmentFeedbackPrompt = async (
         candidate: SegmentFeedbackCandidate | null,
-        localPlaybackKey: string,
+        context: SegmentFeedbackContext,
         filename: string,
         playbackTime: number,
       ) => {
@@ -2754,14 +2726,31 @@ const Player: React.FC = () => {
         ) {
           return;
         }
-        const slotKey = `${localPlaybackKey}:${candidate.kind}`;
-        const feedbackKey = [
-          slotKey,
-          candidate.source,
-          candidate.reason,
-          Math.round(candidate.start_sec * 2) / 2,
-          Math.round(candidate.end_sec * 2) / 2,
-        ].join(':');
+        const slotKey = `${context.seriesKey.toLowerCase()}:${context.season}:${context.episode}:${candidate.kind}`;
+        const feedbackKey = buildSegmentFeedbackKey(context, candidate);
+        const priorFeedback = readStoredSegmentFeedback();
+        const shadowMatch = evaluateSegmentFeedbackShadowMatch(priorFeedback, context, candidate);
+        if (
+          shadowMatch.status === 'shadow-promoted'
+          && !segmentFeedbackShadowLoggedKeys.has(feedbackKey)
+        ) {
+          segmentFeedbackShadowLoggedKeys.add(feedbackKey);
+          logger.info('segment_feedback.shadow_would_act', '[Segment Feedback] Shadow pattern matched', {
+            candidate_id: feedbackKey,
+            series_key: context.seriesKey,
+            season: context.season,
+            episode: context.episode,
+            kind: candidate.kind,
+            provider: candidate.source,
+            reason: candidate.reason,
+            position_seconds: shadowMatch.positionSeconds,
+            learned_position_seconds: shadowMatch.learnedPositionSeconds,
+            tolerance_seconds: shadowMatch.toleranceSeconds,
+            supporting_episode_count: shadowMatch.episodeCount,
+            promotion_status: shadowMatch.status,
+            action: 'none-shadow-only',
+          }, 'segment_feedback');
+        }
         if (
           segmentFeedbackPromptedKeys.has(slotKey)
           || hasStoredSegmentFeedback(feedbackKey)
@@ -2775,6 +2764,7 @@ const Player: React.FC = () => {
           requestId,
           key: feedbackKey,
           candidate,
+          context,
           filename,
         };
         segmentFeedbackPromptedKeys.add(slotKey);
@@ -2784,15 +2774,20 @@ const Player: React.FC = () => {
             candidate.kind,
             segmentFeedbackSourceLabel(candidate),
           );
-          console.log('[Segment Feedback] Prompt shown', {
-            requestId,
+          logger.info('segment_feedback.prompt_shown', '[Segment Feedback] Prompt shown', {
+            request_id: requestId,
+            candidate_id: feedbackKey,
+            series_key: context.seriesKey,
+            season: context.season,
+            episode: context.episode,
             kind: candidate.kind,
-            start: candidate.start_sec,
-            end: candidate.end_sec,
-            source: candidate.source,
+            start_seconds: candidate.start_sec,
+            end_seconds: candidate.end_sec,
+            provider: candidate.source,
             reason: candidate.reason,
             score: candidate.score,
-          });
+            promotion_status: shadowMatch.status,
+          }, 'segment_feedback');
         } catch (error) {
           if (activeSegmentFeedbackPrompt?.requestId === requestId) {
             activeSegmentFeedbackPrompt = null;
@@ -2807,17 +2802,62 @@ const Player: React.FC = () => {
         activeSegmentFeedbackPrompt = null;
 
         const { candidate } = active;
-        console.log('[Segment Feedback] Response received', {
-          requestId: payload.request_id,
+        logger.info('segment_feedback.response_received', '[Segment Feedback] Response received', {
+          request_id: payload.request_id,
+          candidate_id: active.key,
+          series_key: active.context.seriesKey,
+          season: active.context.season,
+          episode: active.context.episode,
           response: payload.response,
           kind: candidate.kind,
-          start: candidate.start_sec,
-          end: candidate.end_sec,
-          source: candidate.source,
+          start_seconds: candidate.start_sec,
+          end_seconds: candidate.end_sec,
+          provider: candidate.source,
           reason: candidate.reason,
-        });
+          status: payload.response === 'yes'
+            ? 'confirmed'
+            : payload.response === 'no'
+              ? 'rejected'
+              : payload.response,
+        }, 'segment_feedback');
         if (payload.response === 'dismissed') return;
-        storeSegmentFeedback(active.key, payload.response, candidate);
+        const priorFeedback = readStoredSegmentFeedback();
+        const previousShadowMatch = evaluateSegmentFeedbackShadowMatch(
+          priorFeedback,
+          active.context,
+          candidate,
+        );
+        const nextFeedback = storeSegmentFeedback(
+          active.key,
+          payload.response,
+          candidate,
+          active.context,
+        );
+        const nextShadowMatch = evaluateSegmentFeedbackShadowMatch(
+          nextFeedback,
+          active.context,
+          candidate,
+        );
+        if (
+          payload.response === 'yes'
+          && previousShadowMatch.status === 'insufficient'
+          && nextShadowMatch.status === 'shadow-promoted'
+        ) {
+          logger.info('segment_feedback.shadow_promoted', '[Segment Feedback] Pattern entered shadow promotion', {
+            request_id: payload.request_id,
+            candidate_id: active.key,
+            series_key: active.context.seriesKey,
+            season: active.context.season,
+            episode: active.context.episode,
+            kind: candidate.kind,
+            provider: candidate.source,
+            learned_position_seconds: nextShadowMatch.learnedPositionSeconds,
+            tolerance_seconds: nextShadowMatch.toleranceSeconds,
+            supporting_episode_count: nextShadowMatch.episodeCount,
+            promotion_status: nextShadowMatch.status,
+            action: 'none-shadow-only',
+          }, 'segment_feedback');
+        }
 
         if (payload.response === 'no') {
           showSmartNextMessage(`Thanks — this ${candidate.kind} candidate will be ignored.`, 3500);
@@ -2906,11 +2946,18 @@ const Player: React.FC = () => {
       const getChapterSegments = async (
         episodeKey: string,
         duration: number,
+        scanContext: {
+          season: number;
+          episode: number;
+          missingIntro: boolean;
+          missingRecap: boolean;
+          missingOutro: boolean;
+        },
       ): Promise<PlayerChapterSegments | null> => {
         const key = `${episodeKey}:${Math.round(duration * 1_000)}`;
         if (chapterLookupKey !== key || !chapterLookupPromise) {
           chapterLookupKey = key;
-          console.debug('[Segment Detection][Local] Chapter scan started');
+          console.debug('[Segment Detection] Remote data incomplete; local chapter scan started', scanContext);
           chapterLookupPromise = window.electronAPI.introDb.detectChapters(duration)
             .then((segments) => {
               console.debug('[Segment Detection][Local] Chapter scan complete', {
@@ -3480,14 +3527,13 @@ const Player: React.FC = () => {
         );
         if (needsLocalChapterScan) {
           localDetectionAttempted = true;
-          console.debug('[Segment Detection] Remote data incomplete; local chapter scan started', {
+          const chapters = await getChapterSegments(episodeKey, duration, {
             season: episode.season,
             episode: episode.episode,
             missingIntro: settings.introMode !== 'always-watch' && !resolvedIntro,
             missingRecap: settings.recapMode !== 'always-watch' && !resolvedRecap,
             missingOutro: settings.autoNextAtOutro && !resolvedOutro,
           });
-          const chapters = await getChapterSegments(episodeKey, duration);
           if (disposed || introDbLookupKey !== episodeKey) return;
           resolvedIntro ||= validateIntroDbSegment('intro', chapters?.intro ?? null, duration);
           resolvedRecap ||= validateIntroDbSegment('recap', chapters?.recap ?? null, duration);
@@ -3650,7 +3696,12 @@ const Player: React.FC = () => {
         if (!resolvedIntro) {
           await maybeShowSegmentFeedbackPrompt(
             introFeedbackCandidate,
-            localPlaybackKey,
+            {
+              seriesKey: seriesWatchKey,
+              season: episode.season,
+              episode: episode.episode,
+              duration,
+            },
             filename,
             playbackTime,
           );
@@ -3658,7 +3709,12 @@ const Player: React.FC = () => {
         if (!resolvedOutro) {
           await maybeShowSegmentFeedbackPrompt(
             outroFeedbackCandidate,
-            localPlaybackKey,
+            {
+              seriesKey: seriesWatchKey,
+              season: episode.season,
+              episode: episode.episode,
+              duration,
+            },
             filename,
             playbackTime,
           );

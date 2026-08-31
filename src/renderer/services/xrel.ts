@@ -9,6 +9,7 @@ import {
   type XrelQuality,
   type XrelQualityLabel,
 } from './xrel-quality.ts';
+import { getAddonReleaseQualityConsensus } from './addon-release-quality.ts';
 import { resolveTmdbImdbId } from './tmdb-identity.ts';
 
 const XREL_API_BASE = 'https://xrel-api.nfos.to/v2';
@@ -23,7 +24,8 @@ const XREL_BACKGROUND_QUEUE_STORAGE_KEY = 'streamee-xrel-background-queue-v1';
 const SRRDB_BACKGROUND_BUDGET_STORAGE_KEY = 'streamee-srrdb-background-budget-v1';
 const SRRDB_BACKGROUND_QUEUE_STORAGE_KEY = 'streamee-srrdb-background-queue-v1';
 const SRRDB_FEED_REFRESH_STORAGE_KEY = 'streamee-srrdb-feed-refresh-v1';
-const ADDON_RELEASE_PROBE_STORAGE_KEY = 'streamee-addon-release-probes-v1';
+const ADDON_RELEASE_PROBE_STORAGE_KEY = 'streamee-addon-release-probes-v2';
+const LEGACY_ADDON_RELEASE_PROBE_STORAGE_KEY = 'streamee-addon-release-probes-v1';
 const XREL_CACHE_STORAGE_KEY = 'streamee-xrel-release-quality-cache-v2';
 const XREL_LEGACY_CACHE_STORAGE_KEY = 'streamee-xrel-release-quality-cache-v1';
 const SHARED_STORAGE_BACKUP_KEY = 'streamee-shared-storage-backup-v1';
@@ -147,6 +149,7 @@ interface XrelTitleEntry extends Omit<XrelQualityBadge, 'matchMethod'> {
 interface XrelReleaseCache {
   version: 2;
   backgroundMatcherVersion: 4;
+  addonMatcherVersion: 2;
   fetchedAt: number;
   seenReleaseIds: string[];
   entries: XrelTitleEntry[];
@@ -240,6 +243,7 @@ type XrelBackgroundTimerMode = 'normal' | 'retry' | 'global';
 const EMPTY_CACHE: XrelReleaseCache = {
   version: 2,
   backgroundMatcherVersion: 4,
+  addonMatcherVersion: 2,
   fetchedAt: 0,
   seenReleaseIds: [],
   entries: [],
@@ -625,12 +629,16 @@ function parseCacheValue(stored: unknown): XrelReleaseCache | null {
         )),
       )
       : {};
+    const addonMatcherIsCurrent = parsed.addonMatcherVersion === 2;
     return {
       version: 2,
       backgroundMatcherVersion: 4,
+      addonMatcherVersion: 2,
       fetchedAt: typeof parsed.fetchedAt === 'number' ? parsed.fetchedAt : 0,
       seenReleaseIds: parsed.seenReleaseIds.filter((id): id is string => typeof id === 'string'),
-      entries: parsed.entries.flatMap(migrateCachedTitleEntry),
+      entries: parsed.entries
+        .flatMap(migrateCachedTitleEntry)
+        .filter((entry) => addonMatcherIsCurrent || entry.provider !== 'addon'),
       negativeLookups,
       preciseLookups: pruneXrelPreciseLookups(parsed.preciseLookups ?? {}, now),
       identityAliases: pruneXrelIdentityAliases(parsed.identityAliases ?? {}, now),
@@ -2155,31 +2163,25 @@ export function mergeAddonReleaseQualityObservations(
   const imdbId = resolvedImdbId(item);
   if (!imdbId || !/^tt\d+$/.test(imdbId)) return 0;
 
+  const consensus = getAddonReleaseQualityConsensus(item, observations, scope);
+  if (!consensus) return 0;
+
   const languagePreference = readLanguagePreference();
-  const releases: XrelRelease[] = observations.flatMap((observation, index) => {
-    const dirname = [observation.filename, observation.title, observation.description]
-      .filter((value, valueIndex, values): value is string => (
-        !!value && values.indexOf(value) === valueIndex
-      ))
-      .join(' ')
-      .trim();
-    if (!dirname) return [];
-    return [{
-      id: `addon:${imdbId}:${scope?.season ?? 'all'}:${scope?.episode ?? 'all'}:${index}`,
-      dirname,
-      time: Math.floor(Date.now() / 1000),
-      main_lang: languagePreference === 'german' ? 'de' : undefined,
-      flags: languagePreference === 'english' ? { english: true } : undefined,
-      tv_season: scope?.season,
-      tv_episode: scope?.episode,
-      ext_info: {
-        id: `addon:${imdbId}`,
-        type: item.type === 'movie' ? 'movie' : 'tv',
-        title: item.name,
-        uris: [`imdb:${imdbId}`],
-      },
-    }];
-  });
+  const releases: XrelRelease[] = [{
+    id: `addon:${imdbId}:${scope?.season ?? 'all'}:${scope?.episode ?? 'all'}:${consensus.quality.label}`,
+    dirname: consensus.dirname,
+    time: Math.floor(Date.now() / 1000),
+    main_lang: languagePreference === 'german' ? 'de' : undefined,
+    flags: languagePreference === 'english' ? { english: true } : undefined,
+    tv_season: scope?.season,
+    tv_episode: scope?.episode,
+    ext_info: {
+      id: `addon:${imdbId}`,
+      type: item.type === 'movie' ? 'movie' : 'tv',
+      title: item.name,
+      uris: [`imdb:${imdbId}`],
+    },
+  }];
   const classified = mergeReleases(releases, true, 'addon', 'background');
   if (classified > 0) {
     persistCache();
@@ -2266,6 +2268,7 @@ export function clearXrelReleaseCache(rebuild = false): void {
   localStorage.removeItem(XREL_LEGACY_CACHE_STORAGE_KEY);
   localStorage.removeItem(SRRDB_FEED_REFRESH_STORAGE_KEY);
   localStorage.removeItem(ADDON_RELEASE_PROBE_STORAGE_KEY);
+  localStorage.removeItem(LEGACY_ADDON_RELEASE_PROBE_STORAGE_KEY);
   rebuildIndexes();
   emitChange();
   if (rebuild && readEnabledSetting()) {
