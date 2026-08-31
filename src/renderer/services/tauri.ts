@@ -355,15 +355,33 @@ export interface IntroDbSegments {
   outro: IntroDbSegment | null;
 }
 
+export interface SegmentFeedbackCandidate {
+  kind: 'intro' | 'outro';
+  start_sec: number;
+  end_sec: number;
+  source: 'intro-skipper' | 'intro-skipper-outro' | 'chapter';
+  reason: string;
+  score: number | null;
+}
+
+export interface PlayerSegmentFeedbackPayload {
+  request_id: number;
+  response: 'yes' | 'no' | 'not-sure' | 'dismissed';
+  filename: string;
+  playlist_pos?: number;
+}
+
 export interface PlayerChapterSegments {
   intro: IntroDbSegment | null;
   recap: IntroDbSegment | null;
   outro: IntroDbSegment | null;
+  candidate: SegmentFeedbackCandidate | null;
   chapter_count: number;
 }
 
 export interface IntroSkipperDetectionResult {
   segment: IntroDbSegment | null;
+  candidate: SegmentFeedbackCandidate | null;
   status:
     | 'waiting-for-buffer'
     | 'waiting-for-local-cache'
@@ -419,6 +437,47 @@ export interface RifeInstallProgress {
   message: string;
   downloadedBytes: number;
   totalBytes: number;
+}
+
+export interface RifeEnginePreparationRequest {
+  model: string;
+  multiplier: number;
+  gpuStreams: number;
+  processingMode: string;
+  scale: string;
+  sourceResolution: '2160' | '1080' | '720';
+}
+
+export interface RifeEnginePreparationResult {
+  model: string;
+  scale: string;
+  sourceResolution: string;
+  message: string;
+}
+
+export interface RifeEnginePreparationProgress {
+  phase: 'preparing' | 'compiling' | 'complete' | 'cancelled' | 'error';
+  message: string;
+}
+
+export interface RifeCacheInfo {
+  path: string;
+  bytes: number;
+  fileCount: number;
+  engineCount: number;
+}
+
+export interface RifePlaybackStatus {
+  status: 'pending' | 'active' | 'failed';
+  pid: number;
+  multiplier: number;
+  filename?: string;
+  containerFps?: number | null;
+  outputFps?: number | null;
+  sustaining?: boolean | null;
+  inputVideo?: Record<string, unknown> | null;
+  outputVideo?: Record<string, unknown> | null;
+  message: string;
 }
 
 interface PreparedAddonStreamUrl {
@@ -701,6 +760,13 @@ const tauriAPI = {
     },
     showMessage: async (message: string, durationMs = 2500) => {
       await invoke('show_player_message', { message, durationMs });
+    },
+    showSegmentFeedbackPrompt: async (
+      requestId: number,
+      kind: 'intro' | 'outro',
+      source: string,
+    ) => {
+      await invoke('show_segment_feedback_prompt', { requestId, kind, source });
     },
     loadSubtitle: async (path: string) => {
       try {
@@ -1150,6 +1216,11 @@ const tauriAPI = {
         callback(event.payload);
       });
     },
+    onSegmentFeedback: async (callback: (data: PlayerSegmentFeedbackPayload) => void) => {
+      return await listen<PlayerSegmentFeedbackPayload>('player://segment-feedback', (event) => {
+        callback(event.payload);
+      });
+    },
     onAudioTrackChanged: async (callback: (data: { track_id: number | null }) => void) => {
       return await listen<{ track_id: number | null }>('player://audio-track-changed', (event) => {
         callback(event.payload);
@@ -1243,13 +1314,42 @@ const tauriAPI = {
     getRuntimeInfo: async (model: string) => {
       return await invoke<RifeRuntimeInfo>('get_rife_runtime_info', { model });
     },
+    getPlaybackStatus: async () => {
+      return await invoke<RifePlaybackStatus | null>('get_rife_playback_status');
+    },
+    getCacheInfo: async () => {
+      return await invoke<RifeCacheInfo>('get_rife_cache_info');
+    },
+    clearCache: async () => {
+      return await invoke<RifeCacheInfo>('clear_rife_cache');
+    },
     install: async (model: string) => {
       return await invoke<RifeRuntimeInfo>('install_rife_runtime', { model });
+    },
+    prepareEngine: async (request: RifeEnginePreparationRequest) => {
+      return await invoke<RifeEnginePreparationResult>('prepare_rife_engine', { request });
+    },
+    cancelEnginePreparation: async () => {
+      return await invoke<void>('cancel_rife_engine_preparation');
     },
     onInstallProgress: async (
       callback: (data: RifeInstallProgress) => void
     ): Promise<UnlistenFn> => {
       return await listen<RifeInstallProgress>('rife://install-progress', (event) => {
+        callback(event.payload);
+      });
+    },
+    onEnginePreparationProgress: async (
+      callback: (data: RifeEnginePreparationProgress) => void
+    ): Promise<UnlistenFn> => {
+      return await listen<RifeEnginePreparationProgress>('rife://engine-preparation-progress', (event) => {
+        callback(event.payload);
+      });
+    },
+    onPlaybackStatus: async (
+      callback: (data: RifePlaybackStatus) => void
+    ): Promise<UnlistenFn> => {
+      return await listen<RifePlaybackStatus>('rife://playback-status', (event) => {
         callback(event.payload);
       });
     },

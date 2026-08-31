@@ -25,8 +25,8 @@ use mpv_ipc::{
     get_playlist_info, load_file_replace_with_title, load_subtitle_file, playlist_add,
     playlist_next, playlist_prev, seek_absolute_time, set_detected_segments,
     set_media_title as set_mpv_media_title, set_player_track as set_mpv_player_track,
-    set_smart_next_available, show_player_message, start_player_observing, stop_player_observing,
-    PlayerDetectedSegment,
+    set_smart_next_available, show_player_message, show_segment_feedback_prompt,
+    start_player_observing, stop_player_observing, PlayerDetectedSegment,
 };
 use sha1::{Digest, Sha1};
 use tauri_plugin_store::StoreExt;
@@ -691,6 +691,44 @@ impl VideoUpscaler {
             Self::RtxVsr => "auto",
             Self::SSimSuperRes | Self::Fsr => "off",
         }
+    }
+}
+
+fn rife_filter_concurrency(
+    model: &str,
+    processing_mode: &str,
+    gpu_streams: u32,
+    requested: Option<&str>,
+) -> u32 {
+    if let Some(explicit) = requested.and_then(|value| value.parse::<u32>().ok()) {
+        if matches!(explicit, 1 | 2 | 4 | 6 | 8 | 12) {
+            return explicit;
+        }
+    }
+    if model == "4.6" && processing_mode == "auto" {
+        // Four queued frames per TensorRT stream keep the GPU fed without the
+        // latency, memory use, and discarded seek work of the old 12-frame queue.
+        4 * gpu_streams.clamp(1, 2)
+    } else {
+        4
+    }
+}
+
+#[cfg(test)]
+mod rife_launch_tests {
+    use super::rife_filter_concurrency;
+
+    #[test]
+    fn bounds_rife_queue_to_four_frames_per_active_stream() {
+        assert_eq!(rife_filter_concurrency("4.6", "auto", 1, None), 4);
+        assert_eq!(rife_filter_concurrency("4.6", "auto", 2, Some("auto")), 8);
+        assert_eq!(rife_filter_concurrency("4.6", "auto", 99, None), 8);
+        assert_eq!(rife_filter_concurrency("4.16-lite", "auto", 2, None), 4);
+        assert_eq!(rife_filter_concurrency("4.6", "native", 2, None), 4);
+        assert_eq!(rife_filter_concurrency("4.6", "auto", 2, Some("1")), 1);
+        assert_eq!(rife_filter_concurrency("4.6", "auto", 2, Some("6")), 6);
+        assert_eq!(rife_filter_concurrency("4.6", "auto", 2, Some("12")), 12);
+        assert_eq!(rife_filter_concurrency("4.6", "auto", 2, Some("3")), 8);
     }
 }
 
@@ -6332,11 +6370,62 @@ async fn get_rife_runtime_info(
 }
 
 #[tauri::command]
+fn get_rife_playback_status() -> Option<serde_json::Value> {
+    mpv_ipc::current_rife_playback_status()
+}
+
+#[tauri::command]
+fn get_rife_cache_info() -> Result<rife_runtime::RifeCacheInfo, String> {
+    rife_runtime::cache_info()
+}
+
+#[tauri::command]
+fn clear_rife_cache() -> Result<rife_runtime::RifeCacheInfo, String> {
+    let active_pid = mpv_ipc::active_player_pid();
+    if active_pid != 0 {
+        return Err(format!(
+            "Stop playback before clearing compiled RIFE engines (MPV process {active_pid} is active)"
+        ));
+    }
+    rife_runtime::clear_cache()
+}
+
+#[tauri::command]
 async fn install_rife_runtime(
     app: AppHandle,
     model: Option<String>,
 ) -> Result<rife_runtime::RifeRuntimeInfo, String> {
+    let active_pid = mpv_ipc::active_player_pid();
+    if active_pid != 0 {
+        return Err(format!(
+            "Stop playback before installing or repairing RIFE (MPV process {active_pid} is active)"
+        ));
+    }
     rife_runtime::install(app, model.unwrap_or_else(|| "4.6".to_string())).await
+}
+
+#[tauri::command]
+async fn prepare_rife_engine(
+    app: AppHandle,
+    request: rife_runtime::RifeEnginePreparationRequest,
+) -> Result<rife_runtime::RifeEnginePreparationResult, String> {
+    let active_pid = mpv_ipc::active_player_pid();
+    if active_pid != 0 {
+        return Err(format!(
+            "Stop playback before preparing a RIFE engine (MPV process {active_pid} is active)"
+        ));
+    }
+    let mpv_path = PathBuf::from(find_mpv(&app).ok_or_else(|| "MPV not found".to_string())?);
+    let mpv_dir = mpv_path
+        .parent()
+        .ok_or_else(|| "Could not determine MPV directory".to_string())?;
+    let script_path = mpv_dir.join("scripts").join("streamee_rife.py");
+    rife_runtime::prepare_engine(app, mpv_path, script_path, request).await
+}
+
+#[tauri::command]
+fn cancel_rife_engine_preparation() -> Result<(), String> {
+    rife_runtime::cancel_engine_preparation()
 }
 
 #[tauri::command]
@@ -6691,6 +6780,7 @@ async fn launch_mpv_process(
     } else {
         2
     };
+    let rife_concurrent_frames = get_store_setting(app, "mpvRifeConcurrentFrames");
     let rife_processing_mode = match get_store_setting(app, "mpvRifeProcessingResolution")
         .as_deref()
         .map(str::trim)
@@ -6714,11 +6804,12 @@ async fn launch_mpv_process(
         get_store_setting(app, "mpvRifeBeforeUpscaling").as_deref() != Some("false");
     let rife_before_upscaling =
         upscaler != VideoUpscaler::RtxVsr || rife_before_upscaling_requested;
-    let rife_filter_concurrency = if rife_model == "4.6" && rife_processing_mode == "auto" {
-        12
-    } else {
-        4
-    };
+    let rife_filter_concurrency = rife_filter_concurrency(
+        rife_model,
+        rife_processing_mode,
+        rife_gpu_streams,
+        rife_concurrent_frames.as_deref(),
+    );
     info!("Selected video upscaler: {}", upscaler.label());
     info!(
         "MPV video processing defaults: sharpen={} ({}), denoise={} ({}), deband={}, smart_black_bar_fill={}, black_bar_lighting={}, vsr_before_svp={}",
@@ -6754,37 +6845,49 @@ async fn launch_mpv_process(
         .to_path_buf();
     let rife_script_path = mpv_dir.join("scripts").join("streamee_rife.py");
     let rife_runtime_dir = PathBuf::from(&rife_runtime_path);
-    let rife_model_filename = format!("rife_v{}.onnx", rife_model.replace('-', "_"));
-    let rife_required_paths = [
-        rife_script_path.clone(),
-        rife_runtime_dir.join("vstrt.dll"),
-        rife_runtime_dir.join("vsmlrt.py"),
-        rife_runtime_dir.join("vsmlrt-cuda").join("nvinfer_10.dll"),
-        rife_runtime_dir
-            .join("models")
-            .join("rife")
-            .join(&rife_model_filename),
-    ];
-    let missing_rife_path = rife_required_paths.iter().find(|path| !path.exists());
-    let rife_enabled = rife_requested && missing_rife_path.is_none();
+    let rife_runtime_status = rife_requested
+        .then(|| rife_runtime::runtime_info(rife_model))
+        .transpose();
+    let rife_enabled = rife_requested
+        && rife_script_path.is_file()
+        && rife_runtime_status
+            .as_ref()
+            .ok()
+            .and_then(|runtime| runtime.as_ref())
+            .is_some_and(|runtime| runtime.ready);
     if rife_requested {
-        if let Some(path) = missing_rife_path {
+        if !rife_script_path.is_file() {
             error!(
-                "Streamee RIFE disabled for this MPV session because a runtime file is missing: {}",
-                path.display()
+                "Streamee RIFE disabled for this MPV session because its MPV script is missing: {}",
+                rife_script_path.display()
             );
+        } else if let Err(error) = &rife_runtime_status {
+            error!("Streamee RIFE disabled for this MPV session: {error}");
+        } else if let Some(runtime) = rife_runtime_status
+            .as_ref()
+            .ok()
+            .and_then(|runtime| runtime.as_ref())
+        {
+            if !runtime.ready {
+                error!(
+                    "Streamee RIFE disabled for this MPV session: {}",
+                    runtime.message
+                );
+            } else {
+                info!(
+                    "Streamee RIFE enabled: model={}, multiplier={}x, gpu_streams={}, processing_mode={}, scale={}, filter_concurrency={}, before_upscaling={}, runtime={}",
+                    rife_model,
+                    rife_multiplier,
+                    rife_gpu_streams,
+                    rife_processing_mode,
+                    rife_scale,
+                    rife_filter_concurrency,
+                    rife_before_upscaling,
+                    rife_runtime_dir.display()
+                );
+            }
         } else {
-            info!(
-                "Streamee RIFE enabled: model={}, multiplier={}x, gpu_streams={}, processing_mode={}, scale={}, filter_concurrency={}, before_upscaling={}, runtime={}",
-                rife_model,
-                rife_multiplier,
-                rife_gpu_streams,
-                rife_processing_mode,
-                rife_scale,
-                rife_filter_concurrency,
-                rife_before_upscaling,
-                rife_runtime_dir.display()
-            );
+            error!("Streamee RIFE disabled because runtime readiness could not be determined");
         }
     }
 
@@ -7040,6 +7143,14 @@ async fn launch_mpv_process(
             .env("STREAMEE_RIFE_PROCESSING_MODE", rife_processing_mode)
             .env("STREAMEE_RIFE_SCALE", rife_scale);
     }
+    if rife_requested {
+        let svp_path = get_svp_executable_path(app);
+        if let Err(error) = stop_svp_process(&svp_path) {
+            debug!("RIFE is enabled; no configured SVP process needed cleanup: {error}");
+        } else {
+            info!("RIFE is enabled; SVP was stopped and auto-start was suppressed");
+        }
+    }
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -7048,6 +7159,34 @@ async fn launch_mpv_process(
         }
     };
     let pid = child.id();
+    mpv_ipc::register_spawned_player(pid);
+    if rife_requested {
+        info!(
+            event = "rife.session_configured",
+            source = "backend",
+            subsystem = "rife.playback",
+            status = if rife_enabled { "Ready" } else { "Failed" },
+            playback_session_id = pid,
+            model = rife_model,
+            multiplier = rife_multiplier,
+            gpu_streams = rife_gpu_streams,
+            processing_mode = rife_processing_mode,
+            scale = rife_scale,
+            concurrent_frames = rife_filter_concurrency,
+            before_upscaling = rife_before_upscaling,
+            runtime_ready = rife_enabled,
+            "[RIFE] Session configuration registered"
+        );
+    }
+    mpv_ipc::register_rife_expectation(
+        app,
+        pid,
+        if rife_requested {
+            Some(rife_multiplier)
+        } else {
+            None
+        },
+    );
     if MPV_STRUCTURED_LOGGING_ENABLED {
         logging::start_mpv_log_ingestion(mpv_scratch_log_path, mpv_log_path, pid);
     }
@@ -7059,7 +7198,9 @@ async fn launch_mpv_process(
         pid,
         "MPV process spawned"
     );
-    start_svp_from_settings(app);
+    if !rife_requested {
+        start_svp_from_settings(app);
+    }
     if let Err(err) = attach_mpv_to_main_window(app, pid).await {
         warn!("Failed to attach MPV window to app owner: {}", err);
     }
@@ -7480,6 +7621,15 @@ async fn attach_mpv_to_main_window(app: &AppHandle, pid: u32) -> Result<(), Stri
             return Err(format!("SetWinEventHook failed for pid {}", pid));
         }
 
+        // MPV can show its idle window between process creation and hook setup.
+        // Recover that already-visible window instead of waiting for an event
+        // that will never be delivered.
+        if let Some(hwnd) = find_mpv_window_by_pid(pid)? {
+            unsafe {
+                mpv_win_event_proc(hook, EVENT_OBJECT_SHOW, hwnd, 0, 0, 0, 0);
+            }
+        }
+
         let start = std::time::Instant::now();
         let mut msg: MSG = unsafe { std::mem::zeroed() };
 
@@ -7855,6 +8005,14 @@ fn clean_executable_path(executable_path: &str) -> String {
     executable_path.trim().trim_matches('"').to_string()
 }
 
+fn ensure_svp_allowed(app: &AppHandle) -> Result<(), String> {
+    if get_bool_setting(app, "mpvRifeEnabled") || mpv_ipc::rife_session_active_or_expected() {
+        Err("SVP cannot start while Streamee RIFE is enabled".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn start_svp_process(executable_path: &str) -> Result<(), String> {
     let path = PathBuf::from(clean_executable_path(executable_path));
@@ -7915,6 +8073,10 @@ fn start_svp_from_settings(app: &AppHandle) {
     if !get_bool_setting(app, "svpAutoStartEnabled") {
         return;
     }
+    if let Err(error) = ensure_svp_allowed(app) {
+        info!("{error}; SVP auto-start was suppressed");
+        return;
+    }
 
     let path = get_svp_executable_path(app);
     match start_svp_process(&path) {
@@ -7925,6 +8087,7 @@ fn start_svp_from_settings(app: &AppHandle) {
 
 #[tauri::command]
 async fn restart_svp(app: AppHandle, executable_path: Option<String>) -> Result<(), String> {
+    ensure_svp_allowed(&app)?;
     let path = executable_path.unwrap_or_else(|| get_svp_executable_path(&app));
 
     #[cfg(target_os = "windows")]
@@ -7943,6 +8106,7 @@ async fn restart_svp(app: AppHandle, executable_path: Option<String>) -> Result<
 
 #[cfg(target_os = "windows")]
 pub(crate) fn restart_svp_from_settings(app: &AppHandle) -> Result<(), String> {
+    ensure_svp_allowed(app)?;
     let path = get_svp_executable_path(app);
     let _ = stop_svp_process(&path);
     std::thread::sleep(std::time::Duration::from_millis(600));
@@ -8448,7 +8612,12 @@ pub fn run() {
             install_whisperlive,
             test_whisperlive_runtime,
             get_rife_runtime_info,
+            get_rife_playback_status,
+            get_rife_cache_info,
+            clear_rife_cache,
             install_rife_runtime,
+            prepare_rife_engine,
+            cancel_rife_engine_preparation,
             stop_whisperlive_server,
             stop_whisperlive_client,
             stop_audio_normalizer_runtime,
@@ -8480,6 +8649,7 @@ pub fn run() {
             get_pending_smart_next_request,
             ack_smart_next_request,
             show_player_message,
+            show_segment_feedback_prompt,
             get_playlist_info,
             fetch_introdb_segments,
             detect_player_chapter_segments,

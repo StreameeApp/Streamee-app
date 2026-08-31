@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { getVersion } from '@tauri-apps/api/app';
 import { invoke } from '@tauri-apps/api/core';
-import { FiCheck, FiX, FiFolder, FiRefreshCw, FiFileText, FiDownload, FiCpu, FiVolume2, FiTrash2, FiMonitor, FiDatabase, FiKey, FiPlayCircle, FiZap, FiRadio, FiHardDrive, FiInfo, FiWifi, FiCopy, FiExternalLink, FiSearch, FiPackage } from 'react-icons/fi';
+import { FiCheck, FiX, FiFolder, FiRefreshCw, FiFileText, FiDownload, FiCpu, FiVolume2, FiTrash2, FiMonitor, FiDatabase, FiKey, FiPlayCircle, FiZap, FiRadio, FiHardDrive, FiInfo, FiWifi, FiCopy, FiExternalLink, FiSearch, FiPackage, FiChevronDown } from 'react-icons/fi';
 import { loadInstalledAddons, uninstallAddon } from '../../services/installed-addons';
 import { getTraktRateLimitRetryAt, isAuthenticated as checkTraktAuth } from '../../services/trakt';
 import { detectSystemTmdbWatchRegion } from '../../services/tmdb';
@@ -29,7 +29,7 @@ import {
   setXrelLanguagePreference,
   subscribeXrelQualitySnapshot,
 } from '../../services/xrel';
-import type { RifeRuntimeInfo, WhisperRuntimeInfo } from '../../services/tauri';
+import type { RifeCacheInfo, RifePlaybackStatus, RifeRuntimeInfo, WhisperRuntimeInfo } from '../../services/tauri';
 import { useStore } from '../../store';
 import TraktConnect from '../trakt/TraktConnect';
 import AddonSettings from './AddonSettings';
@@ -122,8 +122,10 @@ type VideoUpscaler = 'rtx-vsr' | 'ssim-superres' | 'fsr';
 type RifeModel = '4.6' | '4.9' | '4.16-lite' | '4.18' | '4.25';
 type RifeMultiplier = 2 | 3;
 type RifeGpuStreams = 1 | 2;
+type RifeConcurrentFrames = 'auto' | '1' | '2' | '4' | '6' | '8' | '12';
 type RifeProcessingResolution = 'auto' | 'native' | '1080' | '720';
 type RifeScale = 'auto' | '0.2' | '0.25' | '0.4' | '0.5' | '1.0';
+type RifePreparationResolution = '2160' | '1080' | '720';
 type SharpenPreset = 'auto' | 'standard' | 'adaptive' | 'ultra' | 'ultra-custom';
 type DenoiseStrength = 'low' | 'medium' | 'high';
 type SmartUltrawideFillMode = 'off' | 'efficient' | 'dynamic';
@@ -173,6 +175,13 @@ const openExternalLink = (url: string) => {
   void window.electronAPI.openExternal(url);
 };
 
+const normalizeRifeConcurrentFrames = (value: unknown): RifeConcurrentFrames => {
+  const normalized = String(value ?? 'auto');
+  return ['1', '2', '4', '6', '8', '12'].includes(normalized)
+    ? normalized as RifeConcurrentFrames
+    : 'auto';
+};
+
 const normalizeSharpenPreset = (value: unknown): SharpenPreset => {
   return value === 'standard' || value === 'adaptive' || value === 'ultra' || value === 'ultra-custom'
     ? value
@@ -197,6 +206,12 @@ const whisperRuntimeIsReady = (runtime: WhisperRuntimeInfo): boolean => (
 const formatRuntimeSize = (bytes: number): string => {
   const gibibytes = bytes / (1024 ** 3);
   return gibibytes >= 1 ? `${gibibytes.toFixed(1)} GB` : `${Math.ceil(bytes / (1024 ** 2))} MB`;
+};
+
+const RIFE_PREPARATION_PROFILE_LABELS: Record<RifePreparationResolution, string> = {
+  '2160': '3840×2160',
+  '1080': '1920×1080',
+  '720': '1280×720',
 };
 
 type RuntimeInstallerPanelProps = {
@@ -255,7 +270,7 @@ const RuntimeInstallerPanel: React.FC<RuntimeInstallerPanelProps> = ({
             <div
               className={`settings-runtime-progress-track${determinateProgress ? '' : ' is-indeterminate'}`}
               role="progressbar"
-              aria-label={`${title} installation progress`}
+              aria-label={`${title} progress`}
               aria-valuemin={determinateProgress ? 0 : undefined}
               aria-valuemax={determinateProgress ? 100 : undefined}
               aria-valuenow={determinateProgress ? progress : undefined}
@@ -329,6 +344,7 @@ const resetNativeSettings = async () => {
     window.electronAPI.settings.setSetting('mpvRifeModel', '4.6'),
     window.electronAPI.settings.setSetting('mpvRifeMultiplier', '2'),
     window.electronAPI.settings.setSetting('mpvRifeGpuStreams', '2'),
+    window.electronAPI.settings.setSetting('mpvRifeConcurrentFrames', 'auto'),
     window.electronAPI.settings.setSetting('mpvRifeProcessingResolution', 'auto'),
     window.electronAPI.settings.setSetting('mpvRifeScale', 'auto'),
     window.electronAPI.settings.setSetting('mpvRifeBeforeUpscaling', 'true'),
@@ -441,6 +457,7 @@ const Settings: React.FC = () => {
   const [mpvRifeModel, setMpvRifeModel] = useState<RifeModel>('4.6');
   const [mpvRifeMultiplier, setMpvRifeMultiplier] = useState<RifeMultiplier>(2);
   const [mpvRifeGpuStreams, setMpvRifeGpuStreams] = useState<RifeGpuStreams>(2);
+  const [mpvRifeConcurrentFrames, setMpvRifeConcurrentFrames] = useState<RifeConcurrentFrames>('auto');
   const [mpvRifeProcessingResolution, setMpvRifeProcessingResolution] = useState<RifeProcessingResolution>('auto');
   const [mpvRifeScale, setMpvRifeScale] = useState<RifeScale>('auto');
   const [mpvRifeBeforeUpscaling, setMpvRifeBeforeUpscaling] = useState(true);
@@ -449,6 +466,13 @@ const Settings: React.FC = () => {
   const [rifeInstallPhase, setRifeInstallPhase] = useState<'downloading' | 'extracting' | 'complete'>('downloading');
   const [rifeInstallMessage, setRifeInstallMessage] = useState('Checking RIFE Runtime...');
   const [rifeInstallProgress, setRifeInstallProgress] = useState(0);
+  const [rifePreparationResolution, setRifePreparationResolution] = useState<RifePreparationResolution>('2160');
+  const [rifePreparationStatus, setRifePreparationStatus] = useState<'idle' | 'preparing' | 'success' | 'error'>('idle');
+  const [rifePreparationMessage, setRifePreparationMessage] = useState<string | null>(null);
+  const [rifeCacheInfo, setRifeCacheInfo] = useState<RifeCacheInfo | null>(null);
+  const [rifeCacheStatus, setRifeCacheStatus] = useState<'idle' | 'clearing' | 'success' | 'error'>('idle');
+  const [rifeCacheMessage, setRifeCacheMessage] = useState<string | null>(null);
+  const [rifePlaybackStatus, setRifePlaybackStatus] = useState<RifePlaybackStatus | null>(null);
   const [remoteControlEnabled, setRemoteControlEnabled] = useState(false);
   const [remoteControlPort, setRemoteControlPort] = useState(DEFAULT_REMOTE_CONTROL_PORT);
   const [remoteControlInfo, setRemoteControlInfo] = useState<RemoteControlInfo | null>(null);
@@ -560,6 +584,7 @@ const Settings: React.FC = () => {
 
     setSettingsSearchFocused(false);
     setActiveCategoryId(entry.categoryId);
+    target.closest<HTMLDetailsElement>('details')?.setAttribute('open', '');
     target.classList.remove('settings-search-target');
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
@@ -690,6 +715,7 @@ const Settings: React.FC = () => {
           );
           setMpvRifeMultiplier(settings.mpvRifeMultiplier === 3 ? 3 : 2);
           setMpvRifeGpuStreams(settings.mpvRifeGpuStreams === 1 ? 1 : 2);
+          setMpvRifeConcurrentFrames(normalizeRifeConcurrentFrames(settings.mpvRifeConcurrentFrames));
           setMpvRifeProcessingResolution(
             settings.mpvRifeProcessingResolution === 'native'
               || settings.mpvRifeProcessingResolution === '1080'
@@ -752,6 +778,7 @@ const Settings: React.FC = () => {
             rifeModel,
             rifeMultiplier,
             rifeGpuStreams,
+            rifeConcurrentFrames,
             rifeProcessingResolution,
             rifeScale,
             rifeBeforeUpscaling,
@@ -798,6 +825,7 @@ const Settings: React.FC = () => {
             window.electronAPI.settings.getSetting('mpvRifeModel'),
             window.electronAPI.settings.getSetting('mpvRifeMultiplier'),
             window.electronAPI.settings.getSetting('mpvRifeGpuStreams'),
+            window.electronAPI.settings.getSetting('mpvRifeConcurrentFrames'),
             window.electronAPI.settings.getSetting('mpvRifeProcessingResolution'),
             window.electronAPI.settings.getSetting('mpvRifeScale'),
             window.electronAPI.settings.getSetting('mpvRifeBeforeUpscaling'),
@@ -851,6 +879,7 @@ const Settings: React.FC = () => {
           );
           setMpvRifeMultiplier(rifeMultiplier === '3' ? 3 : 2);
           setMpvRifeGpuStreams(rifeGpuStreams === '1' ? 1 : 2);
+          setMpvRifeConcurrentFrames(normalizeRifeConcurrentFrames(rifeConcurrentFrames));
           setMpvRifeProcessingResolution(
             rifeProcessingResolution === 'native'
               || rifeProcessingResolution === '1080'
@@ -1023,6 +1052,7 @@ const Settings: React.FC = () => {
       mpvRifeModel,
       mpvRifeMultiplier,
       mpvRifeGpuStreams,
+      mpvRifeConcurrentFrames,
       mpvRifeProcessingResolution,
       mpvRifeScale,
       mpvRifeBeforeUpscaling,
@@ -1074,6 +1104,7 @@ const Settings: React.FC = () => {
     await window.electronAPI.settings.setSetting('mpvRifeModel', mpvRifeModel);
     await window.electronAPI.settings.setSetting('mpvRifeMultiplier', String(mpvRifeMultiplier));
     await window.electronAPI.settings.setSetting('mpvRifeGpuStreams', String(mpvRifeGpuStreams));
+    await window.electronAPI.settings.setSetting('mpvRifeConcurrentFrames', mpvRifeConcurrentFrames);
     await window.electronAPI.settings.setSetting('mpvRifeProcessingResolution', mpvRifeProcessingResolution);
     await window.electronAPI.settings.setSetting('mpvRifeScale', mpvRifeScale);
     await window.electronAPI.settings.setSetting('mpvRifeBeforeUpscaling', String(mpvRifeBeforeUpscaling));
@@ -1153,6 +1184,7 @@ const Settings: React.FC = () => {
     mpvRifeModel,
     mpvRifeMultiplier,
     mpvRifeGpuStreams,
+    mpvRifeConcurrentFrames,
     mpvRifeProcessingResolution,
     mpvRifeScale,
     mpvRifeBeforeUpscaling,
@@ -1163,8 +1195,12 @@ const Settings: React.FC = () => {
 
   useEffect(() => {
     let cancelled = false;
-    let unlisten: (() => void) | null = null;
+    let unlistenInstall: (() => void) | null = null;
+    let unlistenPreparation: (() => void) | null = null;
+    let unlistenPlaybackStatus: (() => void) | null = null;
+    let unlistenPlayerClosed: (() => void) | null = null;
     setRifeInstallMessage('Checking RIFE Runtime...');
+    setRifePlaybackStatus(null);
 
     void window.electronAPI.rife.onInstallProgress((progress) => {
       if (cancelled) return;
@@ -1179,11 +1215,71 @@ const Settings: React.FC = () => {
       if (cancelled) {
         dispose();
       } else {
-        unlisten = dispose;
+        unlistenInstall = dispose;
       }
     }).catch((error) => {
       if (!cancelled) {
         console.warn('[Settings][RIFE] Install progress listener unavailable:', error);
+      }
+    });
+
+    void window.electronAPI.rife.onPlaybackStatus((status) => {
+      if (!cancelled) {
+        setRifePlaybackStatus(status);
+      }
+    }).then(async (dispose) => {
+      if (cancelled) {
+        dispose();
+      } else {
+        unlistenPlaybackStatus = dispose;
+        const currentStatus = await window.electronAPI.rife.getPlaybackStatus();
+        if (!cancelled) {
+          setRifePlaybackStatus(currentStatus);
+        }
+      }
+    }).catch((error) => {
+      if (!cancelled) {
+        console.warn('[Settings][RIFE] Playback status listener unavailable:', error);
+      }
+    });
+
+    void window.electronAPI.playerEvents.onClosed(() => {
+      if (!cancelled) {
+        setRifePlaybackStatus(null);
+      }
+    }).then((dispose) => {
+      if (cancelled) {
+        dispose();
+      } else {
+        unlistenPlayerClosed = dispose;
+      }
+    }).catch((error) => {
+      if (!cancelled) {
+        console.warn('[Settings][RIFE] Player close listener unavailable:', error);
+      }
+    });
+
+    void window.electronAPI.rife.onEnginePreparationProgress((progress) => {
+      if (cancelled) return;
+      setRifePreparationStatus(
+        progress.phase === 'complete'
+          ? 'success'
+          : progress.phase === 'error'
+            ? 'error'
+            : progress.phase === 'cancelled'
+              ? 'idle'
+              : 'preparing',
+      );
+      setRifePreparationMessage(progress.message);
+    }).then((dispose) => {
+      if (cancelled) {
+        dispose();
+      } else {
+        unlistenPreparation = dispose;
+      }
+    }).catch((error) => {
+      if (!cancelled) {
+        console.warn('[Settings][RIFE] Engine preparation listener unavailable:', error);
       }
     });
 
@@ -1192,9 +1288,6 @@ const Settings: React.FC = () => {
         if (cancelled) return;
         setRifeRuntimeInfo(runtime);
         setRifeInstallMessage(runtime.message);
-        if (!runtime.ready) {
-          setMpvRifeEnabled(false);
-        }
       })
       .catch((error) => {
         if (cancelled) return;
@@ -1203,9 +1296,23 @@ const Settings: React.FC = () => {
         setRifeInstallMessage(`Could not check RIFE Runtime: ${errorMessage(error)}`);
       });
 
+    void window.electronAPI.rife.getCacheInfo()
+      .then((cache) => {
+        if (cancelled) return;
+        setRifeCacheInfo(cache);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          console.warn('[Settings][RIFE] Cache information unavailable:', error);
+        }
+      });
+
     return () => {
       cancelled = true;
-      unlisten?.();
+      unlistenInstall?.();
+      unlistenPreparation?.();
+      unlistenPlaybackStatus?.();
+      unlistenPlayerClosed?.();
     };
   }, [mpvRifeModel]);
 
@@ -1228,6 +1335,63 @@ const Settings: React.FC = () => {
     } catch (error) {
       setRifeInstallStatus('error');
       setRifeInstallMessage(`RIFE installation failed: ${errorMessage(error)}`);
+    }
+  };
+
+  const handlePrepareRifeEngine = async () => {
+    const profileLabel = RIFE_PREPARATION_PROFILE_LABELS[rifePreparationResolution];
+    setRifePreparationStatus('preparing');
+    setRifePreparationMessage(
+      `Preparing RIFE ${mpvRifeModel} for exact ${profileLabel} source frames...`,
+    );
+
+    try {
+      const result = await window.electronAPI.rife.prepareEngine({
+        model: mpvRifeModel,
+        multiplier: mpvRifeMultiplier,
+        gpuStreams: mpvRifeGpuStreams,
+        processingMode: mpvRifeProcessingResolution,
+        scale: mpvRifeScale,
+        sourceResolution: rifePreparationResolution,
+      });
+      setRifePreparationStatus('success');
+      setRifePreparationMessage(result.message);
+    } catch (error) {
+      const message = errorMessage(error);
+      if (message.toLowerCase().includes('cancelled')) {
+        setRifePreparationStatus('idle');
+        setRifePreparationMessage('RIFE engine preparation was cancelled.');
+      } else {
+        setRifePreparationStatus('error');
+        setRifePreparationMessage(`RIFE engine preparation failed: ${message}`);
+      }
+    }
+  };
+
+  const handleCancelRifePreparation = async () => {
+    try {
+      await window.electronAPI.rife.cancelEnginePreparation();
+      setRifePreparationMessage('Cancelling RIFE engine preparation...');
+    } catch (error) {
+      setRifePreparationStatus('error');
+      setRifePreparationMessage(`Could not cancel RIFE engine preparation: ${errorMessage(error)}`);
+    }
+  };
+
+  const handleClearRifeCache = async () => {
+    if (!window.confirm('Clear every compiled RIFE engine? Engines will compile again when needed.')) {
+      return;
+    }
+    setRifeCacheStatus('clearing');
+    setRifeCacheMessage('Clearing compiled RIFE engines...');
+    try {
+      const cache = await window.electronAPI.rife.clearCache();
+      setRifeCacheInfo(cache);
+      setRifeCacheStatus('success');
+      setRifeCacheMessage('Compiled RIFE engines cleared.');
+    } catch (error) {
+      setRifeCacheStatus('error');
+      setRifeCacheMessage(`Could not clear RIFE engines: ${errorMessage(error)}`);
     }
   };
 
@@ -2557,10 +2721,10 @@ const Settings: React.FC = () => {
             <div className="settings-toggle-info">
               <label>Local Intro Skipper fallback</label>
               <span className="settings-toggle-desc">
-                When community data is missing, use named chapters first. Otherwise start after at least five opening seconds are cached, then fingerprint only verified local-cache bytes as playback fills the analysis window (up to five minutes). Future queued episodes are never opened.
+                When community data is missing, use named chapters first. Otherwise fingerprint only verified local-cache bytes as playback fills the intro and outro analysis windows. Future queued episodes are never opened.
               </span>
               <span className="settings-hint">
-                The first unmatched episode teaches the rolling cache. Fingerprinting pauses when MPV is using a different audio track than the file default.
+                Plausible near-misses can ask for confirmation in the player. Answers stay on this device and do not change automatic skipping yet.
               </span>
             </div>
             <button
@@ -2581,7 +2745,7 @@ const Settings: React.FC = () => {
                 Advances an already queued episode first, otherwise uses Smart Next. If no next source is ready, the credits keep playing.
               </span>
               <span className="settings-hint">
-                Community data: TheIntroDB and IntroDB. Local fingerprinting is used for intros only.
+                Community data: TheIntroDB and IntroDB. Local chapter, audio, and visual fallbacks remain conservative.
               </span>
             </div>
             <button
@@ -2592,6 +2756,23 @@ const Settings: React.FC = () => {
             >
               <span className="toggle-slider" />
             </button>
+          </div>
+
+          <div className="settings-field">
+            <label>Segment confirmation history</label>
+            <button
+              className="settings-btn"
+              onClick={() => {
+                if (!window.confirm('Clear locally saved Intro and Outro confirmation answers?')) return;
+                window.localStorage.removeItem('streamee:segment-feedback:v1');
+              }}
+              type="button"
+            >
+              Clear Confirmation History
+            </button>
+            <span className="settings-hint">
+              Clears only Yes, No, and Not sure answers saved by the player prompts.
+            </span>
           </div>
 
           <div className="settings-toggle">
@@ -2707,7 +2888,7 @@ const Settings: React.FC = () => {
       >
         <h2><FiCpu /> RIFE Frame Generation</h2>
         <p className="settings-description">
-          Installs RIFE as an optional GPU runtime and runs it directly in Streamee&apos;s MPV pipeline. SVP is not required or started.
+          GPU frame generation built into Streamee&apos;s MPV playback. No SVP required.
         </p>
 
         <div className="settings-form">
@@ -2716,24 +2897,42 @@ const Settings: React.FC = () => {
             description={rifeRuntimeInfo?.installed
               ? `${rifeRuntimeInfo.version} managed locally · RIFE ${mpvRifeModel}`
               : `Optional ${formatRuntimeSize(rifeRuntimeInfo?.downloadBytes || 2_811_293_455)} download · ${formatRuntimeSize(rifeRuntimeInfo?.requiredFreeBytes || 6_500_000_000)} free space required`}
-            detail="Downloads resume after interruption and are SHA-256 verified. The first playback compiles an engine for this GPU."
-            message={rifeInstallMessage}
+            detail="Downloads are verified and resumable. Prepare an engine here to avoid compiling during playback."
+            message={rifePreparationMessage || rifeInstallMessage}
             ready={rifeRuntimeInfo?.ready === true}
-            installing={rifeInstallStatus === 'installing'}
-            error={rifeInstallStatus === 'error'}
+            installing={rifeInstallStatus === 'installing' || rifePreparationStatus === 'preparing'}
+            error={rifeInstallStatus === 'error' || rifePreparationStatus === 'error'}
             progress={rifeInstallStatus === 'installing' && rifeInstallPhase === 'downloading' ? rifeInstallProgress : undefined}
             progressLabel={
-              rifeInstallPhase === 'downloading'
+              rifePreparationStatus === 'preparing'
+                ? 'Preparing TensorRT engine...'
+                : rifeInstallPhase === 'downloading'
                 ? `Downloading · ${rifeInstallProgress}%`
                 : rifeInstallPhase === 'extracting'
                   ? 'Extracting runtime...'
                   : 'Finishing installation...'
             }
+            busyLabel={rifePreparationStatus === 'preparing' ? 'Preparing' : 'Installing'}
           >
+              {rifeRuntimeInfo?.ready && (
+                <button
+                  className="settings-btn settings-btn-test"
+                  onClick={rifePreparationStatus === 'preparing'
+                    ? handleCancelRifePreparation
+                    : handlePrepareRifeEngine}
+                  disabled={rifeInstallStatus === 'installing'}
+                  type="button"
+                >
+                  {rifePreparationStatus === 'preparing'
+                    ? <><FiX /> Cancel preparation</>
+                    : <><FiZap /> Prepare {RIFE_PREPARATION_PROFILE_LABELS[rifePreparationResolution]} engine</>}
+                </button>
+              )}
+              {!rifeRuntimeInfo?.ready && (
               <button
                 className="settings-btn settings-btn-test"
                 onClick={handleInstallRife}
-                disabled={rifeInstallStatus === 'installing'}
+                disabled={rifeInstallStatus === 'installing' || rifePreparationStatus === 'preparing'}
                 type="button"
               >
                 {rifeInstallStatus === 'installing' && rifeInstallPhase === 'downloading' && `Downloading... ${rifeInstallProgress}%`}
@@ -2741,47 +2940,95 @@ const Settings: React.FC = () => {
                 {rifeInstallStatus === 'installing' && rifeInstallPhase === 'complete' && <><FiCheck /> Finishing...</>}
                 {rifeInstallStatus !== 'installing' && !rifeRuntimeInfo?.installed && <><FiDownload /> Install RIFE Runtime</>}
                 {rifeInstallStatus !== 'installing' && rifeRuntimeInfo?.installed && !rifeRuntimeInfo.selectedModelInstalled && <><FiDownload /> Install RIFE {mpvRifeModel}</>}
-                {rifeInstallStatus !== 'installing' && rifeRuntimeInfo?.ready && <><FiRefreshCw /> Reinstall RIFE {mpvRifeModel}</>}
               </button>
+              )}
           </RuntimeInstallerPanel>
 
           <div className="settings-toggle">
             <div className="settings-toggle-info">
               <label>Enable Streamee RIFE</label>
               <span className="settings-toggle-desc">
-                Generates intermediate frames with the selected TensorRT model. Available after the runtime and selected model are installed.
+                Generates intermediate frames using the selected TensorRT profile.
               </span>
             </div>
             <button
               className={`toggle-btn ${mpvRifeEnabled ? 'active' : ''}`}
-              onClick={() => setMpvRifeEnabled((previous) => !previous)}
+              onClick={() => {
+                const enabled = !mpvRifeEnabled;
+                setMpvRifeEnabled(enabled);
+                if (enabled) {
+                  setSvpAutoStartEnabled(false);
+                  setSvpAutoRestartOnPlaylistChange(false);
+                  void window.electronAPI.stopSvp(svpExecutablePath).catch((error) => {
+                    console.warn('[Settings][RIFE] Could not stop SVP while enabling RIFE:', error);
+                  });
+                }
+              }}
               aria-label="Toggle Streamee RIFE frame generation"
-              disabled={!rifeRuntimeInfo?.ready || rifeInstallStatus === 'installing'}
+              disabled={(!mpvRifeEnabled && !rifeRuntimeInfo?.ready) || rifeInstallStatus === 'installing' || rifePreparationStatus === 'preparing'}
               type="button"
             >
               <span className="toggle-slider" />
             </button>
           </div>
+          {rifePlaybackStatus && (
+            <div
+              className={`settings-runtime-status rife-playback-status is-${rifePlaybackStatus.status}`}
+              role={rifePlaybackStatus.status === 'failed' ? 'alert' : 'status'}
+            >
+              {rifePlaybackStatus.status === 'active' ? <FiCheck /> : rifePlaybackStatus.status === 'failed' ? <FiX /> : <FiInfo />}
+              <span>{rifePlaybackStatus.message}</span>
+            </div>
+          )}
 
-          <div className="settings-toggle">
-            <div className="settings-toggle-info">
-              <label>Run RIFE before upscaling</label>
-              <span className="settings-toggle-desc">
-                Recommended: interpolates the smaller source frames, then upscales them. With RTX VSR selected, turn this off to upscale first and compare quality against the additional GPU load. Renderer-based upscalers run after RIFE; RTX Video HDR runs last for SDR sources and is bypassed for native HDR.
+          <details className="settings-advanced rife-advanced-settings">
+            <summary>
+              <span>
+                Advanced tuning
+                <small>{`RIFE ${mpvRifeModel} · ${mpvRifeProcessingResolution === 'auto' ? 'Auto' : `${mpvRifeProcessingResolution}p`} · ${mpvRifeMultiplier}x · ${mpvRifeGpuStreams} streams · ${mpvRifeConcurrentFrames === 'auto' ? 'Auto queue' : `${mpvRifeConcurrentFrames} concurrent`}`}</small>
+              </span>
+              <FiChevronDown />
+            </summary>
+            <div className="settings-advanced-grid">
+            <div className="settings-toggle">
+              <div className="settings-toggle-info">
+                <label>Run before upscaling</label>
+                <span className="settings-toggle-desc">
+                  Recommended for lower GPU load. With RTX VSR, turn this off to compare upscaling first.
+                </span>
+              </div>
+              <button
+                className={`toggle-btn ${mpvRifeEnabled && mpvRifeBeforeUpscaling ? 'active' : ''}`}
+                onClick={() => setMpvRifeBeforeUpscaling((previous) => !previous)}
+                aria-label="Toggle RIFE before upscaling"
+                disabled={!mpvRifeEnabled || videoUpscaler !== 'rtx-vsr'}
+                type="button"
+              >
+                <span className="toggle-slider" />
+              </button>
+            </div>
+
+            <div className="settings-field">
+              <label>Engine preparation source</label>
+              <select
+                className="settings-select"
+                value={rifePreparationResolution}
+                onChange={(event) => {
+                  setRifePreparationResolution(event.target.value as RifePreparationResolution);
+                  setRifePreparationStatus('idle');
+                  setRifePreparationMessage(null);
+                }}
+                disabled={!rifeRuntimeInfo?.ready || rifePreparationStatus === 'preparing'}
+              >
+                <option value="2160">3840×2160 (16:9 4K)</option>
+                <option value="1080">1920×1080 (16:9 Full HD)</option>
+                <option value="720">1280×720 (16:9 HD)</option>
+              </select>
+              <span className="settings-hint">
+                TensorRT engines are exact-shape profiles. Cropped cinema frames such as 3840×1600 compile their own engine on first playback. Preparation is unavailable while MPV is active.
               </span>
             </div>
-            <button
-              className={`toggle-btn ${mpvRifeEnabled && mpvRifeBeforeUpscaling ? 'active' : ''}`}
-              onClick={() => setMpvRifeBeforeUpscaling((previous) => !previous)}
-              aria-label="Toggle RIFE before upscaling"
-              disabled={!mpvRifeEnabled || videoUpscaler !== 'rtx-vsr'}
-              type="button"
-            >
-              <span className="toggle-slider" />
-            </button>
-          </div>
 
-          <div className="settings-advanced-grid settings-always-visible">
             <div className="settings-field">
               <label>RIFE model</label>
               <select
@@ -2789,9 +3036,11 @@ const Settings: React.FC = () => {
                 value={mpvRifeModel}
                 onChange={(event) => {
                   setRifeRuntimeInfo(null);
+                  setRifePreparationStatus('idle');
+                  setRifePreparationMessage(null);
                   setMpvRifeModel(event.target.value as RifeModel);
                 }}
-                disabled={rifeInstallStatus === 'installing'}
+                disabled={rifeInstallStatus === 'installing' || rifePreparationStatus === 'preparing'}
               >
                 <option value="4.6">4.6 (recommended for 4K half-scale)</option>
                 <option value="4.9">4.9 (balanced)</option>
@@ -2807,8 +3056,12 @@ const Settings: React.FC = () => {
               <select
                 className="settings-select"
                 value={mpvRifeProcessingResolution}
-                onChange={(event) => setMpvRifeProcessingResolution(event.target.value as RifeProcessingResolution)}
-                disabled={!mpvRifeEnabled}
+                onChange={(event) => {
+                  setMpvRifeProcessingResolution(event.target.value as RifeProcessingResolution);
+                  setRifePreparationStatus('idle');
+                  setRifePreparationMessage(null);
+                }}
+                disabled={!mpvRifeEnabled || rifePreparationStatus === 'preparing'}
               >
                 <option value="auto">Auto (RIFE 4.6 half-scale for 4K)</option>
                 <option value="native">Native source resolution</option>
@@ -2825,8 +3078,12 @@ const Settings: React.FC = () => {
               <select
                 className="settings-select"
                 value={mpvRifeMultiplier}
-                onChange={(event) => setMpvRifeMultiplier(Number(event.target.value) as RifeMultiplier)}
-                disabled={!mpvRifeEnabled}
+                onChange={(event) => {
+                  setMpvRifeMultiplier(Number(event.target.value) as RifeMultiplier);
+                  setRifePreparationStatus('idle');
+                  setRifePreparationMessage(null);
+                }}
+                disabled={!mpvRifeEnabled || rifePreparationStatus === 'preparing'}
               >
                 <option value={2}>2x</option>
                 <option value={3}>3x</option>
@@ -2839,18 +3096,24 @@ const Settings: React.FC = () => {
               <select
                 className="settings-select"
                 value={mpvRifeScale}
-                onChange={(event) => setMpvRifeScale(event.target.value as RifeScale)}
-                disabled={!mpvRifeEnabled || mpvRifeModel !== '4.6'}
+                onChange={(event) => {
+                  setMpvRifeScale(event.target.value as RifeScale);
+                  setRifePreparationStatus('idle');
+                  setRifePreparationMessage(null);
+                }}
+                disabled={!mpvRifeEnabled || mpvRifeModel !== '4.6' || rifePreparationStatus === 'preparing'}
               >
                 <option value="auto">Auto (0.5 for 4K, 1.0 otherwise)</option>
-                <option value="0.2">0.2 (fastest)</option>
-                <option value="0.25">0.25</option>
-                <option value="0.4">0.4</option>
                 <option value="0.5">0.5 (recommended for 4K)</option>
                 <option value="1.0">1.0 (maximum motion detail)</option>
+                <optgroup label="Experimental — lower quality">
+                  <option value="0.4">0.4</option>
+                  <option value="0.25">0.25</option>
+                  <option value="0.2">0.2</option>
+                </optgroup>
               </select>
               <span className="settings-hint">
-                Controls internal motion estimation while retaining full-resolution input and output frames. Values below 1 are supported by RIFE 4.6 only; changing this value compiles a separate TensorRT engine on the next playback.
+                Controls internal motion estimation while retaining full-resolution input and output frames. Sub-0.5 values are experimental: they reduce motion detail and may not reduce total GPU power. Values below 1 are supported by RIFE 4.6 only.
               </span>
             </div>
 
@@ -2859,15 +3122,69 @@ const Settings: React.FC = () => {
               <select
                 className="settings-select"
                 value={mpvRifeGpuStreams}
-                onChange={(event) => setMpvRifeGpuStreams(Number(event.target.value) as RifeGpuStreams)}
-                disabled={!mpvRifeEnabled}
+                onChange={(event) => {
+                  setMpvRifeGpuStreams(Number(event.target.value) as RifeGpuStreams);
+                  setRifePreparationStatus('idle');
+                  setRifePreparationMessage(null);
+                }}
+                disabled={!mpvRifeEnabled || rifePreparationStatus === 'preparing'}
               >
                 <option value={1}>1 (lower VRAM)</option>
                 <option value={2}>2 (higher throughput)</option>
               </select>
-              <span className="settings-hint">Two streams are suitable for the RTX 4090; use one when testing memory pressure.</span>
+              <span className="settings-hint">Two streams favor throughput on high-end GPUs; use one when testing memory pressure or efficiency.</span>
             </div>
-          </div>
+
+            <div className="settings-field">
+              <label>Concurrent frames</label>
+              <select
+                className="settings-select"
+                value={mpvRifeConcurrentFrames}
+                onChange={(event) => setMpvRifeConcurrentFrames(
+                  normalizeRifeConcurrentFrames(event.target.value),
+                )}
+                disabled={!mpvRifeEnabled || rifePreparationStatus === 'preparing'}
+              >
+                <option value="auto">Auto (recommended)</option>
+                <option value="1">1 (minimum load)</option>
+                <option value="2">2</option>
+                <option value="4">4</option>
+                <option value="6">6</option>
+                <option value="8">8</option>
+                <option value="12">12 (maximum throughput)</option>
+              </select>
+              <span className="settings-hint">
+                Controls how many frames VapourSynth can process at once. Lower values may reduce VRAM and GPU activity but can cause stutter; changes apply to the next playback.
+              </span>
+            </div>
+            {rifeRuntimeInfo?.ready && (
+              <div className="settings-actions rife-runtime-maintenance">
+                <button
+                  className="settings-btn settings-btn-test"
+                  onClick={handleInstallRife}
+                  disabled={rifeInstallStatus === 'installing' || rifePreparationStatus === 'preparing'}
+                  type="button"
+                >
+                  <FiRefreshCw /> Repair or reinstall RIFE {mpvRifeModel}
+                </button>
+                <button
+                  className="settings-btn settings-btn-danger"
+                  onClick={handleClearRifeCache}
+                  disabled={rifeInstallStatus === 'installing' || rifePreparationStatus === 'preparing' || rifeCacheStatus === 'clearing'}
+                  type="button"
+                >
+                  <FiTrash2 /> {rifeCacheStatus === 'clearing' ? 'Clearing engines...' : 'Clear compiled engines'}
+                </button>
+                <span className="settings-hint">
+                  {rifeCacheInfo
+                    ? `${rifeCacheInfo.engineCount} compiled ${rifeCacheInfo.engineCount === 1 ? 'engine' : 'engines'} · ${formatRuntimeSize(rifeCacheInfo.bytes)}`
+                    : 'Compiled engine cache size unavailable'}
+                  {rifeCacheMessage ? ` · ${rifeCacheMessage}` : ''}
+                </span>
+              </div>
+            )}
+            </div>
+          </details>
 
         </div>
       </section>
@@ -2911,13 +3228,16 @@ const Settings: React.FC = () => {
             <div className="settings-toggle-info">
               <label>Start SVP with MPV</label>
               <span className="settings-toggle-desc">
-                Starts the selected SVP manager whenever Streamee launches MPV.
+                {mpvRifeEnabled
+                  ? 'Disabled while Streamee RIFE is enabled to prevent two interpolation systems running together.'
+                  : 'Starts the selected SVP manager whenever Streamee launches MPV.'}
               </span>
             </div>
             <button
               className={`toggle-btn ${svpAutoStartEnabled ? 'active' : ''}`}
               onClick={() => setSvpAutoStartEnabled((prev) => !prev)}
               aria-label="Toggle SVP startup with MPV"
+              disabled={mpvRifeEnabled}
               type="button"
             >
               <span className="toggle-slider" />
@@ -2929,13 +3249,16 @@ const Settings: React.FC = () => {
             <div className="settings-toggle-info">
               <label>Restart SVP on playlist changes</label>
               <span className="settings-toggle-desc">
-                Restarts SVP after MPV moves to a different playlist item.
+                {mpvRifeEnabled
+                  ? 'Disabled while Streamee RIFE is enabled.'
+                  : 'Restarts SVP after MPV moves to a different playlist item.'}
               </span>
             </div>
             <button
               className={`toggle-btn ${svpAutoRestartOnPlaylistChange ? 'active' : ''}`}
               onClick={() => setSvpAutoRestartOnPlaylistChange((prev) => !prev)}
               aria-label="Toggle SVP restart on playlist changes"
+              disabled={mpvRifeEnabled}
               type="button"
             >
               <span className="toggle-slider" />

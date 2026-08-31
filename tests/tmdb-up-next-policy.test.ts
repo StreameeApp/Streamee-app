@@ -25,13 +25,27 @@ test('Up Next applies the tested status-aware cache policy and logs its decision
   assert.match(boardSource, /noResultCacheTtlMs: noResultCache\.ttlMs/);
   assert.match(boardSource, /noResultCache\.ttlMs,\s*\);/);
   assert.match(boardSource, /nextEpisodeAirDate: schedule\.nextEpisodeAirDate/);
-  assert.match(boardSource, /no_result_cache_policy_counts: noResultCachePolicyCounts/);
+  assert.match(boardSource, /no_result_cache_policy_counts: summary\.noResultCachePolicyCounts/);
   assert.match(boardSource, /no_result_cache_ttl_hours:/);
 });
 
 test('Up Next retains a resolved episode with the long-lived policy TTL', () => {
   assert.match(boardSource, /UP_NEXT_RESOLVED_RESULT_CACHE_TTL_MS/);
   assert.match(boardSource, /UP_NEXT_RESOLVED_RESULT_CACHE_TTL_MS,\s*\);/);
+});
+
+test('cancelled Up Next scans retain enough counters and reason to explain Worker traffic', () => {
+  assert.match(boardSource, /const logCancelledRefresh = \(cancellationStage:/);
+  assert.match(boardSource, /unresolved_candidate_count: summary\.unresolvedCandidateCount/);
+  assert.match(boardSource, /cached_result_count: summary\.cachedResultCount/);
+  assert.match(boardSource, /cache_miss_count: summary\.cacheMissCount/);
+  assert.match(boardSource, /season_list_lookups: summary\.seasonListLookups/);
+  assert.match(boardSource, /episode_list_lookups: summary\.episodeListLookups/);
+  assert.match(boardSource, /no_result_cache_policy_counts: summary\.noResultCachePolicyCounts/);
+  assert.match(boardSource, /cancellation_reason: getCancellationReason\(\)/);
+  assert.match(boardSource, /if \(!boardMountedRef\.current\) return 'board_unmounted'/);
+  assert.match(boardSource, /logCancelledRefresh\('candidate_resolution'\)/);
+  assert.match(boardSource, /logCancelledRefresh\('metadata_enrichment'\)/);
 });
 
 test('Up Next gets lifecycle metadata with the existing TV details lookup', () => {

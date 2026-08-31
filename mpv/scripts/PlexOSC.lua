@@ -153,8 +153,8 @@ local osc_styles = {
     SeekbarChapterB = '{\\blur0\\bord0\\1c&H244BC9&}',
     SeekbarChapterDimA = '{\\blur0\\bord0\\1c&H1F2124&}',
     SeekbarChapterDimB = '{\\blur0\\bord0\\1c&H191A1C&}',
-    SeekbarChapterSpecial = '{\\blur0\\bord0\\1c&HB6C42B&}',
-    SeekbarChapterSpecialDim = '{\\blur0\\bord0\\1c&H484D18&}',
+    SeekbarChapterSpecial = '{\\blur0\\bord0\\1c&HFFFFFF&}',
+    SeekbarChapterSpecialDim = '{\\blur0\\bord0\\1c&HFFFFFF&}',
     SeekbarCached = '{\\blur0\\bord0.7\\1c&H243F8C&\\3c&H2F56C2&}',
     DelayLabel = '{\\blur0\\bord0\\shad0\\1c&HAAAAAA&\\fs12\\b1\\fn' .. user_opts.font .. '}',
     DelayCtrl = '{\\blur0\\bord0\\shad0\\1c&HFFFFFF&\\fs13\\b1\\fn' .. user_opts.font .. '}',
@@ -176,6 +176,10 @@ local osc_styles = {
     TrackMenuTitle = '{\\blur0\\bord0\\shad0\\1c&HAAAAAA&\\fs14\\b1\\fn' .. user_opts.font .. '}',
     TrackMenuItem = '{\\blur0\\bord0\\shad0\\1c&HD8D8D8&\\fs17\\fn' .. user_opts.font .. '}',
     TrackMenuItemSelected = '{\\blur0\\bord0\\shad0\\1c&H356BFF&\\fs17\\b1\\fn' .. user_opts.font .. '}',
+    SegmentFeedbackBg = '{\\blur0.8\\bord1\\shad0\\1c&H151515&\\3c&H555555&}',
+    SegmentFeedbackTitle = '{\\blur0\\bord0\\shad0\\1c&HF2F2F2&\\fs19\\b1\\fn' .. user_opts.font .. '}',
+    SegmentFeedbackAction = '{\\blur0\\bord0\\shad0\\1c&HFFFFFF&\\fs16\\b1\\fn' .. user_opts.font .. '}',
+    SegmentFeedbackMuted = '{\\blur0\\bord0\\shad0\\1c&HBABABA&\\fs15\\fn' .. user_opts.font .. '}',
 }
 
 -- internal states, do not touch
@@ -218,6 +222,8 @@ local state = {
     detected_segments = {},                 -- renderer-resolved intro/recap/outro ranges
     track_menu_type = nil,
     track_menu_first = 1,
+    segment_feedback_prompt = nil,
+    segment_feedback_timer = nil,
 }
 
 local thumbfast = {
@@ -695,6 +701,68 @@ end
 local function select_track_menu_item(type, value)
     mp.commandv('set', type, value)
     close_track_menu()
+end
+
+local segment_feedback_yes_binding = 'streamee-segment-feedback-yes'
+local segment_feedback_no_binding = 'streamee-segment-feedback-no'
+local segment_feedback_dismiss_binding = 'streamee-segment-feedback-dismiss'
+
+local function remove_segment_feedback_bindings()
+    mp.remove_key_binding(segment_feedback_yes_binding)
+    mp.remove_key_binding(segment_feedback_no_binding)
+    mp.remove_key_binding(segment_feedback_dismiss_binding)
+end
+
+local function respond_to_segment_feedback(response)
+    local prompt = state.segment_feedback_prompt
+    if not prompt then return end
+
+    mp.set_property('user-data/streamee-segment-feedback-response', response)
+    mp.set_property_number(
+        'user-data/streamee-segment-feedback-response-request',
+        prompt.request_id
+    )
+    state.segment_feedback_prompt = nil
+    if state.segment_feedback_timer then
+        state.segment_feedback_timer:kill()
+    end
+    remove_segment_feedback_bindings()
+    request_init()
+end
+
+local function show_segment_feedback_prompt(request_id, kind, source)
+    local numeric_request_id = tonumber(request_id)
+    if not numeric_request_id or numeric_request_id <= 0 then return end
+    if kind ~= 'intro' and kind ~= 'outro' then return end
+
+    if state.segment_feedback_prompt then
+        respond_to_segment_feedback('dismissed')
+    end
+    state.segment_feedback_prompt = {
+        request_id = numeric_request_id,
+        kind = kind,
+        source = source or 'local detection',
+    }
+
+    remove_segment_feedback_bindings()
+    mp.add_forced_key_binding('y', segment_feedback_yes_binding,
+        function() respond_to_segment_feedback('yes') end)
+    mp.add_forced_key_binding('n', segment_feedback_no_binding,
+        function() respond_to_segment_feedback('no') end)
+    mp.add_forced_key_binding('ESC', segment_feedback_dismiss_binding,
+        function() respond_to_segment_feedback('not-sure') end)
+
+    if not state.segment_feedback_timer then
+        state.segment_feedback_timer = mp.add_timeout(
+            12,
+            function() respond_to_segment_feedback('dismissed') end
+        )
+    end
+    state.segment_feedback_timer:kill()
+    state.segment_feedback_timer.timeout = 12
+    state.segment_feedback_timer:resume()
+    show_osc()
+    request_init()
 end
 
 --
@@ -1640,7 +1708,7 @@ layouts = function ()
     osc_param.areas = {} -- delete areas
 
     -- area for active mouse input
-    if state.track_menu_type then
+    if state.track_menu_type or state.segment_feedback_prompt then
         add_area('input', 0, 0, osc_param.playresx, osc_param.playresy)
     else
         add_area('input', get_hitbox_coords(posX, posY, 1, osc_geo.w, 110))
@@ -1835,6 +1903,45 @@ layouts = function ()
             lo.button.maxchars = 43
             row = row + 1
         end
+    end
+
+    if state.segment_feedback_prompt and elements['segment_feedback_bg'] then
+        local prompt_width = math.min(540, osc_param.playresx - 40)
+        local prompt_height = 104
+        local prompt_x = refX - prompt_width / 2
+        local prompt_y = math.max(30, refY - 255)
+        local button_width = math.min(128, (prompt_width - 56) / 3)
+        local button_gap = 8
+        local buttons_width = button_width * 3 + button_gap * 2
+        local button_x = refX - buttons_width / 2 + button_width / 2
+
+        lo = add_layout('segment_feedback_bg')
+        lo.geometry = {x = prompt_x, y = prompt_y, an = 7, w = prompt_width, h = prompt_height}
+        lo.style = osc_styles.SegmentFeedbackBg
+        lo.layer = 90
+        lo.alpha[1] = 18
+        lo.alpha[3] = 42
+        lo.box.radius = 8
+
+        lo = add_layout('segment_feedback_title')
+        lo.geometry = {x = refX, y = prompt_y + 28, an = 5, w = prompt_width - 24, h = 28}
+        lo.style = osc_styles.SegmentFeedbackTitle
+        lo.layer = 91
+
+        lo = add_layout('segment_feedback_yes')
+        lo.geometry = {x = button_x, y = prompt_y + 76, an = 5, w = button_width, h = 32}
+        lo.style = osc_styles.SegmentFeedbackAction
+        lo.layer = 92
+
+        lo = add_layout('segment_feedback_no')
+        lo.geometry = {x = button_x + button_width + button_gap, y = prompt_y + 76, an = 5, w = button_width, h = 32}
+        lo.style = osc_styles.SegmentFeedbackAction
+        lo.layer = 92
+
+        lo = add_layout('segment_feedback_unsure')
+        lo.geometry = {x = button_x + (button_width + button_gap) * 2, y = prompt_y + 76, an = 5, w = button_width, h = 32}
+        lo.style = osc_styles.SegmentFeedbackMuted
+        lo.layer = 92
     end
 
 	lo = add_layout('tog_fs')
@@ -2540,6 +2647,39 @@ function osc_init()
     ne.eventresponder['mbtn_left_up'] =
         function () state.rightTC_trem = not state.rightTC_trem end
 
+    if state.segment_feedback_prompt then
+        new_element('segment_feedback_bg', 'box')
+
+        ne = new_element('segment_feedback_title', 'button')
+        ne.content = function ()
+            local prompt = state.segment_feedback_prompt
+            if not prompt then return '' end
+            if prompt.kind == 'intro' then
+                return 'Is this the intro?  ·  ' .. prompt.source
+            end
+            return 'Does the outro start here?  ·  ' .. prompt.source
+        end
+        ne.styledown = false
+
+        ne = new_element('segment_feedback_yes', 'button')
+        ne.content = function ()
+            local prompt = state.segment_feedback_prompt
+            return prompt and prompt.kind == 'intro' and '[ Yes, skip ]' or '[ Yes, next ]'
+        end
+        ne.eventresponder['mbtn_left_up'] =
+            function () respond_to_segment_feedback('yes') end
+
+        ne = new_element('segment_feedback_no', 'button')
+        ne.content = '[ No ]'
+        ne.eventresponder['mbtn_left_up'] =
+            function () respond_to_segment_feedback('no') end
+
+        ne = new_element('segment_feedback_unsure', 'button')
+        ne.content = '[ Not sure ]'
+        ne.eventresponder['mbtn_left_up'] =
+            function () respond_to_segment_feedback('not-sure') end
+    end
+
     -- load layout
     layouts()
 
@@ -2555,6 +2695,10 @@ end
 function shutdown()
     clear_thumbfast()
     mp.remove_key_binding(track_menu_escape_binding)
+    remove_segment_feedback_bindings()
+    if state.segment_feedback_timer then
+        state.segment_feedback_timer:kill()
+    end
 end
 
 --
@@ -3154,6 +3298,10 @@ mp.register_script_message('osc-message', show_message)
 mp.register_script_message('streamee-file-info', show_file_info_panel)
 mp.register_script_message('streamee-help', show_help_panel)
 mp.register_script_message('streamee-subtitle-lines', open_subtitle_lines)
+mp.register_script_message(
+    'streamee-segment-feedback-prompt',
+    show_segment_feedback_prompt
+)
 mp.register_script_message('osc-chapterlist', function(dur)
     show_message(get_chapterlist(), dur)
 end)

@@ -86,10 +86,12 @@ if external_processing_height and source_height > external_processing_height:
 
 # RIFE 4.6 can estimate optical flow below full scale while retaining
 # full-resolution input, original frames, and generated output. Newer models
-# reject scale != 1. Auto preserves the measured half-scale mode for 4K.
+# reject scale != 1. Treat cropped 4K cinema sources as 4K while leaving
+# 1440p and 3440x1440 ultrawide sources at full motion-analysis scale.
 if model_name == "4.6":
+    is_4k_family = source_width >= 3500 or source_height >= 1800
     rife_scale = (
-        Fraction(1, 2) if scale_setting == "auto" and processing_mode == "auto" and source_height > 1080
+        Fraction(1, 2) if scale_setting == "auto" and processing_mode == "auto" and is_4k_family
         else Fraction(1, 1) if scale_setting == "auto"
         else Fraction(scale_setting)
     )
@@ -105,16 +107,9 @@ if alignment_fraction.denominator != 1:
 alignment = alignment_fraction.numerator
 
 
-def align_up(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
-
-
-def align_down(value: int, multiple: int) -> int:
-    return (value // multiple) * multiple
-
-
 # Border padding preserves the full source image and is removed from the
-# generated result. TensorRT profile dimensions must obey the same alignment.
+# generated result. TensorRT specializes one engine for the exact padded input
+# shape so fixed-resolution playback does not pay dynamic-shape overhead.
 pad_right = (-processing_width) % alignment
 pad_bottom = (-processing_height) % alignment
 if pad_right or pad_bottom:
@@ -122,11 +117,6 @@ if pad_right or pad_bottom:
 
 padded_width = processing_width + pad_right
 padded_height = processing_height + pad_bottom
-profile_min = align_up(128, alignment)
-profile_opt_width = min(align_up(1920, alignment), padded_width)
-profile_opt_height = min(align_up(1080, alignment), padded_height)
-profile_max_width = max(padded_width, align_down(4096, alignment))
-profile_max_height = max(padded_height, align_down(2304, alignment))
 
 # Mark hard cuts before converting to the RGB half-float input expected by RIFE.
 clip = clip.misc.SCDetect(threshold=0.12)
@@ -173,10 +163,8 @@ rgb = core.std.FrameEval(default_rgb, eval=select_rgb_conversion, prop_src=clip)
 backend = Backend.TRT(
     device_id=0,
     num_streams=gpu_streams,
-    static_shape=False,
-    min_shapes=[profile_min, profile_min],
-    opt_shapes=[profile_opt_width, profile_opt_height],
-    max_shapes=[profile_max_width, profile_max_height],
+    static_shape=True,
+    opt_shapes=[padded_width, padded_height],
 )
 backend.force_fp16 = True
 backend.tf32 = True

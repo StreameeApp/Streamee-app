@@ -36,7 +36,7 @@ import {
   shouldAutoSkipIntroDbSegment,
   validateIntroDbSegment,
 } from '../../services/introdb';
-import type { IntroDbSegment, IntroDbSegments, IntroSkipperDetectionResult, PlayerChapterSegments, PlayerDetectedSegment, PlayerPlaylistChangedPayload, PreparedQbittorrentStreamResult, StreamLaunchResult, StreamPlaylistItem, SubtitleProgressEvent, SubtitleSegment, TorrentStartupState } from '../../services/tauri';
+import type { IntroDbSegment, IntroDbSegments, IntroSkipperDetectionResult, PlayerChapterSegments, PlayerDetectedSegment, PlayerPlaylistChangedPayload, PlayerSegmentFeedbackPayload, PreparedQbittorrentStreamResult, SegmentFeedbackCandidate, StreamLaunchResult, StreamPlaylistItem, SubtitleProgressEvent, SubtitleSegment, TorrentStartupState } from '../../services/tauri';
 import './Player.css';
 
 const formatTime = (seconds: number): string => {
@@ -148,7 +148,46 @@ const LOCAL_INTRO_MAX_FAILURE_RETRIES = 30;
 const LOCAL_INTRO_SLOW_RETRY_MS = 60_000;
 const SEGMENT_ACTION_RETRY_MS = 1_000;
 const OUTRO_SMART_NEXT_RETRY_MS = 15_000;
+const SEGMENT_FEEDBACK_STORAGE_KEY = 'streamee:segment-feedback:v1';
+const SEGMENT_FEEDBACK_STORAGE_LIMIT = 400;
 const localIntroPlaybackMax = new Map<string, number>();
+
+type StoredSegmentFeedback = {
+  key: string;
+  response: 'yes' | 'no' | 'not-sure';
+  candidate: SegmentFeedbackCandidate;
+  recordedAt: string;
+};
+
+const readStoredSegmentFeedback = (): StoredSegmentFeedback[] => {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(SEGMENT_FEEDBACK_STORAGE_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+const hasStoredSegmentFeedback = (key: string): boolean => (
+  readStoredSegmentFeedback().some((entry) => entry?.key === key)
+);
+
+const storeSegmentFeedback = (
+  key: string,
+  response: StoredSegmentFeedback['response'],
+  candidate: SegmentFeedbackCandidate,
+): void => {
+  const retained = readStoredSegmentFeedback().filter((entry) => entry?.key !== key);
+  retained.push({ key, response, candidate, recordedAt: new Date().toISOString() });
+  try {
+    window.localStorage.setItem(
+      SEGMENT_FEEDBACK_STORAGE_KEY,
+      JSON.stringify(retained.slice(-SEGMENT_FEEDBACK_STORAGE_LIMIT)),
+    );
+  } catch {
+    // Feedback is optional; private/limited-storage sessions must not affect playback.
+  }
+};
 
 const isAiredEpisode = (airDate: string | null): boolean => {
   if (!airDate) return false;
@@ -937,8 +976,11 @@ const Player: React.FC = () => {
       return;
     }
 
-    const autoRestart = await window.electronAPI.settings.getSetting('svpAutoRestartOnPlaylistChange');
-    if (autoRestart !== 'true') {
+    const [autoRestart, rifeEnabled] = await Promise.all([
+      window.electronAPI.settings.getSetting('svpAutoRestartOnPlaylistChange'),
+      window.electronAPI.settings.getSetting('mpvRifeEnabled'),
+    ]);
+    if (autoRestart !== 'true' || rifeEnabled === 'true') {
       return;
     }
 
@@ -1601,6 +1643,7 @@ const Player: React.FC = () => {
     let playerSeekUnlisten: (() => void) | null = null;
     let playerPlaylistChangedUnlisten: (() => void) | null = null;
     let playerSmartNextUnlisten: (() => void) | null = null;
+    let playerSegmentFeedbackUnlisten: (() => void) | null = null;
     let playerAudioTrackChangedUnlisten: (() => void) | null = null;
     let playerClosedUnlisten: (() => void) | null = null;
     let playerEofUnlisten: (() => void) | null = null;
@@ -1647,6 +1690,8 @@ const Player: React.FC = () => {
     // finishing; episode/release-scoped keys keep retained results safe.
     const resolvedLocalIntroSegments = resolvedLocalIntroSegmentsRef.current;
     const resolvedLocalOutroSegments = resolvedLocalOutroSegmentsRef.current;
+    const localIntroFeedbackCandidates = new Map<string, SegmentFeedbackCandidate>();
+    const localOutroFeedbackCandidates = new Map<string, SegmentFeedbackCandidate>();
     const segmentDetectionRuns = new Map<string, SegmentDetectionRun>();
     let introSkipperGeneration = 0;
     let introSkipperOutroGeneration = 0;
@@ -1658,6 +1703,15 @@ const Player: React.FC = () => {
     const outroSmartNextRetryAfter = new Map<string, number>();
     const segmentDetectionLoggedKeys = new Set<string>();
     const segmentDecisionLoggedKeys = new Set<string>();
+    const segmentFeedbackPromptedKeys = new Set<string>();
+    let segmentFeedbackRequestSequence = Date.now();
+    let segmentFeedbackSeekSuppressedUntil = 0;
+    let activeSegmentFeedbackPrompt: {
+      requestId: number;
+      key: string;
+      candidate: SegmentFeedbackCandidate;
+      filename: string;
+    } | null = null;
     let lastPublishedDetectedSegmentsSignature = '';
     type SegmentBoundaryTimerState = {
       timerId: number;
@@ -2679,6 +2733,122 @@ const Player: React.FC = () => {
             : null
         );
       };
+      const segmentFeedbackSourceLabel = (candidate: SegmentFeedbackCandidate): string => {
+        if (candidate.source === 'chapter') return 'Chapter';
+        if (candidate.reason.startsWith('visual-')) return 'Visual analysis';
+        return 'Audio fingerprint';
+      };
+      const maybeShowSegmentFeedbackPrompt = async (
+        candidate: SegmentFeedbackCandidate | null,
+        localPlaybackKey: string,
+        filename: string,
+        playbackTime: number,
+      ) => {
+        if (
+          !candidate
+          || activeSegmentFeedbackPrompt
+          || playbackPausedRef.current
+          || Date.now() < segmentFeedbackSeekSuppressedUntil
+          || playbackTime < candidate.start_sec
+          || playbackTime >= candidate.end_sec
+        ) {
+          return;
+        }
+        const slotKey = `${localPlaybackKey}:${candidate.kind}`;
+        const feedbackKey = [
+          slotKey,
+          candidate.source,
+          candidate.reason,
+          Math.round(candidate.start_sec * 2) / 2,
+          Math.round(candidate.end_sec * 2) / 2,
+        ].join(':');
+        if (
+          segmentFeedbackPromptedKeys.has(slotKey)
+          || hasStoredSegmentFeedback(feedbackKey)
+        ) {
+          return;
+        }
+
+        segmentFeedbackRequestSequence += 1;
+        const requestId = segmentFeedbackRequestSequence;
+        activeSegmentFeedbackPrompt = {
+          requestId,
+          key: feedbackKey,
+          candidate,
+          filename,
+        };
+        segmentFeedbackPromptedKeys.add(slotKey);
+        try {
+          await window.electronAPI.player.showSegmentFeedbackPrompt(
+            requestId,
+            candidate.kind,
+            segmentFeedbackSourceLabel(candidate),
+          );
+          console.log('[Segment Feedback] Prompt shown', {
+            requestId,
+            kind: candidate.kind,
+            start: candidate.start_sec,
+            end: candidate.end_sec,
+            source: candidate.source,
+            reason: candidate.reason,
+            score: candidate.score,
+          });
+        } catch (error) {
+          if (activeSegmentFeedbackPrompt?.requestId === requestId) {
+            activeSegmentFeedbackPrompt = null;
+            segmentFeedbackPromptedKeys.delete(slotKey);
+          }
+          console.debug('[Segment Feedback] Prompt unavailable', error);
+        }
+      };
+      const handleSegmentFeedback = async (payload: PlayerSegmentFeedbackPayload) => {
+        const active = activeSegmentFeedbackPrompt;
+        if (!active || payload.request_id !== active.requestId) return;
+        activeSegmentFeedbackPrompt = null;
+
+        const { candidate } = active;
+        console.log('[Segment Feedback] Response received', {
+          requestId: payload.request_id,
+          response: payload.response,
+          kind: candidate.kind,
+          start: candidate.start_sec,
+          end: candidate.end_sec,
+          source: candidate.source,
+          reason: candidate.reason,
+        });
+        if (payload.response === 'dismissed') return;
+        storeSegmentFeedback(active.key, payload.response, candidate);
+
+        if (payload.response === 'no') {
+          showSmartNextMessage(`Thanks — this ${candidate.kind} candidate will be ignored.`, 3500);
+          return;
+        }
+        if (payload.response === 'not-sure') {
+          showSmartNextMessage('No problem — playback will continue.', 3000);
+          return;
+        }
+
+        const stillCurrent = normalizeSourceIdentity(payload.filename)
+          === normalizeSourceIdentity(active.filename);
+        if (!stillCurrent) return;
+        if (candidate.kind === 'intro') {
+          try {
+            await window.electronAPI.player.seekTime(candidate.end_sec, active.filename);
+            showSmartNextMessage('Thanks — intro confirmed and skipped.', 3000);
+          } catch (error) {
+            console.warn('[Segment Feedback] Confirmed intro seek failed', error);
+          }
+          return;
+        }
+
+        const advanced = await handleSmartNextRequest(active.filename);
+        showSmartNextMessage(
+          advanced
+            ? 'Thanks — outro confirmed.'
+            : 'Thanks — outro confirmed; the next episode is not ready yet.',
+          4000,
+        );
+      };
       const getIntroDbSegmentsForEpisode = async (
         imdbId: string | null,
         tmdbId: number,
@@ -2748,6 +2918,7 @@ const Player: React.FC = () => {
                 intro: !!segments.intro,
                 recap: !!segments.recap,
                 outro: !!segments.outro,
+                feedbackCandidate: segments.candidate?.reason ?? null,
               });
               return segments;
             })
@@ -2871,6 +3042,9 @@ const Player: React.FC = () => {
               );
             })
             .then((result) => {
+              if (result.candidate?.kind === 'intro') {
+                localIntroFeedbackCandidates.set(localIntroCacheKey, result.candidate);
+              }
               const persistentSegment = validateIntroDbSegment(
                 'intro',
                 result.segment,
@@ -3040,6 +3214,9 @@ const Player: React.FC = () => {
             duration,
           )
             .then((result) => {
+              if (result.candidate?.kind === 'outro') {
+                localOutroFeedbackCandidates.set(localOutroCacheKey, result.candidate);
+              }
               const persistentSegment = validateIntroDbSegment(
                 'outro',
                 result.segment,
@@ -3292,6 +3469,8 @@ const Player: React.FC = () => {
         let resolvedIntro = validateIntroDbSegment('intro', segments?.intro ?? null, duration);
         let resolvedRecap = validateIntroDbSegment('recap', segments?.recap ?? null, duration);
         let resolvedOutro = validateIntroDbSegment('outro', segments?.outro ?? null, duration);
+        let introFeedbackCandidate = localIntroFeedbackCandidates.get(localIntroCacheKey) ?? null;
+        let outroFeedbackCandidate = localOutroFeedbackCandidates.get(localOutroCacheKey) ?? null;
         let localDetectionAttempted = false;
         let localDetectionPending = false;
         const needsLocalChapterScan = settings.introSkipperEnabled && (
@@ -3313,6 +3492,11 @@ const Player: React.FC = () => {
           resolvedIntro ||= validateIntroDbSegment('intro', chapters?.intro ?? null, duration);
           resolvedRecap ||= validateIntroDbSegment('recap', chapters?.recap ?? null, duration);
           resolvedOutro ||= validateIntroDbSegment('outro', chapters?.outro ?? null, duration);
+          if (chapters?.candidate?.kind === 'intro') {
+            introFeedbackCandidate = chapters.candidate;
+          } else if (chapters?.candidate?.kind === 'outro') {
+            outroFeedbackCandidate = chapters.candidate;
+          }
         }
 
         if (!resolvedIntro) {
@@ -3401,6 +3585,9 @@ const Player: React.FC = () => {
             localDetectionPending = localResult?.status === 'waiting-for-buffer'
               || localResult?.status === 'waiting-for-local-cache';
             resolvedIntro = validateIntroDbSegment('intro', localResult?.segment ?? null, duration);
+            if (localResult?.candidate?.kind === 'intro') {
+              introFeedbackCandidate = localResult.candidate;
+            }
             if (resolvedIntro?.source === 'intro-skipper') {
               resolvedLocalIntroSegments.set(localIntroCacheKey, resolvedIntro);
             }
@@ -3445,6 +3632,9 @@ const Player: React.FC = () => {
               localOutroResult?.segment ?? null,
               duration,
             );
+            if (localOutroResult?.candidate?.kind === 'outro') {
+              outroFeedbackCandidate = localOutroResult.candidate;
+            }
             if (resolvedOutro?.source === 'intro-skipper-outro') {
               resolvedLocalOutroSegments.set(localOutroCacheKey, resolvedOutro);
             }
@@ -3456,6 +3646,23 @@ const Player: React.FC = () => {
           ['recap', resolvedRecap],
           ['outro', resolvedOutro],
         ]);
+
+        if (!resolvedIntro) {
+          await maybeShowSegmentFeedbackPrompt(
+            introFeedbackCandidate,
+            localPlaybackKey,
+            filename,
+            playbackTime,
+          );
+        }
+        if (!resolvedOutro) {
+          await maybeShowSegmentFeedbackPrompt(
+            outroFeedbackCandidate,
+            localPlaybackKey,
+            filename,
+            playbackTime,
+          );
+        }
 
         if (!localDetectionPending && !segmentDetectionLoggedKeys.has(episodeKey)) {
           segmentDetectionLoggedKeys.add(episodeKey);
@@ -4309,6 +4516,11 @@ const Player: React.FC = () => {
           void consumeSmartNextRequest(data, data.filename);
         });
 
+        playerSegmentFeedbackUnlisten = await window.electronAPI.playerEvents.onSegmentFeedback((data) => {
+          if (disposed) return;
+          void handleSegmentFeedback(data);
+        });
+
         playerAudioTrackChangedUnlisten = await window.electronAPI.playerEvents.onAudioTrackChanged(async ({ track_id }) => {
           if (disposed) return;
 
@@ -4407,6 +4619,7 @@ const Player: React.FC = () => {
           if (disposed) return;
 
           cancelSegmentBoundaryTimer('seek-event');
+          segmentFeedbackSeekSuppressedUntil = Date.now() + 10_000;
           if (data.playback_time != null) {
             lastKnownPlaybackTimeRef.current = data.playback_time;
           }
@@ -6127,6 +6340,7 @@ const Player: React.FC = () => {
       playerSeekUnlisten?.();
       playerPlaylistChangedUnlisten?.();
       playerSmartNextUnlisten?.();
+      playerSegmentFeedbackUnlisten?.();
       playerAudioTrackChangedUnlisten?.();
       playerClosedUnlisten?.();
       playerEofUnlisten?.();

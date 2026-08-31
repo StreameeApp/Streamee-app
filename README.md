@@ -159,15 +159,19 @@ Streamee exposes a configurable MPV processing chain rather than locking playbac
 
 #### RIFE frame generation
 
-Streamee can generate intermediate frames locally with RIFE through VapourSynth, vs-mlrt, and NVIDIA TensorRT. This is a separate playback path from SmoothVideo Project: enabling Streamee RIFE neither requires nor launches SVP.
+Streamee can generate intermediate frames locally with RIFE through VapourSynth, vs-mlrt, and NVIDIA TensorRT. This is a separate playback path from SmoothVideo Project. Enabling RIFE turns off SVP auto-start and stops the configured SVP manager so the two interpolation systems cannot run together.
 
 - Open **Settings → Integrations → RIFE Frame Generation**, select a model, and install the optional managed runtime. The initial download is about 2.8 GB and requires at least 6.5 GB of free space while installing.
 - Downloads can resume after interruption and every runtime or model archive is checked against its pinned SHA-256 digest before activation. Additional models can be installed individually after the base runtime is ready.
 - **RIFE 4.6** is the recommended starting model, especially for 4K sources. RIFE 4.9, 4.16 Lite, 4.18, and 4.25 provide alternatives with different detail, stability, and processing-cost tradeoffs.
 - The **2x** multiplier generates one intermediate frame between source frames; **3x** generates two and needs more GPU throughput. One TensorRT stream reduces VRAM pressure, while two can improve throughput on high-end GPUs.
-- **Auto** processing keeps the original input and output resolution. For 4K with RIFE 4.6, motion estimation runs internally at half scale by default; advanced users can select another RIFE 4.6 motion-analysis scale or compare native, 1080p, and 720p processing modes.
+- **Auto** processing keeps the original input and output resolution. For full-frame or cropped 4K-family sources with RIFE 4.6, motion estimation runs internally at half scale by default; ordinary 1440p sources remain full scale. Advanced users can select another RIFE 4.6 motion-analysis scale or compare native, 1080p, and 720p processing modes. Sub-0.5 scales are experimental because they reduce motion detail and may not lower total GPU power.
 - RIFE normally runs before upscaling to reduce GPU cost. RTX VSR users can reverse that order for comparison; renderer-based upscalers remain after RIFE. RTX Video HDR runs after frame generation for SDR sources and is skipped for native HDR.
 - Scene-cut detection prevents interpolation across hard cuts, and the generated frames are converted back using the source colour matrix and range.
+- **Concurrent frames** controls the VapourSynth queue depth. Auto uses a bounded queue selected for the active model and TensorRT stream count; explicit values are intended for diagnostics and GPU tuning.
+- Settings can prepare exact 3840×2160, 1920×1080, or 1280×720 TensorRT profiles before playback. Cropped cinema dimensions use their own static engine and can still compile on first use. Preparation can be cancelled and runtime mutation is blocked while MPV is active.
+- Streamee verifies the live MPV filter graph and generated frame rate after media loads. MPV displays whether RIFE is active or failed, and structured diagnostics include source/output frame rates and colour metadata.
+- Compiled engine count and disk use are visible under Advanced tuning. Failed zero-byte artifacts are cleaned automatically, and **Clear compiled engines** safely resets the cache when playback is stopped.
 
 RIFE currently requires Windows, a supported NVIDIA GPU and driver, and substantial GPU memory and processing headroom. The first playback after changing the model, resolution, scale, or GPU-specific configuration can pause while TensorRT compiles and caches an engine; later playback reuses that cache.
 

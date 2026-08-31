@@ -86,6 +86,10 @@ vec4 hook() {
     if (lighting_enabled < 0.5) return vec4(0.0, 0.0, 0.0, 1.0);
     vec2 lo = vec2(light_x, light_y) + 0.5 * HOOKED_pt;
     vec2 hi = vec2(light_x + light_w, light_y + light_h) - 0.5 * HOOKED_pt;
+    vec2 sample_inset = min(
+        4.0 * HOOKED_pt,
+        max((hi - lo) * 0.01, vec2(0.0))
+    );
     int edge = int(floor(HOOKED_pos.y * 4.0));
     float center = (floor(HOOKED_pos.x * 10.0) + 0.5) / 10.0;
     vec3 color = vec3(0.0);
@@ -95,10 +99,10 @@ vec4 hook() {
         for (int inward = 0; inward < 4; ++inward) {
             float depth = light_depth * (float(inward) + 0.5) / 4.0;
             vec2 p;
-            if (edge == 0) p = vec2(lo.x + depth, mix(lo.y, hi.y, t));
-            else if (edge == 1) p = vec2(hi.x - depth, mix(lo.y, hi.y, t));
-            else if (edge == 2) p = vec2(mix(lo.x, hi.x, t), lo.y + depth);
-            else p = vec2(mix(lo.x, hi.x, t), hi.y - depth);
+            if (edge == 0) p = vec2(lo.x + sample_inset.x + depth, mix(lo.y, hi.y, t));
+            else if (edge == 1) p = vec2(hi.x - sample_inset.x - depth, mix(lo.y, hi.y, t));
+            else if (edge == 2) p = vec2(mix(lo.x, hi.x, t), lo.y + sample_inset.y + depth);
+            else p = vec2(mix(lo.x, hi.x, t), hi.y - sample_inset.y - depth);
             color += HOOKED_tex(clamp(p, lo, hi)).rgb;
         }
     }
@@ -121,14 +125,29 @@ vec4 hook() {
                    / vec2(crop_w, crop_h);
     vec2 active_hi = (vec2(light_x + light_w, light_y + light_h)
                    - vec2(crop_x, crop_y)) / vec2(crop_w, crop_h);
+    vec2 q_min = vec2(0.5) - 0.5 / fit;
+    vec2 q_max = vec2(0.5) + 0.5 / fit;
     // cropdetect is intentionally quantized and can retain a few black pixels.
     // Absorb that rounding margin into the lighting instead of drawing a seam.
-    vec2 edge_guard = content_guard * min(
+    vec2 guarded_axes = step(
+        0.5 * HOOKED_pt / vec2(crop_w, crop_h),
+        max(active_lo, vec2(1.0) - active_hi)
+    );
+    vec2 edge_guard = content_guard * guarded_axes * min(
         4.0 * HOOKED_pt / vec2(crop_w, crop_h),
         max((active_hi - active_lo) * 0.01, vec2(0.0))
     );
-    active_lo += edge_guard;
-    active_hi -= edge_guard;
+    // Native picture edges can also contain a small dark resampling fringe.
+    // Guard only edges that actually border lighting so unaffected sides retain
+    // the complete source picture.
+    vec2 seam_guard = lighting_enabled * min(
+        4.0 * HOOKED_pt / vec2(crop_w, crop_h),
+        max((active_hi - active_lo) * 0.01, vec2(0.0))
+    );
+    vec2 low_seam_guard = min(seam_guard, max(active_lo - q_min, vec2(0.0)));
+    vec2 high_seam_guard = min(seam_guard, max(q_max - active_hi, vec2(0.0)));
+    active_lo += max(edge_guard, low_seam_guard);
+    active_hi -= max(edge_guard, high_seam_guard);
     bool inside_render = all(greaterThanEqual(q, vec2(0.0)))
                       && all(lessThanEqual(q, vec2(1.0)));
     bool inside_active = all(greaterThanEqual(q, active_lo))
@@ -136,8 +155,6 @@ vec4 hook() {
     if (inside_render && inside_active) {
         return HOOKED_tex(clamp(source_position, render_lo, render_hi));
     }
-    vec2 q_min = vec2(0.5) - 0.5 / fit;
-    vec2 q_max = vec2(0.5) + 0.5 / fit;
     vec4 violations = vec4(active_lo.x - q.x, q.x - active_hi.x,
                            active_lo.y - q.y, q.y - active_hi.y);
     vec4 spans = max(vec4(active_lo.x - q_min.x, q_max.x - active_hi.x,

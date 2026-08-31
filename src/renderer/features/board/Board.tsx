@@ -294,6 +294,7 @@ const Board: React.FC = () => {
   const [heroReady, setHeroReady] = useState(false);
   const catalogGridRef = useRef<HTMLDivElement>(null);
   const continueRefreshGenerationRef = useRef(0);
+  const boardMountedRef = useRef(true);
   const releaseQualitySnapshot = useSyncExternalStore(
     subscribeXrelQualitySnapshot,
     getXrelQualitySnapshot,
@@ -304,6 +305,13 @@ const Board: React.FC = () => {
     () => buildContinueViewFingerprint(continueWatching, watched, watchedEpisodes),
     [continueWatching, watched, watchedEpisodes],
   );
+
+  useEffect(() => {
+    boardMountedRef.current = true;
+    return () => {
+      boardMountedRef.current = false;
+    };
+  }, []);
 
   useLayoutEffect(() => {
     const grid = catalogGridRef.current;
@@ -847,6 +855,56 @@ const Board: React.FC = () => {
         noResultCachePolicy?: string;
         noResultCacheTtlMs?: number;
       }> = [];
+      const summarizeResolvedEpisodes = () => {
+        const resolvedResultCount = resolvedEpisodes.filter((item) => item.nextEpisode).length;
+        const failedResultCount = resolvedEpisodes.filter((item) => item.failed).length;
+        const cachedResultCount = resolvedEpisodes.filter((item) => item.cacheHit).length;
+        const noResultCachePolicyCounts = resolvedEpisodes.reduce<Record<string, number>>((counts, item) => {
+          if (item.noResultCachePolicy) {
+            counts[item.noResultCachePolicy] = (counts[item.noResultCachePolicy] ?? 0) + 1;
+          }
+          return counts;
+        }, {});
+        return {
+          resolvedCandidateCount: resolvedEpisodes.length,
+          unresolvedCandidateCount: Math.max(0, upNextCandidates.length - resolvedEpisodes.length),
+          cachedResultCount,
+          cacheMissCount: resolvedEpisodes.length - cachedResultCount,
+          resolvedResultCount,
+          noResultCount: resolvedEpisodes.length - resolvedResultCount - failedResultCount,
+          failedResultCount,
+          seasonListLookups: resolvedEpisodes.reduce((total, item) => total + item.seasonListLookups, 0),
+          episodeListLookups: resolvedEpisodes.reduce((total, item) => total + item.episodeListLookups, 0),
+          noResultCachePolicyCounts,
+        };
+      };
+      const getCancellationReason = () => {
+        if (!boardMountedRef.current) return 'board_unmounted';
+        if (continueRefreshGenerationRef.current !== refreshGeneration) return 'refresh_superseded';
+        if (cancelled) return 'effect_cleanup';
+        return 'unknown';
+      };
+      const logCancelledRefresh = (cancellationStage: 'candidate_resolution' | 'metadata_enrichment') => {
+        const summary = summarizeResolvedEpisodes();
+        logger.info('board.up_next_refresh.cancelled', '[TMDB Up Next] Refresh cancelled', {
+          request_id: refreshRequestId,
+          status: 'cancelled',
+          duration_ms: Math.max(0, performance.now() - refreshStartedAt),
+          candidate_count: upNextCandidates.length,
+          resolved_candidate_count: summary.resolvedCandidateCount,
+          unresolved_candidate_count: summary.unresolvedCandidateCount,
+          cached_result_count: summary.cachedResultCount,
+          cache_miss_count: summary.cacheMissCount,
+          resolved_result_count: summary.resolvedResultCount,
+          no_result_count: summary.noResultCount,
+          failed_result_count: summary.failedResultCount,
+          season_list_lookups: summary.seasonListLookups,
+          episode_list_lookups: summary.episodeListLookups,
+          no_result_cache_policy_counts: summary.noResultCachePolicyCounts,
+          cancellation_reason: getCancellationReason(),
+          cancellation_stage: cancellationStage,
+        }, 'board.tmdb_up_next');
+      };
       let nextCandidateIndex = 0;
       const workerCount = Math.min(4, upNextCandidates.length);
       const workers = Array.from({ length: workerCount }, async () => {
@@ -861,13 +919,7 @@ const Board: React.FC = () => {
       });
       await Promise.all(workers);
       if (!isCurrentRefresh()) {
-        logger.info('board.up_next_refresh.cancelled', '[TMDB Up Next] Refresh cancelled', {
-          request_id: refreshRequestId,
-          status: 'cancelled',
-          duration_ms: Math.max(0, performance.now() - refreshStartedAt),
-          candidate_count: upNextCandidates.length,
-          resolved_candidate_count: resolvedEpisodes.length,
-        }, 'board.tmdb_up_next');
+        logCancelledRefresh('candidate_resolution');
         return;
       }
 
@@ -877,14 +929,7 @@ const Board: React.FC = () => {
           .map(({ show }) => ({ tmdbId: show.tmdbId, mediaType: 'tv' as const })),
       );
       if (!isCurrentRefresh()) {
-        logger.info('board.up_next_refresh.cancelled', '[TMDB Up Next] Refresh cancelled', {
-          request_id: refreshRequestId,
-          status: 'cancelled',
-          duration_ms: Math.max(0, performance.now() - refreshStartedAt),
-          candidate_count: upNextCandidates.length,
-          resolved_candidate_count: resolvedEpisodes.length,
-          cancellation_stage: 'metadata_enrichment',
-        }, 'board.tmdb_up_next');
+        logCancelledRefresh('metadata_enrichment');
         return;
       }
 
@@ -921,17 +966,7 @@ const Board: React.FC = () => {
         setContinueWatchingView(merged);
         setContinueWatchingViewRefresh(continueRefreshFingerprint, Date.now());
 
-        const seasonListLookups = resolvedEpisodes.reduce((total, item) => total + item.seasonListLookups, 0);
-        const episodeListLookups = resolvedEpisodes.reduce((total, item) => total + item.episodeListLookups, 0);
-        const cachedResultCount = resolvedEpisodes.filter((item) => item.cacheHit).length;
-        const resolvedResultCount = resolvedEpisodes.filter((item) => item.nextEpisode).length;
-        const failedResultCount = resolvedEpisodes.filter((item) => item.failed).length;
-        const noResultCachePolicyCounts = resolvedEpisodes.reduce<Record<string, number>>((counts, item) => {
-          if (item.noResultCachePolicy) {
-            counts[item.noResultCachePolicy] = (counts[item.noResultCachePolicy] ?? 0) + 1;
-          }
-          return counts;
-        }, {});
+        const summary = summarizeResolvedEpisodes();
         const highestFanoutShows = [...resolvedEpisodes]
           .sort((a, b) => b.episodeListLookups - a.episodeListLookups)
           .slice(0, UP_NEXT_DIAGNOSTIC_SHOW_LIMIT)
@@ -961,19 +996,20 @@ const Board: React.FC = () => {
             error_kind: item.errorKind ?? null,
           }));
 
-        const logRefreshCompleted = failedResultCount > 0 ? logger.warn : logger.info;
+        const logRefreshCompleted = summary.failedResultCount > 0 ? logger.warn : logger.info;
         logRefreshCompleted('board.up_next_refresh.completed', '[TMDB Up Next] Refresh completed', {
           request_id: refreshRequestId,
-          status: failedResultCount > 0 ? 'degraded' : 'completed',
+          status: summary.failedResultCount > 0 ? 'degraded' : 'completed',
           duration_ms: Math.max(0, performance.now() - refreshStartedAt),
           candidate_count: upNextCandidates.length,
-          resolved_result_count: resolvedResultCount,
-          no_result_count: resolvedEpisodes.length - resolvedResultCount - failedResultCount,
-          failed_result_count: failedResultCount,
-          cached_result_count: cachedResultCount,
-          season_list_lookups: seasonListLookups,
-          episode_list_lookups: episodeListLookups,
-          no_result_cache_policy_counts: noResultCachePolicyCounts,
+          resolved_result_count: summary.resolvedResultCount,
+          no_result_count: summary.noResultCount,
+          failed_result_count: summary.failedResultCount,
+          cached_result_count: summary.cachedResultCount,
+          cache_miss_count: summary.cacheMissCount,
+          season_list_lookups: summary.seasonListLookups,
+          episode_list_lookups: summary.episodeListLookups,
+          no_result_cache_policy_counts: summary.noResultCachePolicyCounts,
           metadata_preview_count: enrichedItems.length,
           highest_fanout_shows: highestFanoutShows,
         }, 'board.tmdb_up_next');

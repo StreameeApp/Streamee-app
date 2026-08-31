@@ -19,19 +19,36 @@ pub fn get_mpv_pipe_name() -> &'static str {
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
 #[cfg(target_os = "windows")]
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, OPEN_EXISTING,
 };
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 
 static MPV_IPC_RUNNING: AtomicBool = AtomicBool::new(false);
 static WATCHER_RUNNING: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WATCHED_MPV_PID: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_os = "windows")]
+static SPAWNED_MPV_PID: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "windows")]
+static EXPECTED_RIFE_PID: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "windows")]
+static EXPECTED_RIFE_MULTIPLIER: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "windows")]
 static SMART_NEXT_PENDING_REQUEST: once_cell::sync::Lazy<Mutex<Option<SmartNextPendingRequest>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
+#[cfg(target_os = "windows")]
+static RIFE_PLAYBACK_STATUS: once_cell::sync::Lazy<Mutex<Option<serde_json::Value>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
+#[cfg(target_os = "windows")]
+const RIFE_HEALTH_WARMUP: Duration = Duration::from_secs(5);
+#[cfg(target_os = "windows")]
+const RIFE_HEALTH_FAILURE_DEADLINE: Duration = Duration::from_secs(15);
+#[cfg(target_os = "windows")]
+const RIFE_HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -83,6 +100,238 @@ fn clear_pending_smart_next_request_for_pid(mpv_pid: u32, reason: &str) {
 // Keep the pipe name stable to match bundled mpv.conf and preserve SVP hooking.
 static MPV_PIPE_NAME: once_cell::sync::Lazy<String> =
     once_cell::sync::Lazy::new(|| "\\\\.\\pipe\\mpvpipe".to_string());
+
+#[cfg(target_os = "windows")]
+pub fn active_player_pid() -> u32 {
+    for slot in [&SPAWNED_MPV_PID, &WATCHED_MPV_PID] {
+        let pid = slot.load(Ordering::SeqCst);
+        if pid != 0 && process_is_running(pid) {
+            return pid;
+        }
+        if pid != 0 {
+            let _ = slot.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+    0
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn active_player_pid() -> u32 {
+    0
+}
+
+#[cfg(target_os = "windows")]
+fn process_is_running(pid: u32) -> bool {
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else {
+        return false;
+    };
+    let running = unsafe { WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT;
+    let _ = unsafe { CloseHandle(handle) };
+    running
+}
+
+#[cfg(target_os = "windows")]
+pub fn register_spawned_player(pid: u32) {
+    SPAWNED_MPV_PID.store(pid, Ordering::SeqCst);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn register_spawned_player(_pid: u32) {}
+
+#[cfg(target_os = "windows")]
+pub fn rife_session_active_or_expected() -> bool {
+    let pid = EXPECTED_RIFE_PID.load(Ordering::SeqCst);
+    pid != 0 && process_is_running(pid)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn rife_session_active_or_expected() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+pub fn register_rife_expectation(app_handle: &AppHandle, pid: u32, multiplier: Option<u32>) {
+    let expected_multiplier = multiplier
+        .filter(|value| matches!(value, 2 | 3))
+        .unwrap_or(0);
+    EXPECTED_RIFE_MULTIPLIER.store(expected_multiplier, Ordering::SeqCst);
+    EXPECTED_RIFE_PID.store(
+        if expected_multiplier == 0 { 0 } else { pid },
+        Ordering::SeqCst,
+    );
+    if expected_multiplier != 0 {
+        publish_rife_playback_status(
+            app_handle,
+            serde_json::json!({
+                "status": "pending",
+                "pid": pid,
+                "multiplier": expected_multiplier,
+                "message": "RIFE is initializing"
+            }),
+        );
+        info!(
+            event = "rife.session_pending",
+            source = "backend",
+            subsystem = "rife.playback",
+            status = "Pending",
+            playback_session_id = pid,
+            multiplier = expected_multiplier,
+            "[RIFE] Session verification pending"
+        );
+    } else if let Ok(mut current) = RIFE_PLAYBACK_STATUS.lock() {
+        *current = None;
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn register_rife_expectation(_app_handle: &AppHandle, _pid: u32, _multiplier: Option<u32>) {}
+
+#[cfg(target_os = "windows")]
+fn publish_rife_playback_status(app_handle: &AppHandle, status: serde_json::Value) {
+    if let Ok(mut current) = RIFE_PLAYBACK_STATUS.lock() {
+        *current = Some(status.clone());
+    }
+    let _ = app_handle.emit("rife://playback-status", status);
+}
+
+#[cfg(target_os = "windows")]
+pub fn current_rife_playback_status() -> Option<serde_json::Value> {
+    let mut current = RIFE_PLAYBACK_STATUS.lock().ok()?;
+    let pid = current
+        .as_ref()
+        .and_then(|status| status.get("pid"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    if pid.is_some_and(|value| !process_is_running(value)) {
+        *current = None;
+        return None;
+    }
+    current.clone()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn current_rife_playback_status() -> Option<serde_json::Value> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn clear_rife_playback_status(pid: u32) {
+    if let Ok(mut current) = RIFE_PLAYBACK_STATUS.lock() {
+        let belongs_to_session = current
+            .as_ref()
+            .and_then(|status| status.get("pid"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(pid));
+        if belongs_to_session {
+            *current = None;
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn inspect_rife_filter(pipe: HANDLE) -> Option<bool> {
+    get_property_value(pipe, "vf")?
+        .as_array()
+        .and_then(|filters| {
+            filters.iter().find_map(|filter| {
+                if filter.get("label").and_then(serde_json::Value::as_str) != Some("streamee-rife")
+                {
+                    return None;
+                }
+                Some(
+                    filter
+                        .get("enabled")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true),
+                )
+            })
+        })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn rife_sustaining(
+    container_fps: Option<f64>,
+    output_fps: Option<f64>,
+    multiplier: u32,
+) -> Option<bool> {
+    match (container_fps, output_fps) {
+        (Some(source), Some(output)) if source > 0.0 => {
+            Some(output >= source * multiplier as f64 * 0.95)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn emit_rife_playback_status(
+    app_handle: &AppHandle,
+    pipe: HANDLE,
+    status: &str,
+    pid: u32,
+    multiplier: u32,
+    filename: &str,
+    container_fps: Option<f64>,
+    output_fps: Option<f64>,
+    input_video: Option<serde_json::Value>,
+    output_video: Option<serde_json::Value>,
+    message: &str,
+    show_osd: bool,
+) {
+    if show_osd {
+        show_hdr_message(pipe, message);
+    }
+    let sustaining = rife_sustaining(container_fps, output_fps, multiplier);
+    publish_rife_playback_status(
+        app_handle,
+        serde_json::json!({
+            "status": status,
+            "pid": pid,
+            "multiplier": multiplier,
+            "filename": filename,
+            "containerFps": container_fps,
+            "outputFps": output_fps,
+            "sustaining": sustaining,
+            "inputVideo": &input_video,
+            "outputVideo": &output_video,
+            "message": message,
+        }),
+    );
+    if status == "failed" {
+        warn!(
+            event = "rife.session_failed",
+            source = "backend",
+            subsystem = "rife.playback",
+            status = "Failed",
+            error_kind = "filter_initialization",
+            playback_session_id = pid,
+            multiplier,
+            filename,
+            message,
+            "[RIFE] Session verification failed"
+        );
+    } else {
+        let readiness_status = if sustaining == Some(true) {
+            "Ready"
+        } else {
+            "Degraded"
+        };
+        info!(
+            event = "rife.session_ready",
+            source = "backend",
+            subsystem = "rife.playback",
+            status = readiness_status,
+            playback_session_id = pid,
+            multiplier,
+            container_fps,
+            output_fps,
+            sustaining,
+            input_video = ?input_video,
+            output_video = ?output_video,
+            filename,
+            "[RIFE] Session verified"
+        );
+    }
+}
 
 #[cfg(target_os = "windows")]
 fn set_main_window_always_on_top(app_handle: &AppHandle, always_on_top: bool) {
@@ -286,6 +535,51 @@ pub async fn show_player_message(message: String, duration_ms: Option<u64>) -> R
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (message, duration_ms);
+        Err("Not implemented for this platform".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn show_segment_feedback_prompt(
+    request_id: i64,
+    kind: String,
+    source: String,
+) -> Result<(), String> {
+    if request_id <= 0 {
+        return Err("Segment feedback request ID must be positive".to_string());
+    }
+    if !matches!(kind.as_str(), "intro" | "outro") {
+        return Err("Segment feedback kind must be intro or outro".to_string());
+    }
+    let source = source.trim();
+    if source.is_empty() || source.len() > 80 {
+        return Err("Segment feedback source is invalid".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let pipe = connect_to_mpv_pipe_with_retry()
+            .ok_or_else(|| "MPV not connected after retry".to_string())?;
+        let command = MpvCommand {
+            command: vec![
+                serde_json::json!("script-message-to"),
+                serde_json::json!("PlexOSC"),
+                serde_json::json!("streamee-segment-feedback-prompt"),
+                serde_json::json!(request_id.to_string()),
+                serde_json::json!(kind),
+                serde_json::json!(source),
+            ],
+            request_id: None,
+        };
+        let result = send_command(pipe, &command);
+        unsafe {
+            let _ = CloseHandle(pipe);
+        }
+        confirmed_unit_command(result, "show segment feedback prompt")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (request_id, kind, source);
         Err("Not implemented for this platform".to_string())
     }
 }
@@ -2012,7 +2306,8 @@ pub fn start_player_watcher(app_handle: AppHandle) {
             }
             set_svp_enabled_property(
                 pipe,
-                crate::get_bool_setting(&app_handle, "svpAutoStartEnabled"),
+                crate::get_bool_setting(&app_handle, "svpAutoStartEnabled")
+                    && !crate::get_bool_setting(&app_handle, "mpvRifeEnabled"),
             );
 
             let mut current_state = PlaybackSessionState::new();
@@ -2035,7 +2330,12 @@ pub fn start_player_watcher(app_handle: AppHandle) {
             let mut last_hdr_toggle_request = 0i64;
             let mut last_svp_restart_request = 0i64;
             let mut last_smart_next_request = 0i64;
+            let mut last_segment_feedback_response_request = 0i64;
             let mut pipe_disconnected = false;
+            let mut rife_health_filename = String::new();
+            let mut rife_health_started: Option<std::time::Instant> = None;
+            let mut rife_health_last_report: Option<std::time::Instant> = None;
+            let mut rife_health_last_state: Option<&'static str> = None;
 
             // Get initial state before entering loop
             {
@@ -2143,6 +2443,130 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                 }),
                             );
                             last_progress_emit = std::time::Instant::now();
+                        }
+
+                        let expected_rife_pid = EXPECTED_RIFE_PID.load(Ordering::SeqCst);
+                        let expected_multiplier = EXPECTED_RIFE_MULTIPLIER.load(Ordering::SeqCst);
+                        if expected_rife_pid == mpv_pid
+                            && expected_multiplier != 0
+                            && !current_state.filename.is_empty()
+                        {
+                            if rife_health_filename != current_state.filename {
+                                rife_health_filename = current_state.filename.clone();
+                                rife_health_started = Some(std::time::Instant::now());
+                                rife_health_last_report = None;
+                                rife_health_last_state = None;
+                            }
+                            let now = std::time::Instant::now();
+                            let elapsed = rife_health_started
+                                .map(|started| started.elapsed())
+                                .unwrap_or_default();
+                            let report_due = rife_health_last_report
+                                .map(|reported| reported.elapsed() >= RIFE_HEALTH_REPORT_INTERVAL)
+                                .unwrap_or(true);
+                            match inspect_rife_filter(pipe) {
+                                Some(true) if elapsed >= RIFE_HEALTH_WARMUP => {
+                                    let container_fps = get_property_value(pipe, "container-fps")
+                                        .and_then(|value| value.as_f64());
+                                    let output_fps = get_property_value(pipe, "estimated-vf-fps")
+                                        .and_then(|value| value.as_f64());
+                                    if output_fps.is_some()
+                                        || elapsed >= RIFE_HEALTH_FAILURE_DEADLINE
+                                    {
+                                        let sustaining = rife_sustaining(
+                                            container_fps,
+                                            output_fps,
+                                            expected_multiplier,
+                                        )
+                                        .unwrap_or(false);
+                                        let state = if sustaining {
+                                            "active"
+                                        } else if output_fps.is_some() {
+                                            "degraded"
+                                        } else {
+                                            "unknown-rate"
+                                        };
+                                        let message = if sustaining {
+                                            format!(
+                                                "RIFE is active at {:.3} fps",
+                                                output_fps.unwrap_or_default()
+                                            )
+                                        } else if let Some(output) = output_fps {
+                                            format!(
+                                                "RIFE is active at {output:.3} fps but is below the requested {expected_multiplier}x rate"
+                                            )
+                                        } else {
+                                            "RIFE is active; output frame rate is not available yet"
+                                                .to_string()
+                                        };
+                                        if rife_health_last_state != Some(state) || report_due {
+                                            let input_video =
+                                                get_property_value(pipe, "video-params");
+                                            let output_video =
+                                                get_property_value(pipe, "video-out-params");
+                                            emit_rife_playback_status(
+                                                &app_handle,
+                                                pipe,
+                                                "active",
+                                                mpv_pid,
+                                                expected_multiplier,
+                                                &current_state.filename,
+                                                container_fps,
+                                                output_fps,
+                                                input_video,
+                                                output_video,
+                                                &message,
+                                                rife_health_last_state != Some(state),
+                                            );
+                                            rife_health_last_state = Some(state);
+                                            rife_health_last_report = Some(now);
+                                        }
+                                    }
+                                }
+                                Some(false) if elapsed >= RIFE_HEALTH_WARMUP => {
+                                    let state = "disabled";
+                                    if rife_health_last_state != Some(state) || report_due {
+                                        emit_rife_playback_status(
+                                            &app_handle,
+                                            pipe,
+                                            "failed",
+                                            mpv_pid,
+                                            expected_multiplier,
+                                            &current_state.filename,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            "The RIFE filter is present but disabled",
+                                            rife_health_last_state != Some(state),
+                                        );
+                                        rife_health_last_state = Some(state);
+                                        rife_health_last_report = Some(now);
+                                    }
+                                }
+                                None if elapsed >= RIFE_HEALTH_FAILURE_DEADLINE => {
+                                    let state = "missing";
+                                    if rife_health_last_state != Some(state) || report_due {
+                                        emit_rife_playback_status(
+                                            &app_handle,
+                                            pipe,
+                                            "failed",
+                                            mpv_pid,
+                                            expected_multiplier,
+                                            &current_state.filename,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            "The RIFE filter did not initialize",
+                                            rife_health_last_state != Some(state),
+                                        );
+                                        rife_health_last_state = Some(state);
+                                        rife_health_last_report = Some(now);
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
 
@@ -2303,6 +2727,51 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                             } else {
                                 debug!("[MPV IPC] Ignoring Smart Next request {request}; another request is still pending");
                             }
+                        }
+                    }
+
+                    let segment_feedback_request = get_property_value(
+                        pipe,
+                        "user-data/streamee-segment-feedback-response-request",
+                    )
+                    .and_then(|value| {
+                        value
+                            .as_i64()
+                            .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+                    })
+                    .unwrap_or(0);
+                    if segment_feedback_request > 0
+                        && segment_feedback_request != last_segment_feedback_response_request
+                    {
+                        let response = get_property_value(
+                            pipe,
+                            "user-data/streamee-segment-feedback-response",
+                        )
+                        .and_then(|value| value.as_str().map(str::to_owned));
+                        if let Some(response) = response.filter(|value| {
+                            matches!(value.as_str(), "yes" | "no" | "not-sure" | "dismissed")
+                        }) {
+                            last_segment_feedback_response_request = segment_feedback_request;
+                            let clear_request = MpvCommand {
+                                command: vec![
+                                    serde_json::json!("set_property"),
+                                    serde_json::json!(
+                                        "user-data/streamee-segment-feedback-response-request"
+                                    ),
+                                    serde_json::json!(0),
+                                ],
+                                request_id: None,
+                            };
+                            let _ = send_command(pipe, &clear_request);
+                            let _ = app_handle.emit(
+                                "player://segment-feedback",
+                                serde_json::json!({
+                                    "request_id": segment_feedback_request,
+                                    "response": response,
+                                    "filename": current_state.filename,
+                                    "playlist_pos": current_state.playlist_pos,
+                                }),
+                            );
                         }
                     }
                 }
@@ -2674,6 +3143,14 @@ pub fn start_player_watcher(app_handle: AppHandle) {
             }
             let _ =
                 WATCHED_MPV_PID.compare_exchange(mpv_pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+            let _ =
+                SPAWNED_MPV_PID.compare_exchange(mpv_pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+            let _ =
+                EXPECTED_RIFE_PID.compare_exchange(mpv_pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+            if EXPECTED_RIFE_PID.load(Ordering::SeqCst) == 0 {
+                EXPECTED_RIFE_MULTIPLIER.store(0, Ordering::SeqCst);
+            }
+            clear_rife_playback_status(mpv_pid);
             clear_pending_smart_next_request_for_pid(mpv_pid, "MPV session ended");
             std::thread::sleep(Duration::from_millis(500));
         }
@@ -2710,8 +3187,8 @@ pub fn stop_player_watcher() {
 mod smart_next_tests {
     use super::{
         cached_tail_seconds, cached_window_end_seconds, mpv_start_option,
-        next_smart_next_request_id, should_request_smart_next, SmartEpisodeDirection,
-        SmartNextPendingRequest,
+        next_smart_next_request_id, rife_sustaining, should_request_smart_next,
+        SmartEpisodeDirection, SmartNextPendingRequest,
     };
 
     #[test]
@@ -2772,6 +3249,14 @@ mod smart_next_tests {
         assert_eq!(mpv_start_option(Some(150.0)), Some("100%".to_string()));
         assert_eq!(mpv_start_option(Some(0.0)), None);
         assert_eq!(mpv_start_option(Some(f64::NAN)), None);
+    }
+
+    #[test]
+    fn rife_sustaining_allows_small_frame_rate_jitter() {
+        assert_eq!(rife_sustaining(Some(24.0), Some(46.0), 2), Some(true));
+        assert_eq!(rife_sustaining(Some(24.0), Some(45.0), 2), Some(false));
+        assert_eq!(rife_sustaining(Some(24.0), None, 2), None);
+        assert_eq!(rife_sustaining(Some(0.0), Some(60.0), 2), None);
     }
 
     #[test]

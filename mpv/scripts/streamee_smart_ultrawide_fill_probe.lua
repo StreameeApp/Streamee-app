@@ -26,6 +26,8 @@ local opts = {
     max_total_crop_fraction = 0.35,
     symmetry_tolerance_fraction = 0.02,
     min_content_aspect = 1.8,
+    min_pillarbox_content_aspect = 1.2,
+    max_pillarbox_content_aspect = 1.85,
 }
 
 options.read_options(opts, "streamee_smart_ultrawide_fill_probe")
@@ -117,11 +119,12 @@ local function crops_equivalent(left, right)
     if left_none or right_none then
         return left_none == true and right_none == true
     end
-    if not lw or not rw or lw ~= rw then
+    if not lw or not rw then
         return false
     end
     local tolerance = math.max(0, tonumber(opts.crop_tolerance) or 0)
-    return math.abs(lh - rh) <= tolerance * 2
+    return math.abs(lw - rw) <= tolerance * 2
+        and math.abs(lh - rh) <= tolerance * 2
         and math.abs(lx - rx) <= tolerance
         and math.abs(ly - ry) <= tolerance
 end
@@ -154,16 +157,20 @@ local function detected_rectangle()
         return nil
     end
 
+    local width = metadata_number(metadata, "lavfi.cropdetect.w")
     local height = metadata_number(metadata, "lavfi.cropdetect.h")
+    local x = metadata_number(metadata, "lavfi.cropdetect.x")
     local y = metadata_number(metadata, "lavfi.cropdetect.y")
-    if height and y then
-        return height, y
+    if width and height and x and y then
+        return width, height, x, y
     end
 
     local legacy = metadata["lavfi.crop"]
     if type(legacy) == "string" then
-        local _, legacy_h, _, legacy_y = legacy:match("^(%d+):(%d+):(%d+):(%d+)$")
-        return tonumber(legacy_h), tonumber(legacy_y)
+        local legacy_w, legacy_h, legacy_x, legacy_y =
+            legacy:match("^(%d+):(%d+):(%d+):(%d+)$")
+        return tonumber(legacy_w), tonumber(legacy_h),
+            tonumber(legacy_x), tonumber(legacy_y)
     end
 
     return nil
@@ -173,44 +180,89 @@ local function validated_candidate()
     local source_width = mp.get_property_number("video-params/w")
     local source_height = mp.get_property_number("video-params/h")
     local detector_height = mp.get_property_number("video-out-params/h")
-    local height, y = detected_rectangle()
-    if not source_width or not source_height or not detector_height or not height or not y then
+    local detector_width = mp.get_property_number("video-out-params/w")
+    local width, height, x, y = detected_rectangle()
+    if not source_width or not source_height or not detector_width or not detector_height
+        or not width or not height or not x or not y then
         return nil
     end
-    if source_width <= 0 or source_height <= 0 or detector_height <= 0 or height <= 0 then
+    if source_width <= 0 or source_height <= 0
+        or detector_width <= 0 or detector_height <= 0
+        or width <= 0 or height <= 0 then
         return nil
     end
 
-    local top = y
-    local bottom = detector_height - (y + height)
-    local symmetry_tolerance = math.max(
+    local top = math.max(0, y)
+    local bottom = math.max(0, detector_height - (y + height))
+    local left = math.max(0, x)
+    local right = math.max(0, detector_width - (x + width))
+    local vertical_symmetry_tolerance = math.max(
         4,
         detector_height * opts.symmetry_tolerance_fraction
     )
-    if math.abs(top - bottom) > symmetry_tolerance then
+    local vertical_crop = top + bottom
+    local has_vertical_bars = vertical_crop >= detector_height * opts.min_bar_fraction * 2
+    if has_vertical_bars
+        and (math.abs(top - bottom) > vertical_symmetry_tolerance
+            or vertical_crop > detector_height * opts.max_total_crop_fraction) then
         return nil
     end
 
-    local total_crop = top + bottom
-    if total_crop < detector_height * opts.min_bar_fraction * 2 then
+    local horizontal_symmetry_tolerance = math.max(
+        4,
+        detector_width * opts.symmetry_tolerance_fraction
+    )
+    local horizontal_crop = left + right
+    local has_horizontal_bars = horizontal_crop >= detector_width * opts.min_bar_fraction * 2
+    if has_horizontal_bars
+        and (math.abs(left - right) > horizontal_symmetry_tolerance
+            or horizontal_crop > detector_width * opts.max_total_crop_fraction) then
+        return nil
+    end
+    if not has_vertical_bars and not has_horizontal_bars then
         return "none"
     end
-    if total_crop > detector_height * opts.max_total_crop_fraction then
-        return nil
-    end
 
-    local source_top = math.floor((top / detector_height) * source_height + 0.5)
-    local source_bottom = math.floor((bottom / detector_height) * source_height + 0.5)
     local quantum = math.max(1, math.floor(opts.boundary_quantum))
-    local source_bar = math.floor(
-        (((source_top + source_bottom) / 2) / quantum) + 0.5
-    ) * quantum
-    local source_crop_height = source_height - (source_bar * 2)
-    if source_crop_height <= 0 or (source_width / source_crop_height) < opts.min_content_aspect then
+    local source_bar_y = 0
+    if has_vertical_bars then
+        local source_top = math.floor((top / detector_height) * source_height + 0.5)
+        local source_bottom = math.floor((bottom / detector_height) * source_height + 0.5)
+        source_bar_y = math.floor(
+            (((source_top + source_bottom) / 2) / quantum) + 0.5
+        ) * quantum
+    end
+    local source_bar_x = 0
+    if has_horizontal_bars then
+        local source_left = math.floor((left / detector_width) * source_width + 0.5)
+        local source_right = math.floor((right / detector_width) * source_width + 0.5)
+        source_bar_x = math.floor(
+            (((source_left + source_right) / 2) / quantum) + 0.5
+        ) * quantum
+    end
+
+    local source_crop_width = source_width - (source_bar_x * 2)
+    local source_crop_height = source_height - (source_bar_y * 2)
+    if source_crop_width <= 0 or source_crop_height <= 0 then
+        return nil
+    end
+    local content_aspect = source_crop_width / source_crop_height
+    if has_horizontal_bars then
+        if content_aspect < opts.min_pillarbox_content_aspect
+            or content_aspect > opts.max_pillarbox_content_aspect then
+            return nil
+        end
+    elseif content_aspect < opts.min_content_aspect then
         return nil
     end
 
-    return string.format("%dx%d+0+%d", source_width, source_crop_height, source_bar)
+    return string.format(
+        "%dx%d+%d+%d",
+        source_crop_width,
+        source_crop_height,
+        source_bar_x,
+        source_bar_y
+    )
 end
 
 local function reset_candidate()

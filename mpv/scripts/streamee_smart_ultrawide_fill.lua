@@ -26,6 +26,8 @@ local opts = {
     max_total_crop_fraction = 0.35,
     symmetry_tolerance_fraction = 0.02,
     min_content_aspect = 1.8,
+    min_pillarbox_content_aspect = 1.2,
+    max_pillarbox_content_aspect = 1.85,
     -- Zero allows both standard and wide displays. The option name remains
     -- compatible with existing script-opts configurations.
     min_viewport_aspect = 0,
@@ -45,6 +47,7 @@ local opts = {
     lookahead_stable_time = 0.90,
     efficient_scan_interval = 60,
     efficient_scan_lead = 0.25,
+    efficient_scan_timeout = 5.0,
     fixed_canvas_lighting = true,
     lighting_enabled = true,
 }
@@ -105,6 +108,7 @@ local efficient_interval_timer = nil
 local efficient_poll_timer = nil
 local efficient_scan_start_timer = nil
 local efficient_live_scan_active = false
+local efficient_scan_deadline = nil
 local render_lead_estimate = tonumber(opts.lookahead_render_lead) or 0.060
 local pending_render_sample = nil
 local topology_timer = nil
@@ -240,11 +244,12 @@ local function crops_equivalent(left, right)
     if left_none or right_none then
         return left_none == true and right_none == true
     end
-    if not lw or not rw or lw ~= rw then
+    if not lw or not rw then
         return false
     end
     local tolerance = math.max(0, tonumber(opts.lookahead_crop_tolerance) or 0)
-    return math.abs(lh - rh) <= tolerance * 2
+    return math.abs(lw - rw) <= tolerance * 2
+        and math.abs(lh - rh) <= tolerance * 2
         and math.abs(lx - rx) <= tolerance
         and math.abs(ly - ry) <= tolerance
 end
@@ -402,10 +407,21 @@ local function start_lookahead(purpose)
         "streamee_smart_ultrawide_fill_probe-generation=" .. generation,
         "streamee_smart_ultrawide_fill_probe-probe_width=" .. tostring(opts.lookahead_probe_width),
         "streamee_smart_ultrawide_fill_probe-probe_fps=" .. tostring(opts.lookahead_probe_fps),
+        "streamee_smart_ultrawide_fill_probe-limit=" .. tostring(opts.limit),
+        "streamee_smart_ultrawide_fill_probe-round=" .. tostring(opts.round),
+        "streamee_smart_ultrawide_fill_probe-reset_count=" .. tostring(opts.reset_count),
+        "streamee_smart_ultrawide_fill_probe-poll_interval=" .. tostring(opts.poll_interval),
+        "streamee_smart_ultrawide_fill_probe-boundary_quantum=" .. tostring(opts.boundary_quantum),
         "streamee_smart_ultrawide_fill_probe-crop_tolerance=" .. tostring(opts.lookahead_crop_tolerance),
         "streamee_smart_ultrawide_fill_probe-scene_threshold=" .. tostring(opts.lookahead_scene_threshold),
         "streamee_smart_ultrawide_fill_probe-scene_gate_window=" .. tostring(opts.lookahead_scene_gate_window),
         "streamee_smart_ultrawide_fill_probe-stable_time=" .. tostring(opts.lookahead_stable_time),
+        "streamee_smart_ultrawide_fill_probe-min_bar_fraction=" .. tostring(opts.min_bar_fraction),
+        "streamee_smart_ultrawide_fill_probe-max_total_crop_fraction=" .. tostring(opts.max_total_crop_fraction),
+        "streamee_smart_ultrawide_fill_probe-symmetry_tolerance_fraction=" .. tostring(opts.symmetry_tolerance_fraction),
+        "streamee_smart_ultrawide_fill_probe-min_content_aspect=" .. tostring(opts.min_content_aspect),
+        "streamee_smart_ultrawide_fill_probe-min_pillarbox_content_aspect=" .. tostring(opts.min_pillarbox_content_aspect),
+        "streamee_smart_ultrawide_fill_probe-max_pillarbox_content_aspect=" .. tostring(opts.max_pillarbox_content_aspect),
     }, ",")
     local args = {
         mpv_path,
@@ -1074,46 +1090,76 @@ local function validated_candidate()
         return nil
     end
 
-    local top = y
-    local bottom = detector_height - (y + height)
-    local symmetry_tolerance = math.max(
+    local top = math.max(0, y)
+    local bottom = math.max(0, detector_height - (y + height))
+    local left = math.max(0, x)
+    local right = math.max(0, detector_width - (x + width))
+    local vertical_symmetry_tolerance = math.max(
         8,
         detector_height * opts.symmetry_tolerance_fraction
     )
-
-    -- Only the top and bottom boundaries matter. cropdetect also follows dark
-    -- picture content at the sides, which must not veto letterbox removal.
-    if math.abs(top - bottom) > symmetry_tolerance then
+    local vertical_crop = top + bottom
+    local has_vertical_bars = vertical_crop >= detector_height * opts.min_bar_fraction * 2
+    if has_vertical_bars
+        and (math.abs(top - bottom) > vertical_symmetry_tolerance
+            or vertical_crop > detector_height * opts.max_total_crop_fraction) then
         return nil
     end
 
-    local total_crop = top + bottom
-    if total_crop < detector_height * opts.min_bar_fraction * 2 then
+    local horizontal_symmetry_tolerance = math.max(
+        8,
+        detector_width * opts.symmetry_tolerance_fraction
+    )
+    local horizontal_crop = left + right
+    local has_horizontal_bars = horizontal_crop >= detector_width * opts.min_bar_fraction * 2
+    if has_horizontal_bars
+        and (math.abs(left - right) > horizontal_symmetry_tolerance
+            or horizontal_crop > detector_width * opts.max_total_crop_fraction) then
+        return nil
+    end
+    if not has_vertical_bars and not has_horizontal_bars then
         return "none"
     end
-    if total_crop > detector_height * opts.max_total_crop_fraction then
-        return nil
+
+    local boundary_quantum = math.max(1, math.floor(opts.boundary_quantum))
+    local source_bar_y = 0
+    if has_vertical_bars then
+        local source_top = math.floor((top / detector_height) * source_height + 0.5)
+        local source_bottom = math.floor((bottom / detector_height) * source_height + 0.5)
+        source_bar_y = math.floor(
+            (((source_top + source_bottom) / 2) / boundary_quantum) + 0.5
+        ) * boundary_quantum
+    end
+    local source_bar_x = 0
+    if has_horizontal_bars then
+        local source_left = math.floor((left / detector_width) * source_width + 0.5)
+        local source_right = math.floor((right / detector_width) * source_width + 0.5)
+        source_bar_x = math.floor(
+            (((source_left + source_right) / 2) / boundary_quantum) + 0.5
+        ) * boundary_quantum
     end
 
-    local source_top = math.floor((top / detector_height) * source_height + 0.5)
-    local source_bottom = math.floor((bottom / detector_height) * source_height + 0.5)
-    -- Treat a few pixels of detector jitter as the same boundary and keep the
-    -- crop centered. This lets a genuine aspect transition settle near its cut
-    -- instead of restarting the old multi-second stability timer.
-    local boundary_quantum = math.max(1, math.floor(opts.boundary_quantum))
-    local source_bar = math.floor(
-        (((source_top + source_bottom) / 2) / boundary_quantum) + 0.5
-    ) * boundary_quantum
-    local source_crop_height = source_height - (source_bar * 2)
-    if source_crop_height <= 0 or (source_width / source_crop_height) < opts.min_content_aspect then
+    local source_crop_width = source_width - (source_bar_x * 2)
+    local source_crop_height = source_height - (source_bar_y * 2)
+    if source_crop_width <= 0 or source_crop_height <= 0 then
+        return nil
+    end
+    local content_aspect = source_crop_width / source_crop_height
+    if has_horizontal_bars then
+        if content_aspect < opts.min_pillarbox_content_aspect
+            or content_aspect > opts.max_pillarbox_content_aspect then
+            return nil
+        end
+    elseif content_aspect < opts.min_content_aspect then
         return nil
     end
 
     return string.format(
-        "%dx%d+0+%d",
-        source_width,
+        "%dx%d+%d+%d",
+        source_crop_width,
         source_crop_height,
-        source_bar
+        source_bar_x,
+        source_bar_y
     )
 end
 
@@ -1249,6 +1295,7 @@ end
 
 local function stop_efficient_timers()
     efficient_live_scan_active = false
+    efficient_scan_deadline = nil
     if efficient_interval_timer then
         efficient_interval_timer:stop()
     end
@@ -1261,6 +1308,25 @@ local function stop_efficient_timers()
     end
 end
 
+local function start_efficient_live_fallback(reason)
+    stop_lookahead()
+    efficient_scan_deadline = nil
+    if efficient_poll_timer then
+        efficient_poll_timer:stop()
+    end
+    suppress_svp_outer_lighting()
+    efficient_live_scan_active = true
+    reset_candidate()
+    add_detector()
+    if filter_installed then
+        start_timer()
+        msg.warn("Smart Black Bar Fill efficient scan using live detector fallback: " .. reason)
+    else
+        efficient_live_scan_active = false
+        msg.warn("Smart Black Bar Fill efficient live detector fallback was unavailable: " .. reason)
+    end
+end
+
 local function poll_efficient_scan()
     if effective_detection_mode() ~= "efficient" or lookahead_purpose ~= "efficient" then
         return
@@ -1268,6 +1334,11 @@ local function poll_efficient_scan()
 
     local event = poll_lookahead_result()
     if not event or event.kind ~= "baseline" then
+        if not lookahead_running
+            or (efficient_scan_deadline and now() >= efficient_scan_deadline) then
+            local reason = lookahead_running and "helper deadline exceeded" or "helper exited early"
+            start_efficient_live_fallback(reason)
+        end
         return
     end
 
@@ -1281,6 +1352,7 @@ local function poll_efficient_scan()
         apply_detection_result(crop, "efficient periodic scan")
     end
     msg.info("Smart Black Bar Fill efficient scan completed: crop=" .. crop)
+    efficient_scan_deadline = nil
     stop_lookahead()
     if efficient_poll_timer then
         efficient_poll_timer:stop()
@@ -1298,6 +1370,10 @@ local function start_efficient_scan()
     end
 
     if start_lookahead("efficient") then
+        efficient_scan_deadline = now() + math.max(
+            3.0,
+            tonumber(opts.efficient_scan_timeout) or 5.0
+        )
         if not efficient_poll_timer then
             efficient_poll_timer = mp.add_periodic_timer(
                 opts.poll_interval,
@@ -1307,17 +1383,7 @@ local function start_efficient_scan()
             efficient_poll_timer:resume()
         end
     else
-        suppress_svp_outer_lighting()
-        efficient_live_scan_active = true
-        reset_candidate()
-        add_detector()
-        if filter_installed then
-            start_timer()
-            msg.info("Smart Black Bar Fill efficient scan using live detector fallback")
-        else
-            efficient_live_scan_active = false
-            msg.warn("Smart Black Bar Fill efficient live detector fallback was unavailable")
-        end
+        start_efficient_live_fallback("cache-only helper unavailable")
     end
 end
 

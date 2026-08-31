@@ -28,6 +28,8 @@ const MIN_OUTRO_MATCH_SECONDS: f64 = 10.0;
 const MIN_CHAPTER_OUTRO_LEAD_SECONDS: f64 = 10.0;
 const MIN_INTRO_SECONDS: f64 = 15.0;
 const MIN_FUZZY_INTRO_SECONDS: f64 = 25.0;
+const MIN_FEEDBACK_INTRO_SECONDS: f64 = 10.0;
+const MIN_FEEDBACK_OUTRO_SECONDS: f64 = 5.0;
 const MAX_INTRO_SECONDS: f64 = 2.0 * 60.0;
 const SAMPLE_DURATION_SECONDS: f64 = 4096.0 / 11025.0 / 3.0;
 const MAX_POINT_BIT_DIFFERENCES: u32 = 6;
@@ -169,8 +171,19 @@ impl Default for SeasonFingerprintCache {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct SegmentFeedbackCandidate {
+    pub kind: String,
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub source: String,
+    pub reason: String,
+    pub score: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct IntroSkipperDetectionResult {
     pub segment: Option<IntroDbSegment>,
+    pub candidate: Option<SegmentFeedbackCandidate>,
     pub status: String,
     pub reference_episode: Option<u32>,
     pub reference_end_sec: Option<f64>,
@@ -184,6 +197,7 @@ pub struct PlayerChapterSegments {
     pub intro: Option<IntroDbSegment>,
     pub recap: Option<IntroDbSegment>,
     pub outro: Option<IntroDbSegment>,
+    pub candidate: Option<SegmentFeedbackCandidate>,
     pub chapter_count: usize,
 }
 
@@ -1108,17 +1122,27 @@ fn intro_match_is_eligible(range: &MatchedRange) -> bool {
     range.end - range.start >= minimum_duration
 }
 
-fn find_shared_outro(lhs: &[u32], rhs: &[u32], max_duration: f64) -> Option<MatchedRange> {
+fn find_shared_outro_with_minimum(
+    lhs: &[u32],
+    rhs: &[u32],
+    minimum_duration: f64,
+    max_duration: f64,
+) -> Option<MatchedRange> {
     candidate_shifts(lhs, rhs)
         .into_iter()
         .filter_map(|shift| {
-            range_for_shift_with_limits(lhs, rhs, shift, MIN_OUTRO_MATCH_SECONDS, max_duration)
+            range_for_shift_with_limits(lhs, rhs, shift, minimum_duration, max_duration)
         })
         .max_by(|left, right| {
             (left.end - left.start)
                 .partial_cmp(&(right.end - right.start))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
+}
+
+#[cfg(test)]
+fn find_shared_outro(lhs: &[u32], rhs: &[u32], max_duration: f64) -> Option<MatchedRange> {
+    find_shared_outro_with_minimum(lhs, rhs, MIN_OUTRO_MATCH_SECONDS, max_duration)
 }
 
 fn cache_path(app: &tauri::AppHandle, series_key: &str, season: u32) -> Result<PathBuf, String> {
@@ -1427,6 +1451,27 @@ fn segment_from_range(start: f64, end: f64, source: &str) -> Option<IntroDbSegme
     })
 }
 
+fn feedback_candidate_from_range(
+    kind: &str,
+    start: f64,
+    end: f64,
+    source: &str,
+    reason: &str,
+    score: Option<f64>,
+) -> Option<SegmentFeedbackCandidate> {
+    if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
+        return None;
+    }
+    Some(SegmentFeedbackCandidate {
+        kind: kind.to_string(),
+        start_sec: (start * 1_000.0).round() / 1_000.0,
+        end_sec: (end * 1_000.0).round() / 1_000.0,
+        source: source.to_string(),
+        reason: reason.to_string(),
+        score: score.map(|value| value.clamp(0.0, 1.0)),
+    })
+}
+
 fn detect_chapter_segments(chapters: &[MpvChapter], duration: f64) -> PlayerChapterSegments {
     let mut result = PlayerChapterSegments {
         chapter_count: chapters.len(),
@@ -1471,6 +1516,33 @@ fn detect_chapter_segments(chapters: &[MpvChapter], duration: f64) -> PlayerChap
             _ => {}
         }
     }
+
+    if result.outro.is_none() {
+        if let Some(last) = chapters.last() {
+            let remaining = duration - last.time;
+            let kind = chapter_kind(&last.title);
+            let unlabeled_candidate = kind.is_none() && remaining >= MIN_CHAPTER_OUTRO_LEAD_SECONDS;
+            let short_labeled_candidate =
+                kind == Some(ChapterKind::Outro) && remaining >= MIN_FEEDBACK_OUTRO_SECONDS;
+            if last.time >= duration * 0.55
+                && remaining <= MAX_OUTRO_ANALYSIS_SECONDS
+                && (unlabeled_candidate || short_labeled_candidate)
+            {
+                result.candidate = feedback_candidate_from_range(
+                    "outro",
+                    last.time,
+                    duration,
+                    "chapter",
+                    if unlabeled_candidate {
+                        "unlabeled-final-chapter"
+                    } else {
+                        "short-labeled-outro-chapter"
+                    },
+                    short_labeled_candidate.then_some(remaining / MIN_CHAPTER_OUTRO_LEAD_SECONDS),
+                );
+            }
+        }
+    }
     result
 }
 
@@ -1482,11 +1554,16 @@ pub async fn detect_player_chapter_segments(
     let chapters = crate::mpv_ipc::get_player_chapters()?;
     let result = detect_chapter_segments(&chapters, duration_seconds);
     info!(
-        "[Segment Detection][Local] Chapter scan complete: chapters={}, intro={}, recap={}, outro={}",
+        "[Segment Detection][Local] Chapter scan complete: chapters={}, intro={}, recap={}, outro={}, feedback_candidate={}",
         result.chapter_count,
         result.intro.is_some(),
         result.recap.is_some(),
-        result.outro.is_some()
+        result.outro.is_some(),
+        result
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.reason.as_str())
+            .unwrap_or("none")
     );
     Ok(result)
 }
@@ -1569,6 +1646,7 @@ pub async fn detect_intro_skipper_segment(
         );
         return Ok(IntroSkipperDetectionResult {
             segment: None,
+            candidate: None,
             status: "waiting-for-buffer".to_string(),
             reference_episode: None,
             reference_end_sec: None,
@@ -1627,6 +1705,7 @@ pub async fn detect_intro_skipper_segment(
         Err(error) if error == LOCAL_AUDIO_CACHE_NOT_READY => {
             return Ok(IntroSkipperDetectionResult {
                 segment: None,
+                candidate: None,
                 status: "waiting-for-local-cache".to_string(),
                 reference_episode: None,
                 reference_end_sec: None,
@@ -1655,6 +1734,7 @@ pub async fn detect_intro_skipper_segment(
             );
             return Ok(IntroSkipperDetectionResult {
                 segment: None,
+                candidate: None,
                 status: "waiting-for-local-cache".to_string(),
                 reference_episode: None,
                 reference_end_sec: None,
@@ -1678,7 +1758,7 @@ pub async fn detect_intro_skipper_segment(
         );
     }
 
-    let (matched, cached_episode_count, reference_count) = {
+    let (matched, feedback_candidate, cached_episode_count, reference_count) = {
         let _write_guard = SEASON_CACHE_WRITE_LOCK.lock();
         let mut latest_cache = load_season_cache(&path);
         let mut latest_references = latest_cache
@@ -1699,7 +1779,7 @@ pub async fn detect_intro_skipper_segment(
                 entry.episode.abs_diff(episode),
             )
         });
-        let matched = latest_references
+        let evaluated = latest_references
             .iter()
             .filter_map(|reference| {
                 let range = find_shared_intro(&current, &reference.points)?;
@@ -1728,19 +1808,52 @@ pub async fn detect_intro_skipper_segment(
                         reference.window_start_seconds + range.reference_start,
                     "[Segment Detection][Local] Intro fingerprint candidate evaluated"
                 );
-                accepted.then_some((
+                Some((
                     reference.source_identity == source_identity,
                     reference.episode,
                     reference.window_start_seconds,
                     range,
+                    accepted,
                 ))
             })
+            .collect::<Vec<_>>();
+        let matched = evaluated
+            .iter()
+            .copied()
+            .filter(|entry| entry.4)
             .max_by(|left, right| {
                 left.0.cmp(&right.0).then_with(|| {
                     (left.3.end - left.3.start)
                         .partial_cmp(&(right.3.end - right.3.start))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
+            })
+            .map(|entry| (entry.0, entry.1, entry.2, entry.3));
+        let feedback_candidate = evaluated
+            .iter()
+            .copied()
+            .filter(|entry| !entry.4 && entry.3.end - entry.3.start >= MIN_FEEDBACK_INTRO_SECONDS)
+            .max_by(|left, right| {
+                (left.3.end - left.3.start)
+                    .partial_cmp(&(right.3.end - right.3.start))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .and_then(|entry| {
+                let minimum = match entry.3.method {
+                    IntroMatchMethod::Exact => MIN_INTRO_SECONDS,
+                    IntroMatchMethod::Fuzzy => MIN_FUZZY_INTRO_SECONDS,
+                };
+                feedback_candidate_from_range(
+                    "intro",
+                    window_start_seconds + entry.3.start,
+                    window_start_seconds + entry.3.end,
+                    "intro-skipper",
+                    match entry.3.method {
+                        IntroMatchMethod::Exact => "short-exact-fingerprint-match",
+                        IntroMatchMethod::Fuzzy => "short-fuzzy-fingerprint-match",
+                    },
+                    Some((entry.3.end - entry.3.start) / minimum),
+                )
             });
         if let Err(error) = store_episode_fingerprint(
             &path,
@@ -1757,6 +1870,7 @@ pub async fn detect_intro_skipper_segment(
         }
         (
             matched,
+            feedback_candidate,
             latest_cache.episodes.len(),
             latest_references.len(),
         )
@@ -1774,6 +1888,7 @@ pub async fn detect_intro_skipper_segment(
         );
         return Ok(IntroSkipperDetectionResult {
             segment: None,
+            candidate: feedback_candidate,
             status: status.to_string(),
             reference_episode: None,
             reference_end_sec: None,
@@ -1809,6 +1924,7 @@ pub async fn detect_intro_skipper_segment(
     );
     Ok(IntroSkipperDetectionResult {
         segment,
+        candidate: None,
         status: "detected".to_string(),
         reference_episode: Some(reference_episode),
         reference_end_sec: Some(absolute_reference_end),
@@ -1885,6 +2001,7 @@ pub async fn detect_intro_skipper_outro_segment(
         );
         return Ok(IntroSkipperDetectionResult {
             segment: None,
+            candidate: None,
             status: "waiting-for-tail-cache".to_string(),
             reference_episode: None,
             reference_end_sec: None,
@@ -1916,6 +2033,7 @@ pub async fn detect_intro_skipper_outro_segment(
         Err(error) if error == LOCAL_AUDIO_CACHE_NOT_READY => {
             return Ok(IntroSkipperDetectionResult {
                 segment: None,
+                candidate: None,
                 status: "waiting-for-tail-cache".to_string(),
                 reference_episode: None,
                 reference_end_sec: None,
@@ -1938,6 +2056,7 @@ pub async fn detect_intro_skipper_outro_segment(
         Err(error) if error == LOCAL_CACHE_NOT_READY => {
             return Ok(IntroSkipperDetectionResult {
                 segment: None,
+                candidate: None,
                 status: "waiting-for-tail-cache".to_string(),
                 reference_episode: None,
                 reference_end_sec: None,
@@ -1955,7 +2074,7 @@ pub async fn detect_intro_skipper_outro_segment(
         );
     }
     let path = outro_cache_path(&app, &series_key, season)?;
-    let (matched, cached_episode_count, reference_count) = {
+    let (matched, feedback_candidate, cached_episode_count, reference_count) = {
         let _write_guard = SEASON_CACHE_WRITE_LOCK.lock();
         let mut latest_cache = load_outro_cache(&path);
         let mut latest_references = latest_cache
@@ -1975,32 +2094,73 @@ pub async fn detect_intro_skipper_outro_segment(
                 entry.episode.abs_diff(episode),
             )
         });
-        let matched = latest_references
+        let evaluated = latest_references
             .iter()
             .filter_map(|reference| {
-                let range =
-                    find_shared_outro(&current, &reference.points, required_buffer_seconds)?;
+                let range = find_shared_outro_with_minimum(
+                    &current,
+                    &reference.points,
+                    MIN_FEEDBACK_OUTRO_SECONDS,
+                    required_buffer_seconds,
+                )?;
                 let absolute_start = window_start_seconds + range.start;
                 let reference_absolute_start =
                     reference.window_start_seconds + range.reference_start;
-                (absolute_start >= duration_seconds * 0.55
+                let accepted = range.end - range.start >= MIN_OUTRO_MATCH_SECONDS
+                    && absolute_start >= duration_seconds * 0.55
                     && absolute_start < duration_seconds - 5.0
                     && reference_absolute_start >= reference.duration_seconds * 0.55
-                    && reference_absolute_start < reference.duration_seconds - 5.0)
-                    .then_some((
-                        reference.source_identity == source_identity,
-                        reference.episode,
-                        reference.duration_seconds,
-                        reference.window_start_seconds,
-                        range,
-                    ))
+                    && reference_absolute_start < reference.duration_seconds - 5.0;
+                Some((
+                    reference.source_identity == source_identity,
+                    reference.episode,
+                    reference.duration_seconds,
+                    reference.window_start_seconds,
+                    range,
+                    accepted,
+                ))
             })
+            .collect::<Vec<_>>();
+        let matched = evaluated
+            .iter()
+            .copied()
+            .filter(|entry| entry.5)
             .max_by(|left, right| {
                 left.0.cmp(&right.0).then_with(|| {
                     (left.4.end - left.4.start)
                         .partial_cmp(&(right.4.end - right.4.start))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
+            })
+            .map(|entry| (entry.0, entry.1, entry.2, entry.3, entry.4));
+        let feedback_candidate = evaluated
+            .iter()
+            .copied()
+            .filter(|entry| {
+                let absolute_start = window_start_seconds + entry.4.start;
+                !entry.5
+                    && absolute_start >= duration_seconds * 0.55
+                    && absolute_start < duration_seconds - MIN_FEEDBACK_OUTRO_SECONDS
+            })
+            .max_by(|left, right| {
+                (left.4.end - left.4.start)
+                    .partial_cmp(&(right.4.end - right.4.start))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .and_then(|entry| {
+                let matched_seconds = entry.4.end - entry.4.start;
+                feedback_candidate_from_range(
+                    "outro",
+                    window_start_seconds + entry.4.start,
+                    duration_seconds,
+                    "intro-skipper-outro",
+                    if matched_seconds < MIN_OUTRO_MATCH_SECONDS {
+                        "short-outro-fingerprint-match"
+                    } else {
+                        "reference-placement-mismatch"
+                    },
+                    Some(matched_seconds / MIN_OUTRO_MATCH_SECONDS),
+                )
             });
         if let Err(error) = store_episode_outro_fingerprint(
             &path,
@@ -2016,12 +2176,14 @@ pub async fn detect_intro_skipper_outro_segment(
         }
         (
             matched,
+            feedback_candidate,
             latest_cache.episodes.len(),
             latest_references.len(),
         )
     };
     let Some((_, reference_episode, reference_duration, reference_window_start, range)) = matched
     else {
+        let mut feedback_candidate = feedback_candidate;
         let status = if reference_count == 0 {
             "learned"
         } else {
@@ -2063,6 +2225,7 @@ pub async fn detect_intro_skipper_outro_segment(
                     );
                     return Ok(IntroSkipperDetectionResult {
                         segment: Some(segment),
+                        candidate: None,
                         status: "detected".to_string(),
                         reference_episode: None,
                         reference_end_sec: None,
@@ -2083,6 +2246,30 @@ pub async fn detect_intro_skipper_outro_segment(
                     season,
                     episode
                 );
+                let span_score = (candidate.end_seconds - candidate.start_seconds)
+                    / VISUAL_OUTRO_AUTO_MIN_SECONDS;
+                let visual_score = span_score
+                    .min(candidate.dark_density / VISUAL_OUTRO_AUTO_MIN_DARK_DENSITY)
+                    .min(candidate.content_density / VISUAL_OUTRO_AUTO_MIN_CONTENT_DENSITY)
+                    .min(candidate.mean_black_percent / VISUAL_OUTRO_AUTO_MIN_MEAN_BLACK_PERCENT);
+                let visual_candidate = (candidate.start_seconds >= duration_seconds * 0.55
+                    && candidate.end_seconds >= duration_seconds - 120.0)
+                    .then(|| {
+                        feedback_candidate_from_range(
+                            "outro",
+                            candidate.start_seconds,
+                            duration_seconds,
+                            "intro-skipper-outro",
+                            "visual-credit-near-match",
+                            Some(visual_score),
+                        )
+                    })
+                    .flatten();
+                if visual_candidate.as_ref().and_then(|value| value.score)
+                    > feedback_candidate.as_ref().and_then(|value| value.score)
+                {
+                    feedback_candidate = visual_candidate;
+                }
             }
             Ok(VisualOutroDiagnostic {
                 candidate: None,
@@ -2102,6 +2289,7 @@ pub async fn detect_intro_skipper_outro_segment(
         );
         return Ok(IntroSkipperDetectionResult {
             segment: None,
+            candidate: feedback_candidate,
             status: status.to_string(),
             reference_episode: None,
             reference_end_sec: None,
@@ -2135,6 +2323,7 @@ pub async fn detect_intro_skipper_outro_segment(
     );
     Ok(IntroSkipperDetectionResult {
         segment,
+        candidate: None,
         status: "detected".to_string(),
         reference_episode: Some(reference_episode),
         reference_end_sec: Some(reference_duration),
@@ -2562,7 +2751,55 @@ mod tests {
                 600.0,
             );
             assert!(rejected.outro.is_none());
+            let candidate = rejected.candidate.expect("short labeled candidate");
+            assert_eq!(candidate.kind, "outro");
+            assert_eq!(candidate.reason, "short-labeled-outro-chapter");
         }
+    }
+
+    #[test]
+    fn offers_unlabeled_final_chapter_as_feedback_candidate() {
+        let segments = detect_chapter_segments(
+            &[
+                MpvChapter {
+                    title: "Chapter 1".to_string(),
+                    time: 0.0,
+                },
+                MpvChapter {
+                    title: "Chapter 8".to_string(),
+                    time: 1_120.0,
+                },
+            ],
+            1_200.0,
+        );
+        assert!(segments.outro.is_none());
+        let candidate = segments
+            .candidate
+            .expect("unlabeled final chapter candidate");
+        assert_eq!(candidate.start_sec, 1_120.0);
+        assert_eq!(candidate.end_sec, 1_200.0);
+        assert_eq!(candidate.reason, "unlabeled-final-chapter");
+    }
+
+    #[test]
+    fn does_not_offer_tiny_or_early_generic_chapters() {
+        let tiny = detect_chapter_segments(
+            &[MpvChapter {
+                title: "Chapter 12".to_string(),
+                time: 1_196.0,
+            }],
+            1_200.0,
+        );
+        assert!(tiny.candidate.is_none());
+
+        let early = detect_chapter_segments(
+            &[MpvChapter {
+                title: "Chapter 2".to_string(),
+                time: 300.0,
+            }],
+            1_200.0,
+        );
+        assert!(early.candidate.is_none());
     }
 
     #[test]
