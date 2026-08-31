@@ -1,6 +1,6 @@
 {
     "name": "streamee",
-    "version": "2.0.16",
+    "version": "2.0.17",
     "description": "A Windows desktop media application with user-configured stream add-ons and MPV playback",
     "type": "module",
     "scripts": {
