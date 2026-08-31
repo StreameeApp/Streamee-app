@@ -1,0 +1,12 @@
+{
+  "name": "streamee-sidecar-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Production-only dependencies for the Streamee stream sidecar.",
+  "license": "GPL-3.0-or-later",
+  "dependencies": {
+    "fs-native-extensions": "1.5.0",
+    "parse-torrent": "11.0.24",
+    "webtorrent": "3.0.21"
+  }
+}

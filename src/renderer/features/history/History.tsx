@@ -45,6 +45,8 @@ interface HistoryItem {
   progress?: number;
   rating?: number;
   imdbId?: string;
+  metadataSource?: 'tmdb' | 'addon';
+  addonInstallationId?: string;
   isContinueWatching: boolean;
 }
 
@@ -70,6 +72,8 @@ const History: React.FC = () => {
         date: w.watchedAt || '',
         rating: w.rating,
         imdbId: w.imdbId,
+        metadataSource: w.metadataSource,
+        addonInstallationId: w.addonInstallationId,
         isContinueWatching: false
       });
     });
@@ -83,6 +87,8 @@ const History: React.FC = () => {
         existing.season = c.season;
         existing.episode = c.episode;
         existing.isContinueWatching = true;
+        existing.metadataSource = c.metadataSource || existing.metadataSource;
+        existing.addonInstallationId = c.addonInstallationId || existing.addonInstallationId;
         if (c.rating) existing.rating = c.rating;
       } else {
         items.push({
@@ -95,6 +101,8 @@ const History: React.FC = () => {
           episode: c.episode,
           progress: c.progress,
           rating: c.rating,
+          metadataSource: c.metadataSource,
+          addonInstallationId: c.addonInstallationId,
           isContinueWatching: true
         });
       }
@@ -176,7 +184,9 @@ const History: React.FC = () => {
       name: item.title,
       poster: item.poster,
       year: item.year,
-      rating: item.rating
+      rating: item.rating,
+      metadataSource: item.metadataSource,
+      addonInstallationId: item.addonInstallationId
     }, 'history');
   };
 

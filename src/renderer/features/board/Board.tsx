@@ -25,6 +25,8 @@ import XrelQualityBadge from '../../components/XrelQualityBadge';
 import { scheduleAddonReleaseQualityProbes } from '../../services/addon-release-probes';
 import { getXrelQualitySnapshot, subscribeXrelQualitySnapshot } from '../../services/xrel';
 import { getUpNextNoResultCachePolicy, UP_NEXT_RESOLVED_RESULT_CACHE_TTL_MS } from '../../services/tmdb-request-policy';
+import { fetchAddonCatalogPage } from '../../services/addon-catalogs';
+import { getSupportedCatalogs, loadInstalledAddons } from '../../services/installed-addons';
 import './Board.css';
 
 function formatRelativeTime(dateStr: string): string {
@@ -62,7 +64,8 @@ interface CatalogRow {
   id: string;
   title: string;
   type: 'movie' | 'series';
-  source: 'tmdb' | 'trakt';
+  source: 'tmdb' | 'trakt' | 'addon';
+  addonInstallationId?: string;
   items: MetaPreview[];
   hideWatchedToggle?: boolean;
 }
@@ -77,6 +80,8 @@ interface FeaturedItem {
   progress: number | null;
   detail: string;
   source: 'continue' | 'catalog';
+  metadataSource?: MetaPreview['metadataSource'];
+  addonInstallationId?: string;
 }
 
 const CATALOG_ORDER = [
@@ -89,6 +94,7 @@ const CATALOG_ORDER = [
 ];
 let boardCatalogSnapshot: CatalogRow[] = [];
 let boardCatalogSnapshotMode: DiscoveryContentMode | null = null;
+let boardCatalogSnapshotSourceKey = 'tmdb';
 const CONTINUE_VIEW_REFRESH_TTL_MS = 6 * 60 * 60 * 1000;
 const UP_NEXT_DIAGNOSTIC_SHOW_LIMIT = 10;
 const UP_NEXT_PENDING_SYNC_GRACE_MS = 5_000;
@@ -289,11 +295,18 @@ async function fetchTraktCatalogItems(
 
 const Board: React.FC = () => {
   const [discoveryContentMode, setDiscoveryContentMode] = useState(getDiscoveryContentMode);
+  const catalogSourceInstallationId = useStore((state) => state.catalogSourceInstallationId);
+  const adultCatalogsEnabled = useStore((state) => state.adultCatalogsEnabled);
+  const catalogSourceKey = catalogSourceInstallationId || 'tmdb';
   const [catalogs, setCatalogs] = useState<CatalogRow[]>(() => (
-    boardCatalogSnapshotMode === discoveryContentMode ? boardCatalogSnapshot : []
+    boardCatalogSnapshotMode === discoveryContentMode && boardCatalogSnapshotSourceKey === catalogSourceKey
+      ? boardCatalogSnapshot
+      : []
   ));
   const [loading, setLoading] = useState(
-    boardCatalogSnapshotMode !== discoveryContentMode || boardCatalogSnapshot.length === 0
+    boardCatalogSnapshotMode !== discoveryContentMode
+      || boardCatalogSnapshotSourceKey !== catalogSourceKey
+      || boardCatalogSnapshot.length === 0
   );
   const [tmdbConfigured, setTmdbConfigured] = useState<boolean | null>(null);
   const [itemsPerRow, setItemsPerRow] = useState(3);
@@ -313,7 +326,7 @@ const Board: React.FC = () => {
     getStartupTraktSyncState,
     getStartupTraktSyncState,
   );
-  const { setSelectedMeta, continueWatching, continueWatchingView, continueWatchingViewFingerprint, continueWatchingViewUpdatedAt, setContinueWatchingView, setContinueWatchingViewRefresh, addToContinueWatching, removeFromContinueWatching, setSelectedCatalog, setCatalogItems, setCatalogPage, setCatalogCacheKey, watchlist, addToWatchlist, removeFromWatchlist, watched, addToWatched, removeFromWatched, boardScrollPosition, setBoardScrollPosition, traktConnected, watchedEpisodes } = useStore();
+  const { setSelectedMeta, continueWatching, continueWatchingView, continueWatchingViewFingerprint, continueWatchingViewUpdatedAt, setContinueWatchingView, setContinueWatchingViewRefresh, addToContinueWatching, removeFromContinueWatching, setSelectedCatalog, setCatalogItems, setCatalogPage, setCatalogCacheKey, watchlist, addToWatchlist, removeFromWatchlist, watched, addToWatched, removeFromWatched, boardScrollPosition, setBoardScrollPosition, traktConnected, watchedEpisodes, setCatalogSourceInstallationId } = useStore();
   const continueRefreshFingerprint = useMemo(
     () => buildContinueViewFingerprint(continueWatching, watched, watchedEpisodes),
     [continueWatching, watched, watchedEpisodes],
@@ -391,9 +404,10 @@ const Board: React.FC = () => {
     let cancelled = false;
     let firstCatalogPublished = false;
     const performanceTrace = createPerformanceTrace('Board catalogs');
-    if (boardCatalogSnapshotMode !== discoveryContentMode) {
+    if (boardCatalogSnapshotMode !== discoveryContentMode || boardCatalogSnapshotSourceKey !== catalogSourceKey) {
       boardCatalogSnapshot = [];
       boardCatalogSnapshotMode = discoveryContentMode;
+      boardCatalogSnapshotSourceKey = catalogSourceKey;
       setCatalogs([]);
       setLoading(true);
     }
@@ -405,17 +419,48 @@ const Board: React.FC = () => {
       }
       setCatalogs((current) => {
         const next = sortCatalogRows([
-          ...current.filter((row) => !(row.id === catalog.id && row.type === catalog.type && row.source === catalog.source)),
+          ...current.filter((row) => !(row.id === catalog.id
+            && row.type === catalog.type
+            && row.source === catalog.source
+            && row.addonInstallationId === catalog.addonInstallationId)),
           catalog
         ]);
         boardCatalogSnapshot = next;
         boardCatalogSnapshotMode = discoveryContentMode;
+        boardCatalogSnapshotSourceKey = catalogSourceKey;
         return next;
       });
     };
 
     const fetchCatalogs = async () => {
       try {
+        if (catalogSourceInstallationId) {
+          const addon = loadInstalledAddons().find((candidate) =>
+            candidate.installationId === catalogSourceInstallationId
+          );
+          const allowed = addon?.enabled
+            && (adultCatalogsEnabled || !addon.manifest.behaviorHints?.adult);
+          const addonCatalogs = addon && allowed ? getSupportedCatalogs(addon) : [];
+          if (!addon || !allowed || addonCatalogs.length === 0) {
+            setCatalogSourceInstallationId(null);
+            return;
+          }
+
+          setTmdbConfigured(true);
+          await Promise.allSettled(addonCatalogs.map(async (catalog) => {
+            const items = await fetchAddonCatalogPage(addon, catalog);
+            publishCatalog({
+              id: catalog.id,
+              title: catalog.name,
+              type: catalog.type,
+              source: 'addon',
+              addonInstallationId: addon.installationId,
+              items: items.slice(0, BOARD_CATALOG_ITEM_LIMIT),
+            });
+          }));
+          return;
+        }
+
         const tmdbAvailable = isTmdbConfigured();
         if (cancelled) return;
         setTmdbConfigured(tmdbAvailable);
@@ -470,7 +515,7 @@ const Board: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [discoveryContentMode]);
+  }, [adultCatalogsEnabled, catalogSourceInstallationId, catalogSourceKey, discoveryContentMode, setCatalogSourceInstallationId]);
 
   const handleItemClick = (item: MetaPreview) => {
     setSelectedMeta({
@@ -481,7 +526,9 @@ const Board: React.FC = () => {
       background: item.background,
       year: item.year,
       imdbId: item.imdbId,
-      rating: item.rating
+      rating: item.rating,
+      metadataSource: item.metadataSource,
+      addonInstallationId: item.addonInstallationId,
     }, 'board');
   };
 
@@ -490,6 +537,8 @@ const Board: React.FC = () => {
       addToContinueWatching({
         metaId: item.metaId,
         type: item.type,
+        metadataSource: item.metadataSource,
+        addonInstallationId: item.addonInstallationId,
         title: item.title,
         poster: item.poster,
         progress: item.progress,
@@ -509,7 +558,9 @@ const Board: React.FC = () => {
       type: item.type,
       name: item.title,
       poster: item.poster,
-      rating: item.rating
+      rating: item.rating,
+      metadataSource: item.metadataSource,
+      addonInstallationId: item.addonInstallationId
     });
   };
 
@@ -519,6 +570,7 @@ const Board: React.FC = () => {
       title: catalog.title,
       type: catalog.type,
       source: catalog.source,
+      addonInstallationId: catalog.addonInstallationId,
       hideWatchedToggle: catalog.hideWatchedToggle
     });
   };
@@ -530,6 +582,8 @@ const Board: React.FC = () => {
       name: item.title,
       poster: item.poster,
       rating: item.rating,
+      metadataSource: item.metadataSource,
+      addonInstallationId: item.addonInstallationId,
       continueSource: item.source,
       continueProgress: item.progress,
       continuePausedAt: item.pausedAt,
@@ -1159,8 +1213,12 @@ const Board: React.FC = () => {
         type: item.type,
         rating: item.rating,
         progress: null as number | null,
-        detail: item.releaseDate ? formatReleaseDate(item.releaseDate) : 'Fresh from TMDB',
-        source: 'catalog' as const
+        detail: item.releaseDate
+          ? formatReleaseDate(item.releaseDate)
+          : item.metadataSource === 'addon' ? 'From your catalog add-on' : 'Fresh from TMDB',
+        source: 'catalog' as const,
+        metadataSource: item.metadataSource,
+        addonInstallationId: item.addonInstallationId,
       }));
 
     return [...continueItems, ...catalogItems].filter((item, index, array) => {
@@ -1274,7 +1332,9 @@ const Board: React.FC = () => {
                     name: activeFeatured.name,
                     poster: activeFeatured.poster,
                     background: activeFeatured.background,
-                    rating: activeFeatured.rating
+                    rating: activeFeatured.rating,
+                    metadataSource: activeFeatured.metadataSource,
+                    addonInstallationId: activeFeatured.addonInstallationId,
                   })}
                 >
                   {featuredContinue ? <FiClock /> : <FiTrendingUp />}
@@ -1314,7 +1374,9 @@ const Board: React.FC = () => {
                   name: activeFeatured.name,
                   poster: activeFeatured.poster,
                   background: activeFeatured.background,
-                  rating: activeFeatured.rating
+                  rating: activeFeatured.rating,
+                  metadataSource: activeFeatured.metadataSource,
+                  addonInstallationId: activeFeatured.addonInstallationId,
                 })}
               >
                 <img src={activeFeatured.poster} alt={activeFeatured.name} decoding="async" />
@@ -1411,7 +1473,7 @@ const Board: React.FC = () => {
       )}
 
       {catalogs.map((catalog, catalogIndex) => (
-        <section key={catalog.source + catalog.id + catalog.type} className="board-section">
+        <section key={catalog.source + (catalog.addonInstallationId || '') + catalog.id + catalog.type} className="board-section">
           <div className="board-section-header">
             <div>
               <span className="board-section-kicker">{catalog.type === 'movie' ? 'Movies' : 'Series'}</span>

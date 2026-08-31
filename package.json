@@ -5,7 +5,8 @@
     "type": "module",
     "scripts": {
         "clean:mpv": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\clean-mpv.ps1",
-        "tauri:prepare": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\prepare-tauri-target.ps1",
+        "sidecar:prepare": "node .\\src-tauri\\sidecar-runtime\\prepare.cjs",
+        "tauri:prepare": "npm run sidecar:prepare && powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\prepare-tauri-target.ps1",
         "version:bump": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\bump-version.ps1",
         "release": "npm run tauri:build",
         "dev": "vite",

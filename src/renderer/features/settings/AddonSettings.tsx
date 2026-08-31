@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { FiCheck, FiMenu, FiPlus, FiRefreshCw, FiShield, FiTrash2, FiX } from 'react-icons/fi';
 import {
   installAddonFromManifestUrl,
+  getSupportedCatalogs,
   loadInstalledAddons,
   refreshInstalledAddon,
   reorderInstalledAddons,
@@ -9,6 +10,7 @@ import {
   uninstallAddon,
   type InstalledAddon,
 } from '../../services/installed-addons';
+import { useStore } from '../../store';
 
 type AddonTestState = { status: 'testing' | 'success' | 'error'; message?: string };
 
@@ -20,6 +22,11 @@ const AddonSettings: React.FC = () => {
   const [tests, setTests] = useState<Record<string, AddonTestState>>({});
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const catalogSourceInstallationId = useStore((state) => state.catalogSourceInstallationId);
+  const adultCatalogsEnabled = useStore((state) => state.adultCatalogsEnabled);
+  const setCatalogSourceInstallationId = useStore((state) => state.setCatalogSourceInstallationId);
+  const setAdultCatalogsEnabled = useStore((state) => state.setAdultCatalogsEnabled);
+  const catalogAddons = addons.filter((addon) => addon.enabled && getSupportedCatalogs(addon).length > 0);
 
   useEffect(() => setAddons(loadInstalledAddons()), []);
 
@@ -41,6 +48,9 @@ const AddonSettings: React.FC = () => {
   };
 
   const toggle = (addon: InstalledAddon) => {
+    if (addon.enabled && catalogSourceInstallationId === addon.installationId) {
+      setCatalogSourceInstallationId(null);
+    }
     setAddons(setInstalledAddonEnabled(addon.installationId, !addon.enabled));
     setMessage(null);
     setError(null);
@@ -71,6 +81,9 @@ const AddonSettings: React.FC = () => {
     setMessage(null);
     setError(null);
     try {
+      if (catalogSourceInstallationId === addon.installationId) {
+        setCatalogSourceInstallationId(null);
+      }
       setAddons(await uninstallAddon(addon.installationId));
       setMessage(`${addon.manifest.name} uninstalled.`);
     } catch (removeError) {
@@ -141,6 +154,61 @@ const AddonSettings: React.FC = () => {
               Configured URLs stay in Windows Credential Manager and are never written to frontend storage or logs. Streamee supports Stremio-compatible add-ons but is not affiliated with or endorsed by Stremio or any installed add-on provider. Only install services you trust and use authorized sources.
             </span>
           </div>
+        </div>
+      </div>
+
+      <div className="addon-install-panel addon-catalog-source-panel">
+        <div className="addon-install-heading">
+          <div>
+            <h3>Catalog source</h3>
+            <span>Choose what appears on the Board. TMDB stays configured and is restored when you switch back.</span>
+          </div>
+        </div>
+
+        <div className="addon-catalog-source-controls">
+          <label htmlFor="addon-catalog-source">Active browsing source</label>
+          <select
+            id="addon-catalog-source"
+            className="settings-select"
+            value={catalogSourceInstallationId || 'tmdb'}
+            onChange={(event) => setCatalogSourceInstallationId(
+              event.target.value === 'tmdb' ? null : event.target.value
+            )}
+          >
+            <option value="tmdb">TMDB (default)</option>
+            {catalogAddons
+              .filter((addon) => adultCatalogsEnabled || !addon.manifest.behaviorHints?.adult)
+              .map((addon) => (
+                <option key={addon.installationId} value={addon.installationId}>
+                  {addon.manifest.name}
+                </option>
+              ))}
+          </select>
+          {catalogAddons.length === 0 && (
+            <span className="addon-catalog-source-help">
+              Install or refresh an add-on that declares catalog and metadata resources to use it here.
+            </span>
+          )}
+        </div>
+
+        <div className="addon-enable-control addon-adult-catalog-control">
+          <div>
+            <strong>Adult catalog sources</strong>
+            <span>Allow installed add-ons marked as adult to appear in the browsing-source selector.</span>
+          </div>
+          <button
+            className={`toggle-btn ${adultCatalogsEnabled ? 'active' : ''}`}
+            type="button"
+            aria-label={`${adultCatalogsEnabled ? 'Disable' : 'Enable'} adult catalog sources`}
+            aria-pressed={adultCatalogsEnabled}
+            onClick={() => {
+              if (adultCatalogsEnabled) {
+                const selected = addons.find((addon) => addon.installationId === catalogSourceInstallationId);
+                if (selected?.manifest.behaviorHints?.adult) setCatalogSourceInstallationId(null);
+              }
+              setAdultCatalogsEnabled(!adultCatalogsEnabled);
+            }}
+          ><span className="toggle-slider" /></button>
         </div>
       </div>
 
@@ -216,6 +284,8 @@ const AddonSettings: React.FC = () => {
                   <div className="addon-capabilities">
                     <span className="is-version">v{addon.manifest.version}</span>
                     {addon.manifest.types.map((type) => <span key={type}>{type}</span>)}
+                    {(addon.manifest.catalogs?.length || 0) > 0 && <span>Catalog</span>}
+                    {addon.manifest.behaviorHints?.adult && <span>Adult</span>}
                     {addon.manifest.behaviorHints?.configurable && <span className="is-configurable">Configurable</span>}
                   </div>
                 </div>

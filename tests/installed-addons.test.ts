@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test, { beforeEach } from 'node:test';
 
 import {
+  getEnabledCatalogAddons,
   getEnabledStreamAddons,
+  getSupportedCatalogs,
   loadInstalledAddons,
   reorderInstalledAddons,
   saveInstalledAddons,
@@ -79,6 +81,58 @@ test('stream selection excludes disabled and incompatible add-ons', () => {
   );
 
   assert.deepEqual(selected.map((addon) => addon.installationId), ['compatible']);
+});
+
+test('catalog selection requires an enabled declared catalog and explicit adult access', () => {
+  const streamOnly = installedAddon('stream-only');
+  const catalogManifest = {
+    ...installedAddon('catalog').manifest,
+    resources: ['catalog', 'meta', 'stream'],
+    catalogs: [{ type: 'movie' as const, id: 'latest', name: 'Latest' }],
+  };
+  const catalog = installedAddon('catalog', { manifest: catalogManifest });
+  const adultCatalog = installedAddon('adult-catalog', {
+    manifest: { ...catalogManifest, id: 'community.adult-catalog', behaviorHints: { adult: true } },
+  });
+
+  assert.deepEqual(
+    getEnabledCatalogAddons(false, [streamOnly, catalog, adultCatalog])
+      .map((addon) => addon.installationId),
+    ['catalog'],
+  );
+  assert.deepEqual(
+    getEnabledCatalogAddons(true, [streamOnly, catalog, adultCatalog])
+      .map((addon) => addon.installationId),
+    ['catalog', 'adult-catalog'],
+  );
+});
+
+test('catalog selection requires compatible catalog and metadata resources', () => {
+  const baseManifest = {
+    ...installedAddon('capabilities').manifest,
+    catalogs: [{ type: 'movie' as const, id: 'latest', name: 'Latest' }],
+  };
+  const catalogOnly = installedAddon('catalog-only', {
+    manifest: { ...baseManifest, id: 'community.catalog-only', resources: ['catalog'] },
+  });
+  const wrongMetaType = installedAddon('wrong-meta-type', {
+    manifest: {
+      ...baseManifest,
+      id: 'community.wrong-meta-type',
+      resources: ['catalog', { name: 'meta', types: ['series'] }],
+    },
+  });
+  const compatible = installedAddon('compatible-catalog', {
+    manifest: {
+      ...baseManifest,
+      id: 'community.compatible-catalog',
+      resources: ['catalog', { name: 'meta', types: ['movie'], idPrefixes: ['provider:'] }],
+    },
+  });
+
+  assert.deepEqual(getSupportedCatalogs(catalogOnly), []);
+  assert.deepEqual(getSupportedCatalogs(wrongMetaType), []);
+  assert.deepEqual(getSupportedCatalogs(compatible), baseManifest.catalogs);
 });
 
 test('enabling an installation does not affect another installation of the same add-on', () => {

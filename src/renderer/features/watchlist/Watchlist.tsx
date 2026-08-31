@@ -64,7 +64,9 @@ const Watchlist: React.FC = () => {
       name: item.name,
       poster: item.poster,
       year: item.year,
-      rating: item.rating
+      rating: item.rating,
+      metadataSource: item.metadataSource,
+      addonInstallationId: item.addonInstallationId
     }, 'watchlist');
   };
 

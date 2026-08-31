@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { FiArrowLeft, FiHeart, FiEye, FiEyeOff } from 'react-icons/fi';
 import { useShallow } from 'zustand/react/shallow';
-import { useStore, MetaPreview } from '../../store';
+import { useStore, MetaPreview, type CatalogInfo } from '../../store';
 import { enrichTmdbItemsById, getTmdbMovies, getTmdbTv } from '../../services/tmdb';
 import { getAnticipatedMovies, getAnticipatedShows, getTrendingMovies, getTrendingShows, hasTraktCredentials } from '../../services/trakt';
 import { pushUnwatchedToTrakt, pushWatchedToTrakt, pushWatchlistToTrakt } from '../../services/trakt-sync';
@@ -13,9 +13,12 @@ import {
   type DiscoverySourcePage,
 } from '../../services/discovery-content';
 import XrelQualityBadge from '../../components/XrelQualityBadge';
+import { fetchAddonCatalogBatch, type AddonCatalogPage } from '../../services/addon-catalogs';
+import { getSupportedCatalogs, loadInstalledAddons } from '../../services/installed-addons';
 import './Catalog.css';
 
 const CATALOG_PAGE_SIZE = 20;
+const ADDON_CATALOG_PAGE_SIZE = 100;
 const CATALOG_VIRTUALIZE_AFTER = 100;
 const CATALOG_GRID_MIN_COLUMN_WIDTH = 172;
 const CATALOG_GRID_COLUMN_GAP = 18;
@@ -55,6 +58,43 @@ function appendUniqueItems(current: MetaPreview[], incoming: MetaPreview[]): Met
   }
 
   return merged;
+}
+
+function buildCatalogCacheKey(catalog: CatalogInfo, contentMode: DiscoveryContentMode): string {
+  return `${catalog.source}-${catalog.addonInstallationId || ''}-${catalog.id}-${catalog.type}-${contentMode}-v5`;
+}
+
+async function fetchAddonCatalogSelection(catalog: CatalogInfo, skip: number): Promise<AddonCatalogPage> {
+  const addon = loadInstalledAddons().find((candidate) =>
+    candidate.installationId === catalog.addonInstallationId && candidate.enabled
+  );
+  const descriptor = addon && getSupportedCatalogs(addon).find((candidate) =>
+    candidate.id === catalog.id && candidate.type === catalog.type
+  );
+  if (!addon || !descriptor) throw new Error('The selected catalog add-on is unavailable.');
+  return fetchAddonCatalogBatch(addon, descriptor, { skip });
+}
+
+interface SelectedCatalogPage {
+  items: MetaPreview[];
+  sourceCount: number;
+}
+
+async function fetchSelectedCatalogPage(
+  catalog: CatalogInfo,
+  page: number,
+  contentMode: DiscoveryContentMode,
+): Promise<SelectedCatalogPage> {
+  if (catalog.source === 'addon') return fetchAddonCatalogSelection(catalog, page);
+  if (catalog.source === 'trakt') {
+    const items = await fetchTraktCatalogPage(catalog.id as 'trending' | 'anticipated', catalog.type, page, contentMode);
+    return { items, sourceCount: items.length };
+  }
+  const items = catalog.type === 'movie'
+    ? getTmdbMovies(catalog.id, page)
+    : getTmdbTv(catalog.id, page);
+  const resolvedItems = await items;
+  return { items: resolvedItems, sourceCount: resolvedItems.length };
 }
 
 function formatEpisodeLabel(item: Pick<MetaPreview, 'continueSeason' | 'continueEpisode'>): string {
@@ -371,29 +411,22 @@ const Catalog: React.FC = () => {
     }
     
     try {
-      let data: MetaPreview[] = [];
+      const data = await fetchSelectedCatalogPage(selectedCatalog, page, discoveryContentMode);
       
-      if (selectedCatalog.source === 'trakt') {
-        data = await fetchTraktCatalogPage(selectedCatalog.id as 'trending' | 'anticipated', selectedCatalog.type, page, discoveryContentMode);
-      } else if (selectedCatalog.type === 'movie') {
-        data = await getTmdbMovies(selectedCatalog.id, page);
-      } else {
-        data = await getTmdbTv(selectedCatalog.id, page);
-      }
-      
-      if (data.length === 0) {
+      if (data.sourceCount === 0) {
         setHasMore(false);
       } else {
         setItems(prev => {
-          const newItems = isLoadMore ? appendUniqueItems(prev, data) : appendUniqueItems([], data);
-          const cacheKey = `${selectedCatalog.source}-${selectedCatalog.id}-${selectedCatalog.type}-${discoveryContentMode}-v3`;
+          const newItems = isLoadMore ? appendUniqueItems(prev, data.items) : appendUniqueItems([], data.items);
+          const cacheKey = buildCatalogCacheKey(selectedCatalog, discoveryContentMode);
           setCatalogItems(newItems);
-          setCatalogPage(page + 1);
+          const nextPage = selectedCatalog.source === 'addon' ? page + data.sourceCount : page + 1;
+          setCatalogPage(nextPage);
           setCatalogCacheKey(cacheKey);
           return newItems;
         });
-        pageRef.current = page + 1;
-        if (page === 1) {
+        pageRef.current = selectedCatalog.source === 'addon' ? page + data.sourceCount : page + 1;
+        if (page === 1 || (selectedCatalog.source === 'addon' && page === 0)) {
           initialLoadDone.current = true;
         }
       }
@@ -408,12 +441,12 @@ const Catalog: React.FC = () => {
 
   useEffect(() => {
     if (!selectedCatalog) return;
-    pageRef.current = 1;
+    pageRef.current = selectedCatalog.source === 'addon' ? 0 : 1;
     initialLoadDone.current = false;
     setHasMore(true);
     
     // Use cached items if we have them for this catalog
-    const cacheKey = `${selectedCatalog.source}-${selectedCatalog.id}-${selectedCatalog.type}-${discoveryContentMode}-v3`;
+    const cacheKey = buildCatalogCacheKey(selectedCatalog, discoveryContentMode);
 
     if (selectedCatalog.source === 'continue') {
       setItems(catalogItems);
@@ -430,9 +463,11 @@ const Catalog: React.FC = () => {
       if (restoredItems.length !== catalogItems.length) {
         setCatalogItems(restoredItems);
       }
-      const restoredPage = catalogPage > 1
-        ? catalogPage
-        : Math.ceil(restoredItems.length / CATALOG_PAGE_SIZE) + 1;
+      const restoredPage = selectedCatalog.source === 'addon'
+        ? (catalogPage > 0 ? catalogPage : restoredItems.length)
+        : catalogPage > 1
+          ? catalogPage
+          : Math.ceil(restoredItems.length / CATALOG_PAGE_SIZE) + 1;
       pageRef.current = restoredPage;
       if (restoredPage !== catalogPage) {
         setCatalogPage(restoredPage);
@@ -443,13 +478,14 @@ const Catalog: React.FC = () => {
     }
     
     setCatalogItems([]);
-    setCatalogPage(1);
+    setCatalogPage(selectedCatalog.source === 'addon' ? 0 : 1);
     setCatalogCacheKey('');
     setItems([]);
     
     // Calculate how many items to load based on screen size
     const initialCount = calculateInitialCount();
-    const pagesToLoad = Math.ceil(initialCount / CATALOG_PAGE_SIZE);
+    const pageSize = selectedCatalog.source === 'addon' ? ADDON_CATALOG_PAGE_SIZE : CATALOG_PAGE_SIZE;
+    const pagesToLoad = Math.ceil(initialCount / pageSize);
     
     // Load multiple pages if needed
     const loadMultiple = async () => {
@@ -457,29 +493,25 @@ const Catalog: React.FC = () => {
       try {
         let allData: MetaPreview[] = [];
         let lastFetchedPage = 0;
+        let addonSkip = 0;
         let reachedEnd = false;
         for (let i = 1; i <= pagesToLoad; i++) {
-          let data: MetaPreview[] = [];
-          if (selectedCatalog.source === 'trakt') {
-            data = await fetchTraktCatalogPage(selectedCatalog.id as 'trending' | 'anticipated', selectedCatalog.type, i, discoveryContentMode);
-          } else if (selectedCatalog.type === 'movie') {
-            data = await getTmdbMovies(selectedCatalog.id, i);
-          } else {
-            data = await getTmdbTv(selectedCatalog.id, i);
-          }
-          if (data.length === 0) {
+          const requestPage = selectedCatalog.source === 'addon' ? addonSkip : i;
+          const data = await fetchSelectedCatalogPage(selectedCatalog, requestPage, discoveryContentMode);
+          if (data.sourceCount === 0) {
             reachedEnd = true;
             break;
           }
 
-          allData = appendUniqueItems(allData, data);
-          lastFetchedPage = i;
-          if (data.length < CATALOG_PAGE_SIZE && discoveryContentMode !== 'exclude-anime') {
+          allData = appendUniqueItems(allData, data.items);
+          addonSkip += data.sourceCount;
+          lastFetchedPage = selectedCatalog.source === 'addon' ? addonSkip : i;
+          if (data.sourceCount < pageSize && selectedCatalog.source !== 'addon' && discoveryContentMode !== 'exclude-anime') {
             reachedEnd = true;
             break;
           }
         }
-        const nextPage = lastFetchedPage + 1;
+        const nextPage = selectedCatalog.source === 'addon' ? lastFetchedPage : lastFetchedPage + 1;
         setItems(allData);
         setCatalogItems(allData);
         setCatalogPage(nextPage);
@@ -579,7 +611,9 @@ const Catalog: React.FC = () => {
       background: item.background,
       year: item.year,
       imdbId: item.imdbId,
-      rating: item.rating
+      rating: item.rating,
+      metadataSource: item.metadataSource,
+      addonInstallationId: item.addonInstallationId,
     }, scrollPosition);
   };
 

@@ -12,7 +12,8 @@ export {
 } from './addon-resume-selection';
 
 export interface AddonSourceSearchRequest {
-  imdbId: string;
+  imdbId?: string;
+  contentId?: string;
   mediaType: AddonMediaType;
   season?: number;
   episode?: number;
@@ -30,7 +31,9 @@ export interface AddonSourceSearchOutcome {
 }
 
 function buildContentId(request: AddonSourceSearchRequest): string {
-  const imdbId = request.imdbId.trim();
+  const providerContentId = request.contentId?.trim();
+  if (providerContentId) return providerContentId;
+  const imdbId = request.imdbId?.trim() || '';
   if (!/^tt\d+$/i.test(imdbId)) throw new Error('Installed stream add-ons require an IMDb ID.');
   if (request.mediaType === 'movie') return imdbId;
   if (request.season == null || request.episode == null) {

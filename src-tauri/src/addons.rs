@@ -45,6 +45,27 @@ pub enum AddonResource {
     Descriptor(AddonResourceDescriptor),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonCatalogExtra {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonCatalogDescriptor {
+    #[serde(rename = "type")]
+    pub media_type: String,
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<AddonCatalogExtra>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddonBehaviorHints {
@@ -75,6 +96,8 @@ pub struct AddonManifestSnapshot {
     pub types: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub id_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub catalogs: Vec<AddonCatalogDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_hints: Option<AddonBehaviorHints>,
 }
@@ -91,6 +114,11 @@ impl AddonManifestSnapshot {
             return Err("The add-on manifest does not declare any resources".to_string());
         }
         Ok(())
+    }
+
+    fn retain_supported_catalogs(&mut self) {
+        self.catalogs
+            .retain(|catalog| matches!(catalog.media_type.as_str(), "movie" | "series"));
     }
 }
 
@@ -109,6 +137,28 @@ pub struct InstalledAddonRecord {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddonStreamRequest {
+    pub installation_id: String,
+    pub media_type: String,
+    pub content_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonCatalogRequest {
+    pub installation_id: String,
+    pub media_type: String,
+    pub catalog_id: String,
+    #[serde(default)]
+    pub skip: Option<u32>,
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub genre: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonMetaRequest {
     pub installation_id: String,
     pub media_type: String,
     pub content_id: String,
@@ -380,23 +430,79 @@ async fn fetch_json<T: DeserializeOwned>(url: &Url) -> Result<T, String> {
     serde_json::from_slice(&body).map_err(|_| "The add-on returned invalid JSON".to_string())
 }
 
+fn validate_resource_parts(media_type: &str, resource_id: &str) -> Result<(), String> {
+    if media_type != "movie" && media_type != "series" {
+        return Err("The add-on media type must be movie or series".to_string());
+    }
+    if resource_id.trim().is_empty() || resource_id.contains('/') || resource_id.contains('\\') {
+        return Err("The add-on resource id is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn resource_root(manifest_url: &Url) -> Result<&str, String> {
+    manifest_url
+        .path()
+        .strip_suffix("/manifest.json")
+        .ok_or_else(|| "The stored add-on manifest URL is invalid".to_string())
+}
+
 fn stream_resource_url(
     manifest_url: &Url,
     media_type: &str,
     content_id: &str,
 ) -> Result<Url, String> {
-    if media_type != "movie" && media_type != "series" {
-        return Err("The add-on media type must be movie or series".to_string());
-    }
-    if content_id.trim().is_empty() || content_id.contains('/') || content_id.contains('\\') {
-        return Err("The add-on content id is invalid".to_string());
-    }
+    validate_resource_parts(media_type, content_id)?;
     let mut url = manifest_url.clone();
-    let root = url
-        .path()
-        .strip_suffix("/manifest.json")
-        .ok_or_else(|| "The stored add-on manifest URL is invalid".to_string())?;
+    let root = resource_root(manifest_url)?;
     url.set_path(&format!("{root}/stream/{media_type}/{content_id}.json"));
+    Ok(url)
+}
+
+fn meta_resource_url(
+    manifest_url: &Url,
+    media_type: &str,
+    content_id: &str,
+) -> Result<Url, String> {
+    validate_resource_parts(media_type, content_id)?;
+    let mut url = manifest_url.clone();
+    let root = resource_root(manifest_url)?;
+    url.set_path(&format!("{root}/meta/{media_type}/{content_id}.json"));
+    Ok(url)
+}
+
+fn catalog_resource_url(
+    manifest_url: &Url,
+    media_type: &str,
+    catalog_id: &str,
+    skip: Option<u32>,
+    search: Option<&str>,
+    genre: Option<&str>,
+) -> Result<Url, String> {
+    validate_resource_parts(media_type, catalog_id)?;
+    let mut url = manifest_url.clone();
+    let root = resource_root(manifest_url)?;
+    let mut extras_url = Url::parse("https://addon-extra.invalid/")
+        .map_err(|_| "The add-on catalog extras could not be encoded".to_string())?;
+    {
+        let mut extras = extras_url.query_pairs_mut();
+        if let Some(skip) = skip.filter(|value| *value > 0) {
+            extras.append_pair("skip", &skip.to_string());
+        }
+        if let Some(search) = search.map(str::trim).filter(|value| !value.is_empty()) {
+            extras.append_pair("search", search);
+        }
+        if let Some(genre) = genre.map(str::trim).filter(|value| !value.is_empty()) {
+            extras.append_pair("genre", genre);
+        }
+    }
+    let extras = extras_url.query().unwrap_or_default();
+    let suffix = if extras.is_empty() {
+        format!("{catalog_id}.json")
+    } else {
+        format!("{catalog_id}/{extras}.json")
+    };
+    url.set_path(&format!("{root}/catalog/{media_type}/{suffix}"));
     Ok(url)
 }
 
@@ -423,8 +529,9 @@ pub(crate) fn resolve_stream_handle(handle: &str) -> Result<String, String> {
 #[tauri::command]
 pub async fn install_addon(manifest_url: String) -> Result<InstalledAddonRecord, String> {
     let normalized_url = normalize_manifest_url(&manifest_url)?;
-    let manifest: AddonManifestSnapshot = fetch_json(&normalized_url).await?;
+    let mut manifest: AddonManifestSnapshot = fetch_json(&normalized_url).await?;
     manifest.validate()?;
+    manifest.retain_supported_catalogs();
 
     let installation_id = Uuid::new_v4().to_string();
     vault_write(&installation_id, normalized_url.as_str())?;
@@ -445,9 +552,33 @@ pub async fn refresh_addon_manifest(
     installation_id: String,
 ) -> Result<AddonManifestSnapshot, String> {
     let manifest_url = read_manifest_url(&installation_id)?;
-    let manifest: AddonManifestSnapshot = fetch_json(&manifest_url).await?;
+    let mut manifest: AddonManifestSnapshot = fetch_json(&manifest_url).await?;
     manifest.validate()?;
+    manifest.retain_supported_catalogs();
     Ok(manifest)
+}
+
+#[tauri::command]
+pub async fn fetch_addon_catalog(
+    request: AddonCatalogRequest,
+) -> Result<serde_json::Value, String> {
+    let manifest_url = read_manifest_url(&request.installation_id)?;
+    let catalog_url = catalog_resource_url(
+        &manifest_url,
+        &request.media_type,
+        &request.catalog_id,
+        request.skip,
+        request.search.as_deref(),
+        request.genre.as_deref(),
+    )?;
+    fetch_json(&catalog_url).await
+}
+
+#[tauri::command]
+pub async fn fetch_addon_meta(request: AddonMetaRequest) -> Result<serde_json::Value, String> {
+    let manifest_url = read_manifest_url(&request.installation_id)?;
+    let meta_url = meta_resource_url(&manifest_url, &request.media_type, &request.content_id)?;
+    fetch_json(&meta_url).await
 }
 
 #[tauri::command]
@@ -626,6 +757,47 @@ mod tests {
     }
 
     #[test]
+    fn builds_catalog_and_meta_urls_from_configured_manifest_paths() {
+        let manifest =
+            normalize_manifest_url("https://example.com/config/manifest.json?token=opaque")
+                .unwrap();
+        let catalog =
+            catalog_resource_url(&manifest, "movie", "new", Some(100), None, None).unwrap();
+        let meta = meta_resource_url(&manifest, "movie", "provider:123").unwrap();
+        assert_eq!(
+            catalog.as_str(),
+            "https://example.com/config/catalog/movie/new/skip=100.json?token=opaque"
+        );
+        assert_eq!(
+            meta.as_str(),
+            "https://example.com/config/meta/movie/provider:123.json?token=opaque"
+        );
+    }
+
+    #[test]
+    fn retains_supported_catalogs_from_mixed_type_manifests() {
+        let mut manifest: AddonManifestSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "community.mixed",
+            "version": "1.0.0",
+            "name": "Mixed catalogs",
+            "resources": ["catalog", "meta"],
+            "types": ["movie", "series", "channel"],
+            "catalogs": [
+                { "type": "movie", "id": "movies", "name": "Movies" },
+                { "type": "channel", "id": "channels", "name": "Channels" },
+                { "type": "series", "id": "series", "name": "Series" }
+            ]
+        }))
+        .unwrap();
+
+        manifest.retain_supported_catalogs();
+
+        assert_eq!(manifest.catalogs.len(), 2);
+        assert_eq!(manifest.catalogs[0].media_type, "movie");
+        assert_eq!(manifest.catalogs[1].media_type, "series");
+    }
+
+    #[test]
     fn derives_stream_size_from_original_title_before_using_filename() {
         let stream = StremioStream {
             title: Some("Provider metadata 💾 1.63 GB".to_string()),
@@ -664,5 +836,40 @@ mod tests {
         assert!(vault_read(&installed.installation_id).unwrap().is_some());
         remove_addon(installed.installation_id.clone()).unwrap();
         assert_eq!(vault_read(&installed.installation_id).unwrap(), None);
+    }
+
+    #[test]
+    #[ignore = "requires STREAMEE_ADDON_SMOKE_URL and live network access"]
+    fn live_catalog_and_meta_round_trip() {
+        let manifest_url = std::env::var("STREAMEE_ADDON_SMOKE_URL")
+            .expect("STREAMEE_ADDON_SMOKE_URL must contain a public manifest URL");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let manifest_url = normalize_manifest_url(&manifest_url).unwrap();
+            let manifest: AddonManifestSnapshot = fetch_json(&manifest_url).await.unwrap();
+            let catalog = manifest
+                .catalogs
+                .first()
+                .expect("the smoke add-on must declare a catalog");
+            let catalog_url = catalog_resource_url(
+                &manifest_url,
+                &catalog.media_type,
+                &catalog.id,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let catalog_response: serde_json::Value = fetch_json(&catalog_url).await.unwrap();
+            let first_meta_id = catalog_response["metas"]
+                .as_array()
+                .and_then(|items| items.first())
+                .and_then(|item| item["id"].as_str())
+                .expect("the smoke catalog must contain metadata");
+            let meta_url =
+                meta_resource_url(&manifest_url, &catalog.media_type, first_meta_id).unwrap();
+            let meta_response: serde_json::Value = fetch_json(&meta_url).await.unwrap();
+            assert_eq!(meta_response["meta"]["id"].as_str(), Some(first_meta_id));
+        });
     }
 }

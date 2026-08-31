@@ -40,7 +40,7 @@
                    "createUpdaterArtifacts":  true,
                    "resources":  {
                                      "../mpv/":  "mpv/",
-                                     "../node_modules/":  "node_modules/",
+                                     "sidecar-runtime/node_modules/":  "node_modules/",
                                      "target/node-runtime/streameenode.exe":  "streameenode.exe",
                                      "src/webtorrent-server.cjs":  "webtorrent-server.cjs",
                                      "resources/fpcalc.exe":  "fpcalc.exe",

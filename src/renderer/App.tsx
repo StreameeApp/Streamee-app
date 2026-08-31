@@ -49,7 +49,10 @@ const DISMISSED_ANNOUNCEMENT_ID_KEY = 'streamee-dismissed-announcement-id';
 
 let currentPlayingMeta: {
   type: 'movie' | 'show';
-  tmdbId: number;
+  tmdbId?: number;
+  metaId?: string;
+  metadataSource?: 'tmdb' | 'addon';
+  addonInstallationId?: string;
   name?: string;
   poster?: string;
   imdbId?: string;
@@ -72,8 +75,17 @@ let lastDiscordPresencePlayback: {
 
 const getPlayingMetaId = () => {
   if (!currentPlayingMeta) return null;
-  return `${currentPlayingMeta.type === 'show' ? 'tv' : 'movie'}:${currentPlayingMeta.tmdbId}`;
+  if (currentPlayingMeta.metadataSource === 'addon' && currentPlayingMeta.metaId) {
+    return currentPlayingMeta.metaId;
+  }
+  return typeof currentPlayingMeta.tmdbId === 'number'
+    ? `${currentPlayingMeta.type === 'show' ? 'tv' : 'movie'}:${currentPlayingMeta.tmdbId}`
+    : currentPlayingMeta.metaId || null;
 };
+
+const getPlayingSourceIdentity = () => currentPlayingMeta?.metadataSource === 'addon'
+  ? currentPlayingMeta.metaId
+  : currentPlayingMeta?.tmdbId?.toString();
 
 const readDiscordPresenceEnabled = () => {
   try {
@@ -117,7 +129,7 @@ const syncDiscordPresence = async (
     return;
   }
 
-  const title = currentPlayingMeta.name || `TMDB ${currentPlayingMeta.tmdbId}`;
+  const title = currentPlayingMeta.name || 'Streamee playback';
   const posterUrl = currentPlayingMeta.poster?.trim() || null;
   const subtitle = currentPlayingMeta.type === 'show' && activeEpisodeInfo
     ? formatEpisodeCode(activeEpisodeInfo)
@@ -189,7 +201,9 @@ const persistCurrentSourceResumeSnapshot = (
     return;
   }
 
-  const key = `${currentPlayingMeta.type === 'show' ? 'series' : 'movie'}-${currentPlayingMeta.tmdbId}`;
+  const sourceIdentity = getPlayingSourceIdentity();
+  if (!sourceIdentity) return;
+  const key = `${currentPlayingMeta.type === 'show' ? 'series' : 'movie'}-${sourceIdentity}`;
   try {
     const storedMeta = JSON.parse(localStorage.getItem('streamee-last-source-meta') || '{}');
     const existing = storedMeta[key] || {};
@@ -452,7 +466,7 @@ const getActiveEpisodeInfo = (
       ? {
           season: currentPlayingMeta.season,
           episode: currentPlayingMeta.episode,
-          title: currentPlayingMeta.name || `TMDB ${currentPlayingMeta.tmdbId}`
+          title: currentPlayingMeta.name || 'Episode'
         }
       : null
   );
@@ -566,11 +580,13 @@ const upsertContinueWatchingProgress = (
     }
   } else if (!isWatched || activeEpisodeInfo) {
     const type = currentPlayingMeta.type === 'show' ? 'series' : 'movie';
-    const title = currentPlayingMeta.name || `TMDB ${currentPlayingMeta.tmdbId}`;
+    const title = currentPlayingMeta.name || 'Untitled';
     const poster = currentPlayingMeta.poster || '';
     store.addToContinueWatching({
       metaId,
       type,
+      metadataSource: currentPlayingMeta.metadataSource,
+      addonInstallationId: currentPlayingMeta.addonInstallationId,
       title,
       poster,
       progress,
@@ -607,7 +623,10 @@ export function flushCurrentPlayingProgress(progressOverride?: number, event?: P
 
 export function setCurrentPlayingMeta(meta: {
   type: 'movie' | 'series';
-  tmdbId: number;
+  tmdbId?: number;
+  metaId?: string;
+  metadataSource?: 'tmdb' | 'addon';
+  addonInstallationId?: string;
   name?: string;
   poster?: string;
   imdbId?: string;
@@ -617,6 +636,9 @@ export function setCurrentPlayingMeta(meta: {
   currentPlayingMeta = meta ? {
     type: meta.type === 'series' ? 'show' : 'movie',
     tmdbId: meta.tmdbId,
+    metaId: meta.metaId,
+    metadataSource: meta.metadataSource,
+    addonInstallationId: meta.addonInstallationId,
     name: meta.name,
     poster: meta.poster,
     imdbId: meta.imdbId,
@@ -849,19 +871,22 @@ const App: React.FC = () => {
             
             const watchedAt = new Date().toISOString();
             if (currentPlayingMeta.type === 'show' && activeEpisodeInfo && metaId) {
-              const tmdbId = currentPlayingMeta.tmdbId.toString();
-              const alreadyWatchedEpisode = !!store.watchedEpisodes[`${tmdbId}:${activeEpisodeInfo.season}:${activeEpisodeInfo.episode}`];
+              const episodeWatchId = currentPlayingMeta.metadataSource === 'addon'
+                ? metaId
+                : currentPlayingMeta.tmdbId?.toString();
+              if (!episodeWatchId) return;
+              const alreadyWatchedEpisode = !!store.watchedEpisodes[`${episodeWatchId}:${activeEpisodeInfo.season}:${activeEpisodeInfo.episode}`];
               console.log(`%c[Progress]%c Episode progress >= 80%: watched=${alreadyWatchedEpisode}, metaId=${metaId}, S${activeEpisodeInfo.season}E${activeEpisodeInfo.episode}`, 'color: #10b981; font-weight: bold', 'color: inherit');
 
               if (!alreadyWatchedEpisode) {
-                store.markEpisodeWatched(tmdbId, activeEpisodeInfo.season, activeEpisodeInfo.episode, watchedAt);
+                store.markEpisodeWatched(episodeWatchId, activeEpisodeInfo.season, activeEpisodeInfo.episode, watchedAt);
                 recordMediaCompleted('series');
-                if (store.traktConnected) {
-                  await pushEpisodeWatchedToTrakt(tmdbId, activeEpisodeInfo.season, activeEpisodeInfo.episode, watchedAt);
+                if (store.traktConnected && currentPlayingMeta.metadataSource !== 'addon') {
+                  await pushEpisodeWatchedToTrakt(episodeWatchId, activeEpisodeInfo.season, activeEpisodeInfo.episode, watchedAt);
                 }
               }
             } else if (currentPlayingMeta.type === 'movie' && metaId && !store.watched.some(w => w.id === metaId)) {
-              const title = store.continueWatching.find(c => c.metaId === metaId)?.title || currentPlayingMeta.name || `TMDB ${currentPlayingMeta.tmdbId}`;
+              const title = store.continueWatching.find(c => c.metaId === metaId)?.title || currentPlayingMeta.name || 'Untitled';
               const poster = store.continueWatching.find(c => c.metaId === metaId)?.poster || currentPlayingMeta.poster || '';
 
               console.log(`%c[Progress]%c Adding to watched: ${title}`, 'color: #10b981; font-weight: bold', 'color: inherit');
@@ -872,11 +897,13 @@ const App: React.FC = () => {
                 poster,
                 year,
                 rating,
-                watchedAt
+                watchedAt,
+                metadataSource: currentPlayingMeta.metadataSource,
+                addonInstallationId: currentPlayingMeta.addonInstallationId,
               };
               store.addToWatched(watchedMeta);
               recordMediaCompleted('movie');
-              if (store.traktConnected) {
+              if (store.traktConnected && currentPlayingMeta.metadataSource !== 'addon') {
                 await pushWatchedToTrakt(watchedMeta);
               }
             }

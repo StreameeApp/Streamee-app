@@ -37,6 +37,8 @@ export interface MetaPreview {
   rating?: number;
   genreIds?: number[];
   originalLanguage?: string;
+  metadataSource?: 'tmdb' | 'addon';
+  addonInstallationId?: string;
   continueSource?: 'resume' | 'up-next';
   continueProgress?: number;
   continuePausedAt?: string;
@@ -153,6 +155,8 @@ interface Stream {
 export interface ContinueWatchingItem {
   metaId: string;
   type: 'movie' | 'series';
+  metadataSource?: 'tmdb' | 'addon';
+  addonInstallationId?: string;
   title: string;
   poster: string;
   progress: number;
@@ -250,11 +254,12 @@ export interface PendingTraktWatchlistAction {
   queuedAt: string;
 }
 
-interface CatalogInfo {
+export interface CatalogInfo {
   id: string;
   title: string;
   type: 'movie' | 'series';
-  source: 'tmdb' | 'trakt' | 'continue';
+  source: 'tmdb' | 'trakt' | 'continue' | 'addon';
+  addonInstallationId?: string;
   hideWatchedToggle?: boolean;
 }
 
@@ -297,6 +302,8 @@ interface AppState {
   traktConnected: boolean;
   traktToken: string | null;
   traktLastSync: number | null;
+  catalogSourceInstallationId: string | null;
+  adultCatalogsEnabled: boolean;
   boardScrollPosition: number;
   catalogScrollPosition: number;
   catalogItems: MetaPreview[];
@@ -350,6 +357,8 @@ interface AppState {
   setSearchResults: (results: TorrentResult[]) => void;
   setIsSearching: (isSearching: boolean) => void;
   setIsLoading: (isLoading: boolean) => void;
+  setCatalogSourceInstallationId: (installationId: string | null) => void;
+  setAdultCatalogsEnabled: (enabled: boolean) => void;
   setBoardScrollPosition: (position: number) => void;
   setCatalogScrollPosition: (position: number) => void;
   setCatalogItems: (items: MetaPreview[]) => void;
@@ -469,6 +478,8 @@ export const useStore = create<AppState>()(
       traktConnected: false,
       traktToken: null,
       traktLastSync: null,
+      catalogSourceInstallationId: null,
+      adultCatalogsEnabled: false,
       boardScrollPosition: 0,
       catalogScrollPosition: 0,
       catalogItems: [],
@@ -583,6 +594,15 @@ export const useStore = create<AppState>()(
       setSearchResults: (searchResults) => set({ searchResults }),
       setIsSearching: (isSearching) => set({ isSearching }),
       setIsLoading: (isLoading) => set({ isLoading }),
+      setCatalogSourceInstallationId: (catalogSourceInstallationId) => set({
+        catalogSourceInstallationId,
+        selectedCatalog: null,
+        catalogItems: [],
+        catalogPage: 1,
+        catalogCacheKey: '',
+        boardScrollPosition: 0,
+      }),
+      setAdultCatalogsEnabled: (adultCatalogsEnabled) => set({ adultCatalogsEnabled }),
       setBoardScrollPosition: (boardScrollPosition) => set({ boardScrollPosition }),
       setCatalogScrollPosition: (catalogScrollPosition) => set({ catalogScrollPosition }),
       setCatalogItems: (catalogItems) => set({ catalogItems }),
@@ -900,6 +920,8 @@ export const useStore = create<AppState>()(
         traktConnected: state.traktConnected,
         traktToken: state.traktToken,
         traktLastSync: state.traktLastSync,
+        catalogSourceInstallationId: state.catalogSourceInstallationId,
+        adultCatalogsEnabled: state.adultCatalogsEnabled,
         watchedEpisodes: state.watchedEpisodes,
         pendingTraktHistory: state.pendingTraktHistory,
         pendingTraktWatchlist: state.pendingTraktWatchlist,

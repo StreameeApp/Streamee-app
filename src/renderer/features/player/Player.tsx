@@ -2,7 +2,7 @@ import React, { useRef, useEffect, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { FiArrowLeft, FiActivity, FiChevronDown, FiChevronUp, FiFileText } from 'react-icons/fi';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { useStore, LocalVideoFile, PlaybackIdentityItem, TorrentResult } from '../../store';
+import { useStore, LocalVideoFile, PlaybackIdentityItem, TorrentResult, type Episode } from '../../store';
 import { flushCurrentPlayingProgress, setCurrentPlayingMeta } from '../../App';
 import { sortEpisodes, extractEpisodeNumber, filterVideoFiles } from '../../services/torrent-utils';
 import { cleanupPlaylist } from '../../services/playlist-manager';
@@ -205,6 +205,21 @@ const findAdjacentAiredEpisode = async (
 
 const formatSmartNextEpisode = (target: SmartNextTarget): string =>
   `S${target.season.toString().padStart(2, '0')}E${target.episode.toString().padStart(2, '0')}`;
+
+const findAdjacentAddonEpisode = (
+  episodes: Episode[] | undefined,
+  current: SmartNextTarget,
+  direction: SmartEpisodeDirection,
+): SmartNextTarget | null => {
+  const ordered = (episodes || [])
+    .map((episode) => ({ season: episode.season, episode: episode.episode }))
+    .sort((a, b) => a.season - b.season || a.episode - b.episode);
+  const currentIndex = ordered.findIndex((episode) =>
+    episode.season === current.season && episode.episode === current.episode
+  );
+  if (currentIndex < 0) return null;
+  return ordered[currentIndex + (direction === 'next' ? 1 : -1)] || null;
+};
 
 const RETRYABLE_MEDIA_MARKER = 'RETRYABLE_MEDIA_NOT_READY';
 const RETRYABLE_SESSION_MARKER = 'RETRYABLE_SUBTITLE_SESSION_RESTART';
@@ -511,20 +526,22 @@ const setPlaybackIdentityForFiles = <T extends { name: string; index?: number; p
 };
 
 const getStoredResumeSourceMeta = (
-  selectedMeta: { id: string; type: 'movie' | 'series' } | null | undefined
+  selectedMeta: { id: string; type: 'movie' | 'series'; metadataSource?: 'tmdb' | 'addon' } | null | undefined
 ): { preferredSeason?: number; preferredEpisode?: number; sourceFilename?: string } | null => {
   if (!selectedMeta) {
     return null;
   }
 
-  const tmdbId = selectedMeta.id.split(':')[1];
-  if (!tmdbId) {
+  const sourceIdentity = selectedMeta.metadataSource === 'addon'
+    ? selectedMeta.id
+    : selectedMeta.id.split(':')[1];
+  if (!sourceIdentity) {
     return null;
   }
 
   try {
     const storedMeta = JSON.parse(localStorage.getItem('streamee-last-source-meta') || '{}');
-    const sourceMeta = storedMeta[`${selectedMeta.type}-${tmdbId}`];
+    const sourceMeta = storedMeta[`${selectedMeta.type}-${sourceIdentity}`];
     if (!sourceMeta || typeof sourceMeta !== 'object') {
       return null;
     }
@@ -2087,15 +2104,20 @@ const Player: React.FC = () => {
         target: SmartNextTarget,
       ) => {
         if (!selectedMeta || selectedMeta.type !== 'series') return;
-        const tmdbId = selectedMeta.id.split(':')[1];
-        if (!tmdbId) return;
+        const sourceIdentity = selectedMeta.metadataSource === 'addon'
+          ? selectedMeta.id
+          : selectedMeta.id.split(':')[1];
+        if (!sourceIdentity) return;
+        const addonContentId = selectedMeta.episodes?.find((episode) =>
+          episode.season === target.season && episode.episode === target.episode
+        )?.id;
 
         try {
-          const key = `series-${tmdbId}`;
+          const key = `series-${sourceIdentity}`;
           const lastSources = JSON.parse(localStorage.getItem('streamee-last-sources') || '{}');
           const lastSourceMeta = JSON.parse(localStorage.getItem('streamee-last-source-meta') || '{}');
           const sourceReference = sourceType === 'addon'
-            ? `${torrent.addonInstallationId || 'addon'}:${selectedMeta.imdbId || ''}:${target.season}:${target.episode}`
+            ? `${torrent.addonInstallationId || 'addon'}:${addonContentId || selectedMeta.imdbId || ''}:${target.season}:${target.episode}`
             : torrent.streamUrl || torrent.magnetUri;
           lastSources[key] = sourceReference;
           lastSourceMeta[key] = {
@@ -2110,6 +2132,7 @@ const Player: React.FC = () => {
                   addonId: torrent.addonId,
                   addonName: torrent.addonName,
                   addonImdbId: selectedMeta.imdbId,
+                  addonContentId,
                   addonInfoHash: torrent.infoHash || undefined,
                   addonFileIndex: torrent.sourceFileIndex,
                   addonIndexer: torrent.indexer,
@@ -2163,8 +2186,9 @@ const Player: React.FC = () => {
         }
 
         const currentEpisode = resolveSmartNextCurrentEpisode(filename);
-        const tmdbId = Number(selectedMeta.id.split(':')[1]);
-        if (!Number.isFinite(tmdbId)) {
+        const isAddonMetadata = selectedMeta.metadataSource === 'addon';
+        const tmdbId = isAddonMetadata ? null : Number(selectedMeta.id.split(':')[1]);
+        if (!isAddonMetadata && !Number.isFinite(tmdbId)) {
           throw new Error('Could not identify this show in TMDB.');
         }
 
@@ -2173,7 +2197,7 @@ const Player: React.FC = () => {
           .map((addon) => addon.installationId)
           .join(',');
         const preparationKey = [
-          tmdbId,
+          isAddonMetadata ? selectedMeta.id : tmdbId,
           currentEpisode.season,
           currentEpisode.episode,
           direction,
@@ -2198,7 +2222,9 @@ const Player: React.FC = () => {
 
         let entry: SmartNextPreparationEntry;
         const promise = (async (): Promise<SmartNextPreparedMatch> => {
-          const target = await findAdjacentAiredEpisode(tmdbId, currentEpisode, direction);
+          const target = isAddonMetadata
+            ? findAdjacentAddonEpisode(selectedMeta.episodes, currentEpisode, direction)
+            : await findAdjacentAiredEpisode(tmdbId as number, currentEpisode, direction);
           if (trace) {
             trace.nextEpisodeResolvedAt = Date.now();
             logSmartNextPerformance('next-episode-resolved', {
@@ -2223,6 +2249,11 @@ const Player: React.FC = () => {
           }
           const outcome = await searchEnabledSourceProviders({
             imdbId: selectedMeta.imdbId,
+            contentId: isAddonMetadata
+              ? selectedMeta.episodes?.find((episode) =>
+                  episode.season === target.season && episode.episode === target.episode
+                )?.id
+              : undefined,
             isTvShow: true,
             season: target.season,
             episode: target.episode,
@@ -2548,8 +2579,12 @@ const Player: React.FC = () => {
             void window.electronAPI.cancelSmartNextWarmup().catch(() => {});
           }
 
-          const tmdbId = Number(selectedMeta?.id.split(':')[1]);
-          if (!selectedMeta || selectedMeta.type !== 'series' || !Number.isFinite(tmdbId)) {
+          if (!selectedMeta || selectedMeta.type !== 'series') {
+            throw new Error('Could not identify this series.');
+          }
+          const isAddonMetadata = selectedMeta.metadataSource === 'addon';
+          const tmdbId = isAddonMetadata ? undefined : Number(selectedMeta.id.split(':')[1]);
+          if (!isAddonMetadata && !Number.isFinite(tmdbId)) {
             throw new Error('Could not identify this show in TMDB.');
           }
 
@@ -2595,7 +2630,10 @@ const Player: React.FC = () => {
 
           setCurrentPlayingMeta({
             type: 'series',
-            tmdbId,
+            tmdbId: Number.isFinite(tmdbId) ? tmdbId : undefined,
+            metaId: selectedMeta.id,
+            metadataSource: selectedMeta.metadataSource,
+            addonInstallationId: selectedMeta.addonInstallationId,
             name: selectedMeta.name,
             poster: selectedMeta.poster,
             imdbId: selectedMeta.imdbId,
@@ -3538,6 +3576,7 @@ const Player: React.FC = () => {
 
         const episode = resolveIntroDbEpisode(filename, playlistPos);
         if (!episode) return;
+        if (selectedMeta.metadataSource === 'addon') return;
         const tmdbId = Number(selectedMeta.id.split(':')[1]);
         if (!Number.isSafeInteger(tmdbId) || tmdbId <= 0) return;
         const seriesWatchKey = selectedMeta.imdbId || selectedMeta.id;
@@ -4199,8 +4238,10 @@ const Player: React.FC = () => {
             return;
           }
 
-          const tmdbId = selectedMeta.id.split(':')[1];
-          const key = `${selectedMeta.type}-${tmdbId}`;
+          const sourceIdentity = selectedMeta.metadataSource === 'addon'
+            ? selectedMeta.id
+            : selectedMeta.id.split(':')[1];
+          const key = `${selectedMeta.type}-${sourceIdentity}`;
           const storedMeta = JSON.parse(localStorage.getItem('streamee-last-source-meta') || '{}');
           const existing = storedMeta[key] || {};
           storedMeta[key] = {
@@ -5313,6 +5354,9 @@ const Player: React.FC = () => {
             setCurrentPlayingMeta({
               type: selectedMeta.type,
               tmdbId,
+              metaId: selectedMeta.id,
+              metadataSource: selectedMeta.metadataSource,
+              addonInstallationId: selectedMeta.addonInstallationId,
               name: selectedMeta.name,
               poster: selectedMeta.poster,
               imdbId: selectedMeta.imdbId,
@@ -5814,6 +5858,9 @@ const Player: React.FC = () => {
             setCurrentPlayingMeta({
               type: selectedMeta.type,
               tmdbId,
+              metaId: selectedMeta.id,
+              metadataSource: selectedMeta.metadataSource,
+              addonInstallationId: selectedMeta.addonInstallationId,
               name: selectedMeta.name,
               poster: selectedMeta.poster,
               imdbId: selectedMeta.imdbId,
@@ -6199,6 +6246,9 @@ const Player: React.FC = () => {
               setCurrentPlayingMeta({
                 type: selectedMeta.type,
                 tmdbId,
+                metaId: selectedMeta.id,
+                metadataSource: selectedMeta.metadataSource,
+                addonInstallationId: selectedMeta.addonInstallationId,
                 name: selectedMeta.name,
                 poster: selectedMeta.poster,
                 imdbId: selectedMeta.imdbId,

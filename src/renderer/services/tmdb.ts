@@ -1403,6 +1403,7 @@ export interface EpisodeDetail {
   air_date: string | null;
   runtime: number | null;
   vote_average: number;
+  addonContentId?: string;
 }
 
 export interface TmdbSeriesSchedule {

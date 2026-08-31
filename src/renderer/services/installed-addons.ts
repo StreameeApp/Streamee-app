@@ -17,6 +17,19 @@ export interface AddonManifestBehaviorHints {
   configurationRequired?: boolean;
 }
 
+export interface AddonCatalogExtra {
+  name: string;
+  isRequired?: boolean;
+  options?: string[];
+}
+
+export interface AddonCatalogDescriptor {
+  type: AddonMediaType;
+  id: string;
+  name: string;
+  extra?: AddonCatalogExtra[];
+}
+
 export interface AddonManifestSnapshot {
   id: string;
   version: string;
@@ -27,6 +40,7 @@ export interface AddonManifestSnapshot {
   resources: Array<AddonResourceName | string | AddonResourceDescriptor>;
   types: string[];
   idPrefixes?: string[];
+  catalogs?: AddonCatalogDescriptor[];
   behaviorHints?: AddonManifestBehaviorHints;
 }
 
@@ -67,6 +81,21 @@ export interface InstalledAddonStreamProbe {
   filename?: string;
 }
 
+export interface InstalledAddonCatalogRequest {
+  installationId: string;
+  mediaType: AddonMediaType;
+  catalogId: string;
+  skip?: number;
+  search?: string;
+  genre?: string;
+}
+
+export interface InstalledAddonMetaRequest {
+  installationId: string;
+  mediaType: AddonMediaType;
+  contentId: string;
+}
+
 interface InstalledAddonRegistryV1 {
   version: 1;
   /** Array order is the fallback priority, from highest to lowest. */
@@ -91,6 +120,21 @@ function isResourceDescriptor(value: unknown): value is AddonResourceDescriptor 
   return true;
 }
 
+function isCatalogExtra(value: unknown): value is AddonCatalogExtra {
+  if (!isRecord(value) || !isNonEmptyString(value.name)) return false;
+  if (value.isRequired !== undefined && typeof value.isRequired !== 'boolean') return false;
+  if (value.options !== undefined && !isStringArray(value.options)) return false;
+  return true;
+}
+
+function isCatalogDescriptor(value: unknown): value is AddonCatalogDescriptor {
+  if (!isRecord(value) || (value.type !== 'movie' && value.type !== 'series')) return false;
+  if (!isNonEmptyString(value.id) || !isNonEmptyString(value.name)) return false;
+  if (value.extra !== undefined
+    && (!Array.isArray(value.extra) || !value.extra.every(isCatalogExtra))) return false;
+  return true;
+}
+
 function isManifestSnapshot(value: unknown): value is AddonManifestSnapshot {
   if (!isRecord(value)) return false;
   if (!isNonEmptyString(value.id) || !isNonEmptyString(value.version) || !isNonEmptyString(value.name)) {
@@ -101,6 +145,8 @@ function isManifestSnapshot(value: unknown): value is AddonManifestSnapshot {
     return false;
   }
   if (value.idPrefixes !== undefined && !isStringArray(value.idPrefixes)) return false;
+  if (value.catalogs !== undefined
+    && (!Array.isArray(value.catalogs) || !value.catalogs.every(isCatalogDescriptor))) return false;
   return true;
 }
 
@@ -188,7 +234,7 @@ export function reorderInstalledAddons(installationIds: string[]): InstalledAddo
   return result;
 }
 
-function resourceSupportsRequest(
+export function resourceSupportsRequest(
   manifest: AddonManifestSnapshot,
   resource: AddonResourceName,
   mediaType: AddonMediaType,
@@ -202,6 +248,34 @@ function resourceSupportsRequest(
       && !declaredResource.idPrefixes.some((prefix) => contentId.startsWith(prefix))) return false;
     return true;
   });
+}
+
+function resourceSupportsMediaType(
+  manifest: AddonManifestSnapshot,
+  resource: AddonResourceName,
+  mediaType: AddonMediaType,
+): boolean {
+  return manifest.resources.some((declaredResource) => {
+    if (typeof declaredResource === 'string') return declaredResource === resource;
+    return declaredResource.name === resource
+      && (!declaredResource.types?.length || declaredResource.types.includes(mediaType));
+  });
+}
+
+export function getSupportedCatalogs(addon: InstalledAddon): AddonCatalogDescriptor[] {
+  return (addon.manifest.catalogs || []).filter((catalog) =>
+    resourceSupportsRequest(addon.manifest, 'catalog', catalog.type, catalog.id)
+    && resourceSupportsMediaType(addon.manifest, 'meta', catalog.type)
+  );
+}
+
+export function getEnabledCatalogAddons(
+  includeAdult: boolean,
+  addons = loadInstalledAddons(),
+): InstalledAddon[] {
+  return addons.filter((addon) => addon.enabled
+    && (includeAdult || !addon.manifest.behaviorHints?.adult)
+    && getSupportedCatalogs(addon).length > 0);
 }
 
 export function getEnabledStreamAddons(
@@ -221,17 +295,42 @@ export function clearInstalledAddons(): void {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(emptyRegistry()));
 }
 
+function retainSupportedCatalogs(addon: InstalledAddon): InstalledAddon {
+  return {
+    ...addon,
+    manifest: {
+      ...addon.manifest,
+      catalogs: addon.manifest.catalogs?.filter(
+        (catalog) => catalog.type === 'movie' || catalog.type === 'series',
+      ),
+    },
+  };
+}
+
 export async function installAddonFromManifestUrl(manifestUrl: string): Promise<InstalledAddon> {
   const addon = await invoke<InstalledAddon>('install_addon', { manifestUrl });
-  upsertInstalledAddon(addon);
-  return addon;
+  try {
+    const supportedAddon = retainSupportedCatalogs(addon);
+    upsertInstalledAddon(supportedAddon);
+    return supportedAddon;
+  } catch (error) {
+    try {
+      await invoke<void>('remove_addon', { installationId: addon.installationId });
+    } catch (cleanupError) {
+      console.error('Failed to roll back an add-on installation:', cleanupError);
+    }
+    throw error;
+  }
 }
 
 export async function refreshInstalledAddon(installationId: string): Promise<InstalledAddon> {
   const current = loadInstalledAddons().find((addon) => addon.installationId === installationId);
   if (!current) throw new Error('The installed add-on is unavailable.');
 
-  const manifest = await invoke<AddonManifestSnapshot>('refresh_addon_manifest', { installationId });
+  const manifest = retainSupportedCatalogs({
+    ...current,
+    manifest: await invoke<AddonManifestSnapshot>('refresh_addon_manifest', { installationId }),
+  }).manifest;
   const updated: InstalledAddon = {
     ...current,
     addonId: manifest.id,
@@ -246,6 +345,18 @@ export async function fetchInstalledAddonStreams(
   request: InstalledAddonStreamRequest,
 ): Promise<InstalledAddonStream[]> {
   return invoke<InstalledAddonStream[]>('fetch_addon_streams', { request });
+}
+
+export async function fetchInstalledAddonCatalog(
+  request: InstalledAddonCatalogRequest,
+): Promise<unknown> {
+  return invoke<unknown>('fetch_addon_catalog', { request });
+}
+
+export async function fetchInstalledAddonMeta(
+  request: InstalledAddonMetaRequest,
+): Promise<unknown> {
+  return invoke<unknown>('fetch_addon_meta', { request });
 }
 
 export async function probeInstalledAddonStreams(

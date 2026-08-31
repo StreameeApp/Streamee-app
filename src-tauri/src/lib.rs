@@ -6449,7 +6449,30 @@ async fn stop_audio_normalizer_runtime(app_handle: AppHandle) -> Result<(), Stri
     stop_audio_normalizer_and_emit(&app_handle)
 }
 
+#[cfg(debug_assertions)]
+fn development_mpv_path() -> Option<PathBuf> {
+    let mpv_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("mpv")
+        .join("mpv.exe");
+    mpv_path
+        .is_file()
+        .then(|| mpv_path.canonicalize().unwrap_or(mpv_path))
+}
+
 pub(crate) fn find_mpv(app: &AppHandle) -> Option<String> {
+    // Tauri recreates the generated debug resource directory during startup.
+    // Prefer the authoritative workspace bundle in development so MPV never
+    // starts while scripts/shaders are only partially copied into target/.
+    #[cfg(debug_assertions)]
+    if let Some(development_mpv) = development_mpv_path() {
+        info!(
+            "Found development MPV workspace bundle at: {}",
+            development_mpv.display()
+        );
+        return Some(development_mpv.to_string_lossy().to_string());
+    }
+
     // Prefer the bundled resource path when running from an installed app.
     if let Ok(mpv_path) = app.path().resolve("mpv/mpv.exe", BaseDirectory::Resource) {
         if mpv_path.exists() {
@@ -8639,6 +8662,8 @@ pub fn run() {
             api_keys::clear_api_keys,
             addons::install_addon,
             addons::refresh_addon_manifest,
+            addons::fetch_addon_catalog,
+            addons::fetch_addon_meta,
             addons::fetch_addon_streams,
             addons::probe_addon_streams,
             addons::remove_addon,
@@ -8761,6 +8786,20 @@ mod stream_cache_tests {
 
         assert!(resolved.is_file());
         assert!(resolved.ends_with(Path::new("mpv/scripts/streamee_rife.py")));
+    }
+
+    #[test]
+    fn development_mpv_workspace_bundle_contains_custom_osc() {
+        let resolved = development_mpv_path().expect("development MPV should resolve");
+        let workspace_mpv = resolved
+            .parent()
+            .expect("MPV should have a parent directory");
+
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("mpv.exe")
+        );
+        assert!(workspace_mpv.join("scripts").join("PlexOSC.lua").is_file());
     }
 
     #[cfg(target_os = "windows")]

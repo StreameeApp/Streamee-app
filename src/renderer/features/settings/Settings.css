@@ -1608,6 +1608,43 @@
   line-height: 1.5;
 }
 
+.addon-catalog-source-controls {
+  display: grid;
+  gap: 7px;
+  margin-top: 16px;
+}
+
+.addon-catalog-source-controls > label,
+.addon-adult-catalog-control strong {
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.addon-catalog-source-controls .settings-select {
+  width: min(100%, 420px);
+}
+
+.addon-catalog-source-help,
+.addon-adult-catalog-control > div > span {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.addon-adult-catalog-control {
+  justify-content: space-between;
+  gap: 20px;
+  margin-top: 15px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.addon-adult-catalog-control > div {
+  display: grid;
+  gap: 3px;
+}
+
 .addon-feedback:empty {
   display: none;
 }

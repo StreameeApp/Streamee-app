@@ -4,6 +4,7 @@ export { deduplicateResults } from './source-deduplication';
 
 export interface SourceSearchRequest {
   imdbId?: string;
+  contentId?: string;
   isTvShow: boolean;
   season?: number;
   episode?: number;
@@ -19,8 +20,8 @@ export interface SourceSearchOutcome {
 }
 
 export async function searchEnabledSourceProviders(request: SourceSearchRequest): Promise<SourceSearchOutcome> {
-  if (!request.imdbId) {
-    throw new Error('Installed stream add-ons require an IMDb ID.');
+  if (!request.imdbId && !request.contentId) {
+    throw new Error('Installed stream add-ons require a provider content ID.');
   }
   const toSourceOutcome = (outcome: Awaited<ReturnType<typeof searchInstalledStreamAddons>>): SourceSearchOutcome => ({
     results: outcome.results,
@@ -29,6 +30,7 @@ export async function searchEnabledSourceProviders(request: SourceSearchRequest)
   });
   const outcome = await searchInstalledStreamAddons({
     imdbId: request.imdbId,
+    contentId: request.contentId,
     mediaType: request.isTvShow ? 'series' : 'movie',
     season: request.season,
     episode: request.episode,

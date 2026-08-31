@@ -9,6 +9,8 @@ import {
 } from '../../services/addon-resume-selection';
 import { deduplicateResults, searchEnabledSourceProviders } from '../../services/source-search';
 import { getEnabledStreamAddons } from '../../services/installed-addons';
+import { fetchAddonMetaDetails } from '../../services/addon-catalogs';
+import { resolveTmdbImdbId } from '../../services/tmdb-identity';
 import { getRelatedRecommendations, getTraktSentiments, hasTraktCredentials, type TraktSentiments } from '../../services/trakt';
 import { pushEpisodeWatchedToTrakt, pushEpisodeUnwatchedToTrakt, pushSeasonWatchedToTrakt, pushUnwatchedToTrakt, pushWatchedToTrakt, pushWatchlistToTrakt } from '../../services/trakt-sync';
 import { sortEpisodes } from '../../services/torrent-utils';
@@ -88,6 +90,7 @@ type LastSourceMeta = {
   duration?: number;
   sourceFilename?: string;
   addonImdbId?: string;
+  addonContentId?: string;
   directStreamProvider?: 'addon';
   addonInstallationId?: string;
   addonId?: string;
@@ -218,10 +221,12 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   );
   const actorSeriesCount = actorCredits.length - actorMovieCount;
 
-  const tmdbId = meta.id.split(':')[1];
+  const isAddonMetadata = meta.metadataSource === 'addon' && !!meta.addonInstallationId;
+  const tmdbId = isAddonMetadata ? '' : meta.id.split(':')[1];
+  const episodeWatchId = isAddonMetadata ? meta.id : tmdbId;
   const isTvShow = meta.type === 'series';
   const watchRegion = getTmdbWatchRegion();
-  const continueWatchingMetaId = isTvShow ? `tv:${tmdbId}` : meta.id;
+  const continueWatchingMetaId = isAddonMetadata ? meta.id : isTvShow ? `tv:${tmdbId}` : meta.id;
   const continueWatchingItem = useMemo(
     () =>
       continueWatching.find(
@@ -236,7 +241,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       ) || null,
     [continueWatchingMetaId, continueWatchingView, meta.id]
   );
-  const getLastSourceKey = () => `${meta.type}-${tmdbId}`;
+  const getLastSourceKey = () => `${meta.type}-${isAddonMetadata ? meta.id : tmdbId}`;
   const getDefaultSourceMeta = (sourceUrl?: string): LastSourceMeta => ({
     sourceType: sourceUrl && !sourceUrl.startsWith('magnet:?') ? 'qbittorrent' : 'webtorrent',
     sourceUrl,
@@ -309,7 +314,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
 
   useEffect(() => {
     setPressedTorrentActions(loadTorrentActionState());
-  }, [meta.type, tmdbId]);
+  }, [isAddonMetadata, meta.id, meta.type, tmdbId]);
 
   useEffect(() => {
     if (!secondaryMetadataReady && !details?.imdbId && !meta.imdbId) return;
@@ -332,11 +337,13 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     let latest: { season: number; episode: number; watchedAt: string } | null = null;
 
     for (const [key, value] of Object.entries(watchedEpisodes)) {
-      if (!key.startsWith(`${tmdbId}:`)) {
+      if (!key.startsWith(`${episodeWatchId}:`)) {
         continue;
       }
 
-      const [, seasonPart, episodePart] = key.split(':');
+      const parts = key.split(':');
+      const seasonPart = parts.at(-2);
+      const episodePart = parts.at(-1);
       const season = Number(seasonPart);
       const episode = Number(episodePart);
       const watchedAt = typeof value === 'string' ? value : '';
@@ -351,7 +358,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     }
 
     return latest;
-  }, [isTvShow, tmdbId, watchedEpisodes]);
+  }, [episodeWatchId, isTvShow, watchedEpisodes]);
   const resumeTarget = useMemo(() => {
     if (!isTvShow) {
       return null;
@@ -461,10 +468,11 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     setSelectedIndexer('all');
 
     let episodes = episodesBySeason[season.season_number];
-    if (!episodes) {
+    if (!episodes && !isAddonMetadata) {
       episodes = await getTmdbEpisodes(parseInt(tmdbId, 10), season.season_number);
       setEpisodesBySeason((prev) => ({ ...prev, [season.season_number]: episodes }));
     }
+    episodes ||= [];
 
     setSelectedEpisode((prev) => {
       if (prev && prev.season_number === season.season_number) {
@@ -518,19 +526,19 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   };
 
   const isEpisodeWatched = (episodeNumber: number, seasonNumber: number) => {
-    return !!watchedEpisodes[`${tmdbId}:${seasonNumber}:${episodeNumber}`];
+    return !!watchedEpisodes[`${episodeWatchId}:${seasonNumber}:${episodeNumber}`];
   };
 
   const toggleEpisodeWatched = (e: React.MouseEvent, episode: EpisodeDetail) => {
     e.stopPropagation();
     if (isEpisodeWatched(episode.episode_number, episode.season_number)) {
-      markEpisodeUnwatched(tmdbId, episode.season_number, episode.episode_number);
-      if (traktConnected) {
+      markEpisodeUnwatched(episodeWatchId, episode.season_number, episode.episode_number);
+      if (traktConnected && !isAddonMetadata) {
         pushEpisodeUnwatchedToTrakt(tmdbId, episode.season_number, episode.episode_number);
       }
     } else {
-      markEpisodeWatched(tmdbId, episode.season_number, episode.episode_number);
-      if (traktConnected) {
+      markEpisodeWatched(episodeWatchId, episode.season_number, episode.episode_number);
+      if (traktConnected && !isAddonMetadata) {
         pushEpisodeWatchedToTrakt(tmdbId, episode.season_number, episode.episode_number);
       }
     }
@@ -539,26 +547,27 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   const handleMarkSeasonWatched = async (e: React.MouseEvent, season: Season) => {
     e.stopPropagation();
     let episodes = episodesBySeason[season.season_number];
-    if (!episodes) {
+    if (!episodes && !isAddonMetadata) {
       episodes = await getTmdbEpisodes(parseInt(tmdbId), season.season_number);
       setEpisodesBySeason(prev => ({ ...prev, [season.season_number]: episodes }));
     }
+    episodes ||= [];
     const episodeNumbers = episodes.map(ep => ep.episode_number);
     const allWatched = episodeNumbers.every(ep => isEpisodeWatched(ep, season.season_number));
 
     if (allWatched) {
       // Unmark all
       const { markSeasonUnwatched } = useStore.getState();
-      markSeasonUnwatched(tmdbId, season.season_number, episodeNumbers);
-      if (traktConnected) {
+      markSeasonUnwatched(episodeWatchId, season.season_number, episodeNumbers);
+      if (traktConnected && !isAddonMetadata) {
         await Promise.all(episodeNumbers.map((episodeNumber) =>
           pushEpisodeUnwatchedToTrakt(tmdbId, season.season_number, episodeNumber)
         ));
       }
     } else {
       // Mark all watched
-      markSeasonWatched(tmdbId, season.season_number, episodeNumbers);
-      if (traktConnected) {
+      markSeasonWatched(episodeWatchId, season.season_number, episodeNumbers);
+      if (traktConnected && !isAddonMetadata) {
         pushSeasonWatchedToTrakt(tmdbId, season.season_number, episodeNumbers);
       }
     }
@@ -567,7 +576,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   const getSeasonWatchedCount = (seasonNumber: number): number => {
     let count = 0;
     for (const key of Object.keys(watchedEpisodes)) {
-      if (key.startsWith(`${tmdbId}:${seasonNumber}:`)) count++;
+      if (key.startsWith(`${episodeWatchId}:${seasonNumber}:`)) count++;
     }
     return count;
   };
@@ -593,7 +602,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     if (isTvShow) {
       let latest: string | null = null;
       for (const [key, value] of Object.entries(watchedEpisodes)) {
-        if (key.startsWith(`${tmdbId}:`)) {
+        if (key.startsWith(`${episodeWatchId}:`)) {
           const ts = typeof value === 'string' ? value : null;
           if (ts && (!latest || ts > latest)) latest = ts;
         }
@@ -603,7 +612,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       const watchedMeta = watched.find(w => w.id === meta.id);
       return watchedMeta?.watchedAt ? formatRelativeTime(watchedMeta.watchedAt) : null;
     }
-  }, [watchedEpisodes, watched, tmdbId, isTvShow, meta.id]);
+  }, [episodeWatchId, watchedEpisodes, watched, isTvShow, meta.id]);
 
   const getQualityValue = (quality: string): number => {
     if (quality === '4K') return 4;
@@ -724,17 +733,17 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   }, [detailTitle, isTvShow, releaseYear, selectedEpisode]);
   const availableSearchAddons = useMemo(() => {
     const imdbId = details?.imdbId || meta.imdbId || '';
-    if (!/^tt\d+$/i.test(imdbId)) return [];
-
-    const contentId = isTvShow
-      ? selectedEpisode
-        ? `${imdbId}:${selectedEpisode.season_number}:${selectedEpisode.episode_number}`
-        : ''
-      : imdbId;
+    const contentId = isAddonMetadata
+      ? isTvShow ? selectedEpisode?.addonContentId || '' : meta.id
+      : isTvShow
+        ? selectedEpisode && /^tt\d+$/i.test(imdbId)
+          ? `${imdbId}:${selectedEpisode.season_number}:${selectedEpisode.episode_number}`
+          : ''
+        : /^tt\d+$/i.test(imdbId) ? imdbId : '';
     if (!contentId) return [];
 
     return getEnabledStreamAddons(isTvShow ? 'series' : 'movie', contentId);
-  }, [details?.imdbId, isTvShow, meta.imdbId, selectedEpisode]);
+  }, [details?.imdbId, isAddonMetadata, isTvShow, meta.id, meta.imdbId, selectedEpisode]);
   const activeSeason = selectedSeason ?? visibleSeasons[0] ?? null;
   const activeSeasonEpisodes = activeSeason ? episodesBySeason[activeSeason.season_number] || [] : [];
   const activeSeasonWatchedCount = activeSeason ? getSeasonWatchedCount(activeSeason.season_number) : 0;
@@ -970,23 +979,101 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       setActorCreditFilter('all');
       try {
         const type = meta.type;
-        const tmdbIdNum = parseInt(tmdbId, 10);
         const initialResumeTarget = resumeTarget;
         const secondaryTasks: Array<Promise<unknown>> = [];
+
+        if (isAddonMetadata && meta.addonInstallationId) {
+          const addonDetails = await fetchAddonMetaDetails(
+            meta.addonInstallationId,
+            type,
+            meta.id,
+          );
+          if (!isCurrentRequest()) return;
+          const nextDetails = { ...meta, ...addonDetails, id: meta.id, type: meta.type };
+          setDetails(nextDetails);
+          useStore.setState((state) => ({
+            selectedMeta: state.selectedMeta?.id === meta.id
+              ? { ...state.selectedMeta, ...nextDetails }
+              : state.selectedMeta,
+          }));
+
+          if (type === 'series') {
+            const grouped: Record<number, EpisodeDetail[]> = {};
+            (addonDetails.episodes || []).forEach((episode, index) => {
+              const item: EpisodeDetail = {
+                id: index + 1,
+                name: episode.title,
+                overview: '',
+                still_path: episode.thumbnail || null,
+                episode_number: episode.episode,
+                season_number: episode.season,
+                air_date: null,
+                runtime: null,
+                vote_average: 0,
+                addonContentId: episode.id,
+              };
+              (grouped[episode.season] ||= []).push(item);
+            });
+            Object.values(grouped).forEach((episodes) =>
+              episodes.sort((a, b) => a.episode_number - b.episode_number)
+            );
+            const addonSeasons: Season[] = Object.entries(grouped)
+              .map(([seasonNumber, episodes]) => ({
+                id: Number(seasonNumber),
+                season_number: Number(seasonNumber),
+                name: `Season ${seasonNumber}`,
+                overview: '',
+                poster_path: null,
+                air_date: null,
+                episode_count: episodes.length,
+              }))
+              .sort((a, b) => a.season_number - b.season_number);
+            const preferredSeason = initialResumeTarget
+              ? addonSeasons.find((season) => season.season_number === initialResumeTarget.season)
+              : addonSeasons[0];
+            const selected = preferredSeason || addonSeasons[0] || null;
+            setEpisodesBySeason(grouped);
+            setSeasons(addonSeasons);
+            setSelectedSeason(selected);
+            if (selected) {
+              const episodes = grouped[selected.season_number] || [];
+              const preferredEpisode = initialResumeTarget
+                ? episodes.find((episode) => episode.episode_number === initialResumeTarget.episode)
+                : undefined;
+              setSelectedEpisode(preferredEpisode || episodes[0] || null);
+            }
+          }
+
+          setWatchProvidersLoading(false);
+          setSeasonsLoading(false);
+          scheduleSecondaryMetadata();
+          performanceTrace.finish('add-on metadata ready');
+          return;
+        }
+
+        const tmdbIdNum = parseInt(tmdbId, 10);
 
         const data = await getTmdbTitleBundle(type, tmdbIdNum, shouldLoadWatchProviders, watchRegion);
         if (!isCurrentRequest()) return;
         performanceTrace.mark('primary metadata ready');
 
         if (data?.meta) {
+          const resolvedImdbId = data.meta.imdbId || meta.imdbId || await resolveTmdbImdbId({
+            id: meta.id,
+            type: meta.type,
+          });
+          if (!isCurrentRequest()) return;
+          const resolvedMeta = resolvedImdbId
+            ? { ...data.meta, imdbId: resolvedImdbId }
+            : data.meta;
           setWatchProviders(data.watchProviders);
-          setDetails({ ...meta, ...data.meta, id: meta.id, type: meta.type });
+          setDetails({ ...meta, ...resolvedMeta, id: meta.id, type: meta.type });
           useStore.setState((state) => ({
             selectedMeta: state.selectedMeta?.id === meta.id
               ? {
                   ...state.selectedMeta,
-                  ...data.meta,
-                  rating: data.meta.tmdbRating ?? state.selectedMeta.rating
+                  ...resolvedMeta,
+                  rating: resolvedMeta.tmdbRating ?? state.selectedMeta.rating
                 }
               : state.selectedMeta
           }));
@@ -994,8 +1081,8 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
           setLogoUrl(data.logoUrl);
           setTrailerSources(data.tmdbTrailerSources);
 
-          if (data.meta.imdbId) {
-            secondaryTasks.push(getOmdbRating(data.meta.imdbId).then((imdbRating) => {
+          if (resolvedMeta.imdbId) {
+            secondaryTasks.push(getOmdbRating(resolvedMeta.imdbId).then((imdbRating) => {
               if (isCurrentRequest() && imdbRating) {
                 setDetails(prev => prev ? { ...prev, imdbRating } : null);
               }
@@ -1049,7 +1136,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   // Episode selection changes add-on availability for series. Keeping that
   // derived value out of this dependency list prevents the title reset above
   // from clearing the selected episode and immediately selecting it again.
-  }, [meta.id, meta.type, tmdbId, watchRegion]);
+  }, [isAddonMetadata, meta.addonInstallationId, meta.id, meta.type, tmdbId, watchRegion]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1175,6 +1262,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   }, [details?.name, meta.id, meta.type, secondaryMetadataReady, tmdbId]);
 
   useEffect(() => {
+    if (isAddonMetadata) return;
     if (!activeSeason || episodesBySeason[activeSeason.season_number]) {
       return;
     }
@@ -1209,7 +1297,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     return () => {
       cancelled = true;
     };
-  }, [activeSeason, episodesBySeason, resumeTarget, tmdbId]);
+  }, [activeSeason, episodesBySeason, isAddonMetadata, resumeTarget, tmdbId]);
 
   const openTrailerSource = useCallback((source: TrailerSource) => {
     if (source.embedUrl) {
@@ -1315,6 +1403,9 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     try {
       const outcome = await searchEnabledSourceProviders({
         imdbId: details?.imdbId || meta.imdbId,
+        contentId: isAddonMetadata
+          ? isTvShow ? selectedEpisode?.addonContentId : meta.id
+          : undefined,
         isTvShow,
         season: selectedEpisode?.season_number ?? selectedSeason?.season_number,
         episode: selectedEpisode?.episode_number,
@@ -1399,8 +1490,11 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
 
     const directStreamProvider = torrent.directStreamProvider || 'addon';
     const directStreamIdentity = torrent.addonInstallationId || directStreamProvider;
+    const addonContentId = isAddonMetadata
+      ? isTvShow ? selectedEpisode?.addonContentId : meta.id
+      : undefined;
     const sourceReference = sourceType === 'addon'
-      ? `${directStreamIdentity}:${details?.imdbId || meta.imdbId || ''}:${preferredSeason ?? 0}:${preferredEpisode ?? 0}`
+      ? `${directStreamIdentity}:${addonContentId || details?.imdbId || meta.imdbId || ''}:${preferredSeason ?? 0}:${preferredEpisode ?? 0}`
       : sourceUrl;
     rememberLastSource(sourceReference, {
       sourceType,
@@ -1412,6 +1506,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       ...(sourceType === 'addon' || torrent.addonInstallationId || torrent.addonId
         ? {
             addonImdbId: details?.imdbId || meta.imdbId,
+            addonContentId,
             addonInstallationId: torrent.addonInstallationId,
             addonId: torrent.addonId,
             ...(torrent.addonInstallationId ? {} : { directStreamProvider }),
@@ -1610,7 +1705,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     }
 
     // Legacy migration: check old per-item key
-    const legacyKey = `streamee-last-magnet-${meta.type}-${tmdbId}`;
+    const legacyKey = `streamee-last-magnet-${meta.type}-${isAddonMetadata ? meta.id : tmdbId}`;
     const legacy = localStorage.getItem(legacyKey);
     if (legacy) {
       lastSources[key] = legacy;
@@ -1730,7 +1825,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
         useStore.getState().setContinueWatching(updated);
         if (isMarkedWatched) {
           removeFromWatched(meta.id);
-          if (traktConnected) {
+          if (traktConnected && !isAddonMetadata) {
             void pushUnwatchedToTrakt(meta);
           }
         }
@@ -1741,6 +1836,13 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
           const imdbId = lastSourceMeta.addonImdbId || details?.imdbId || meta.imdbId || '';
           const outcome = await searchEnabledSourceProviders({
             imdbId,
+            contentId: isAddonMetadata
+              ? lastSourceMeta.addonContentId || (isTvShow
+                ? episodesBySeason[playbackTarget?.season || 0]?.find(
+                    (episode) => episode.episode_number === playbackTarget?.episode
+                  )?.addonContentId
+                : meta.id)
+              : undefined,
             isTvShow,
             season: playbackTarget?.season,
             episode: playbackTarget?.episode,
@@ -1766,6 +1868,14 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
             quality: lastSourceMeta.addonQuality,
           });
           if (!resolvedTorrent) {
+            console.warn('[Continue] No playable add-on source resolved', {
+              titleId: meta.id,
+              season: playbackTarget?.season,
+              episode: playbackTarget?.episode,
+              attemptedAddons: outcome.attemptedAddons,
+              failedAddonCount: outcome.failedAddons.length,
+              resultCount: results.length,
+            });
             throw new Error('No enabled source provider returned a playable stream for this title.');
           }
           const resumedSourceType = resolvedTorrent.streamHandle
@@ -1785,6 +1895,12 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
             resumedSourceType,
           );
         } catch (error) {
+          console.error('[Continue] Add-on source resolution failed', {
+            titleId: meta.id,
+            season: playbackTarget?.season,
+            episode: playbackTarget?.episode,
+            error: error instanceof Error ? error.message : String(error),
+          });
           finishContinueLoading();
           setShowTorrents(true);
           setTorrentsError(error instanceof Error ? error.message : String(error));
@@ -1871,7 +1987,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   const handleToggleWatchlist = () => {
     if (isInWatchlist) {
       removeFromWatchlist(meta.id);
-      if (traktConnected) {
+      if (traktConnected && !isAddonMetadata) {
         pushWatchlistToTrakt(meta, 'remove').catch(console.error);
       }
     } else {
@@ -1884,9 +2000,11 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
         year: details?.year || meta.year,
         imdbId: details?.imdbId || meta.imdbId,
         rating: details?.tmdbRating ?? meta.rating,
+        metadataSource: meta.metadataSource,
+        addonInstallationId: meta.addonInstallationId,
       };
       addToWatchlist(watchlistMeta);
-      if (traktConnected) {
+      if (traktConnected && !isAddonMetadata) {
         pushWatchlistToTrakt(watchlistMeta, 'add').catch(console.error);
       }
     }
@@ -1902,19 +2020,21 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       year: details?.year || meta.year,
       imdbId: details?.imdbId || meta.imdbId,
       rating: details?.tmdbRating ?? meta.rating,
+      metadataSource: meta.metadataSource,
+      addonInstallationId: meta.addonInstallationId,
       watchedAt: new Date().toISOString()
     };
 
     if (isMarkedWatched) {
       removeFromWatched(meta.id);
-      if (traktConnected) {
+      if (traktConnected && !isAddonMetadata) {
         await pushUnwatchedToTrakt(meta);
       }
       return;
     }
 
     useStore.getState().addToWatched(watchedMeta);
-    if (traktConnected) {
+    if (traktConnected && !isAddonMetadata) {
       await pushWatchedToTrakt(watchedMeta);
     }
   };
