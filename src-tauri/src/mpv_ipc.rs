@@ -544,6 +544,8 @@ pub async fn show_segment_feedback_prompt(
     request_id: i64,
     kind: String,
     source: String,
+    automatic: bool,
+    countdown_seconds: u64,
 ) -> Result<(), String> {
     if request_id <= 0 {
         return Err("Segment feedback request ID must be positive".to_string());
@@ -554,6 +556,9 @@ pub async fn show_segment_feedback_prompt(
     let source = source.trim();
     if source.is_empty() || source.len() > 80 {
         return Err("Segment feedback source is invalid".to_string());
+    }
+    if !(2..=10).contains(&countdown_seconds) {
+        return Err("Segment feedback countdown must be between 2 and 10 seconds".to_string());
     }
 
     #[cfg(target_os = "windows")]
@@ -568,6 +573,8 @@ pub async fn show_segment_feedback_prompt(
                 serde_json::json!(request_id.to_string()),
                 serde_json::json!(kind),
                 serde_json::json!(source),
+                serde_json::json!(if automatic { "automatic" } else { "manual" }),
+                serde_json::json!(countdown_seconds.to_string()),
             ],
             request_id: None,
         };
@@ -579,7 +586,7 @@ pub async fn show_segment_feedback_prompt(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (request_id, kind, source);
+        let _ = (request_id, kind, source, automatic, countdown_seconds);
         Err("Not implemented for this platform".to_string())
     }
 }
@@ -2749,7 +2756,10 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                         )
                         .and_then(|value| value.as_str().map(str::to_owned));
                         if let Some(response) = response.filter(|value| {
-                            matches!(value.as_str(), "yes" | "no" | "not-sure" | "dismissed")
+                            matches!(
+                                value.as_str(),
+                                "yes" | "no" | "not-sure" | "dismissed" | "automatic"
+                            )
                         }) {
                             last_segment_feedback_response_request = segment_feedback_request;
                             let clear_request = MpvCommand {

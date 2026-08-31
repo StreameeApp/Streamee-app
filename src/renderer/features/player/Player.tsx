@@ -41,8 +41,12 @@ import {
   buildSegmentFeedbackKey,
   evaluateSegmentFeedbackShadowMatch,
   hasStoredSegmentFeedback,
+  isSegmentFeedbackPatternSuspended,
+  readSegmentFeedbackPatternStates,
   readStoredSegmentFeedback,
+  resumeSegmentFeedbackPattern,
   storeSegmentFeedback,
+  suspendSegmentFeedbackPattern,
   type SegmentFeedbackContext,
 } from '../../services/segment-feedback';
 import type { IntroDbSegment, IntroDbSegments, IntroSkipperDetectionResult, PlayerChapterSegments, PlayerDetectedSegment, PlayerPlaylistChangedPayload, PlayerSegmentFeedbackPayload, PreparedQbittorrentStreamResult, SegmentFeedbackCandidate, StreamLaunchResult, StreamPlaylistItem, SubtitleProgressEvent, SubtitleSegment, TorrentStartupState } from '../../services/tauri';
@@ -848,6 +852,14 @@ const Player: React.FC = () => {
   ) => Promise<void>)>(null);
   const resolvedLocalIntroSegmentsRef = useRef<Map<string, IntroDbSegment>>(new Map());
   const resolvedLocalOutroSegmentsRef = useRef<Map<string, IntroDbSegment>>(new Map());
+  const recentAutomaticIntroRef = useRef<{
+    requestId: number;
+    key: string;
+    candidate: SegmentFeedbackCandidate;
+    context: SegmentFeedbackContext;
+    filename: string;
+    completedAt: number;
+  } | null>(null);
   const localSegmentAudioGenerationRef = useRef(0);
   const smartNextPendingPersistenceRef = useRef<{
     sourceUrl: string;
@@ -1683,6 +1695,8 @@ const Player: React.FC = () => {
       candidate: SegmentFeedbackCandidate;
       context: SegmentFeedbackContext;
       filename: string;
+      automatic: boolean;
+      scheduledAt: number;
     } | null = null;
     let lastPublishedDetectedSegmentsSignature = '';
     type SegmentBoundaryTimerState = {
@@ -2730,6 +2744,12 @@ const Player: React.FC = () => {
         const feedbackKey = buildSegmentFeedbackKey(context, candidate);
         const priorFeedback = readStoredSegmentFeedback();
         const shadowMatch = evaluateSegmentFeedbackShadowMatch(priorFeedback, context, candidate);
+        const patternSuspended = isSegmentFeedbackPatternSuspended(
+          readSegmentFeedbackPatternStates(),
+          context,
+          candidate,
+        );
+        const automatic = shadowMatch.status === 'shadow-promoted' && !patternSuspended;
         if (
           shadowMatch.status === 'shadow-promoted'
           && !segmentFeedbackShadowLoggedKeys.has(feedbackKey)
@@ -2748,7 +2768,7 @@ const Player: React.FC = () => {
             tolerance_seconds: shadowMatch.toleranceSeconds,
             supporting_episode_count: shadowMatch.episodeCount,
             promotion_status: shadowMatch.status,
-            action: 'none-shadow-only',
+            action: automatic ? 'automatic-countdown' : 'manual-prompt-pattern-suspended',
           }, 'segment_feedback');
         }
         if (
@@ -2766,6 +2786,8 @@ const Player: React.FC = () => {
           candidate,
           context,
           filename,
+          automatic,
+          scheduledAt: Date.now(),
         };
         segmentFeedbackPromptedKeys.add(slotKey);
         try {
@@ -2773,6 +2795,8 @@ const Player: React.FC = () => {
             requestId,
             candidate.kind,
             segmentFeedbackSourceLabel(candidate),
+            automatic,
+            4,
           );
           logger.info('segment_feedback.prompt_shown', '[Segment Feedback] Prompt shown', {
             request_id: requestId,
@@ -2787,7 +2811,22 @@ const Player: React.FC = () => {
             reason: candidate.reason,
             score: candidate.score,
             promotion_status: shadowMatch.status,
+            prompt_mode: automatic ? 'automatic' : 'manual',
           }, 'segment_feedback');
+          if (automatic) {
+            logger.info('segment_feedback.auto_action_scheduled', '[Segment Feedback] Automatic action scheduled', {
+              request_id: requestId,
+              candidate_id: feedbackKey,
+              series_key: context.seriesKey,
+              season: context.season,
+              episode: context.episode,
+              kind: candidate.kind,
+              provider: candidate.source,
+              countdown_seconds: 4,
+              supporting_episode_count: shadowMatch.episodeCount,
+              status: 'scheduled',
+            }, 'segment_feedback');
+          }
         } catch (error) {
           if (activeSegmentFeedbackPrompt?.requestId === requestId) {
             activeSegmentFeedbackPrompt = null;
@@ -2819,20 +2858,67 @@ const Player: React.FC = () => {
             : payload.response === 'no'
               ? 'rejected'
               : payload.response,
+          prompt_mode: active.automatic ? 'automatic' : 'manual',
         }, 'segment_feedback');
-        if (payload.response === 'dismissed') return;
+        if (payload.response === 'dismissed') {
+          if (active.automatic) {
+            logger.info('segment_feedback.auto_action_cancelled', '[Segment Feedback] Automatic action dismissed', {
+              request_id: payload.request_id,
+              candidate_id: active.key,
+              kind: candidate.kind,
+              provider: candidate.source,
+              reason: 'prompt-dismissed',
+              duration_ms: Date.now() - active.scheduledAt,
+              status: 'cancelled',
+            }, 'segment_feedback');
+          }
+          return;
+        }
+        if (payload.response === 'not-sure') {
+          storeSegmentFeedback(active.key, 'not-sure', candidate, active.context);
+          showSmartNextMessage('No problem — playback will continue.', 3000);
+          return;
+        }
+
+        if (active.automatic && payload.response === 'no') {
+          storeSegmentFeedback(active.key, 'no', candidate, active.context);
+          suspendSegmentFeedbackPattern(active.context, candidate, 'automatic-cancelled');
+          logger.info('segment_feedback.auto_action_cancelled', '[Segment Feedback] Automatic action cancelled', {
+            request_id: payload.request_id,
+            candidate_id: active.key,
+            series_key: active.context.seriesKey,
+            season: active.context.season,
+            episode: active.context.episode,
+            kind: candidate.kind,
+            provider: candidate.source,
+            reason: 'user-cancelled',
+            duration_ms: Date.now() - active.scheduledAt,
+            status: 'cancelled',
+          }, 'segment_feedback');
+          logger.info('segment_feedback.pattern_suspended', '[Segment Feedback] Learned pattern suspended', {
+            request_id: payload.request_id,
+            candidate_id: active.key,
+            series_key: active.context.seriesKey,
+            season: active.context.season,
+            episode: active.context.episode,
+            kind: candidate.kind,
+            provider: candidate.source,
+            reason: 'automatic-cancelled',
+            status: 'suspended',
+          }, 'segment_feedback');
+          showSmartNextMessage('Automatic skipping paused for this pattern.', 3500);
+          return;
+        }
+
         const priorFeedback = readStoredSegmentFeedback();
         const previousShadowMatch = evaluateSegmentFeedbackShadowMatch(
           priorFeedback,
           active.context,
           candidate,
         );
-        const nextFeedback = storeSegmentFeedback(
-          active.key,
-          payload.response,
-          candidate,
-          active.context,
-        );
+        const nextFeedback = payload.response === 'yes'
+          ? storeSegmentFeedback(active.key, 'yes', candidate, active.context)
+          : priorFeedback;
         const nextShadowMatch = evaluateSegmentFeedbackShadowMatch(
           nextFeedback,
           active.context,
@@ -2855,37 +2941,120 @@ const Player: React.FC = () => {
             tolerance_seconds: nextShadowMatch.toleranceSeconds,
             supporting_episode_count: nextShadowMatch.episodeCount,
             promotion_status: nextShadowMatch.status,
-            action: 'none-shadow-only',
+            action: 'automatic-countdown-next-match',
+          }, 'segment_feedback');
+        }
+
+        if (payload.response === 'yes' && resumeSegmentFeedbackPattern(active.context, candidate)) {
+          logger.info('segment_feedback.pattern_reactivated', '[Segment Feedback] Learned pattern reactivated', {
+            request_id: payload.request_id,
+            candidate_id: active.key,
+            series_key: active.context.seriesKey,
+            season: active.context.season,
+            episode: active.context.episode,
+            kind: candidate.kind,
+            provider: candidate.source,
+            status: 'active',
           }, 'segment_feedback');
         }
 
         if (payload.response === 'no') {
+          storeSegmentFeedback(active.key, 'no', candidate, active.context);
           showSmartNextMessage(`Thanks — this ${candidate.kind} candidate will be ignored.`, 3500);
-          return;
-        }
-        if (payload.response === 'not-sure') {
-          showSmartNextMessage('No problem — playback will continue.', 3000);
           return;
         }
 
         const stillCurrent = normalizeSourceIdentity(payload.filename)
           === normalizeSourceIdentity(active.filename);
-        if (!stillCurrent) return;
+        if (!stillCurrent) {
+          if (active.automatic) {
+            logger.info('segment_feedback.auto_action_cancelled', '[Segment Feedback] Automatic action became stale', {
+              request_id: payload.request_id,
+              candidate_id: active.key,
+              kind: candidate.kind,
+              provider: candidate.source,
+              reason: 'playback-changed',
+              duration_ms: Date.now() - active.scheduledAt,
+              status: 'cancelled',
+            }, 'segment_feedback');
+          }
+          return;
+        }
         if (candidate.kind === 'intro') {
           try {
             await window.electronAPI.player.seekTime(candidate.end_sec, active.filename);
-            showSmartNextMessage('Thanks — intro confirmed and skipped.', 3000);
+            if (active.automatic) {
+              recentAutomaticIntroRef.current = {
+                requestId: payload.request_id,
+                key: active.key,
+                candidate,
+                context: active.context,
+                filename: active.filename,
+                completedAt: Date.now(),
+              };
+            }
+            if (active.automatic) {
+              logger.info('segment_feedback.auto_action_completed', '[Segment Feedback] Automatic intro skip completed', {
+                request_id: payload.request_id,
+                candidate_id: active.key,
+                series_key: active.context.seriesKey,
+                season: active.context.season,
+                episode: active.context.episode,
+                kind: candidate.kind,
+                provider: candidate.source,
+                duration_ms: Date.now() - active.scheduledAt,
+                status: 'completed',
+              }, 'segment_feedback');
+              showSmartNextMessage('Learned intro skipped · seek back to undo.', 3500);
+            } else {
+              showSmartNextMessage('Thanks — intro confirmed and skipped.', 3000);
+            }
           } catch (error) {
+            recentAutomaticIntroRef.current = null;
+            if (active.automatic) {
+              logger.warn('segment_feedback.auto_action_cancelled', '[Segment Feedback] Automatic intro skip failed', {
+                request_id: payload.request_id,
+                candidate_id: active.key,
+                kind: candidate.kind,
+                provider: candidate.source,
+                reason: 'seek-failed',
+                duration_ms: Date.now() - active.scheduledAt,
+                error_kind: 'player_seek_failed',
+                status: 'failed',
+              }, 'segment_feedback');
+            }
             console.warn('[Segment Feedback] Confirmed intro seek failed', error);
           }
           return;
         }
 
         const advanced = await handleSmartNextRequest(active.filename);
+        if (active.automatic) {
+          const event = advanced
+            ? 'segment_feedback.auto_action_completed'
+            : 'segment_feedback.auto_action_cancelled';
+          const log = advanced ? logger.info : logger.warn;
+          log(event, advanced
+            ? '[Segment Feedback] Automatic outro action completed'
+            : '[Segment Feedback] Automatic outro action could not advance', {
+            request_id: payload.request_id,
+            candidate_id: active.key,
+            series_key: active.context.seriesKey,
+            season: active.context.season,
+            episode: active.context.episode,
+            kind: candidate.kind,
+            provider: candidate.source,
+            reason: advanced ? 'advanced' : 'next-not-ready',
+            duration_ms: Date.now() - active.scheduledAt,
+            status: advanced ? 'completed' : 'unavailable',
+          }, 'segment_feedback');
+        }
         showSmartNextMessage(
           advanced
-            ? 'Thanks — outro confirmed.'
-            : 'Thanks — outro confirmed; the next episode is not ready yet.',
+            ? active.automatic ? 'Learned outro advanced.' : 'Thanks — outro confirmed.'
+            : active.automatic
+              ? 'The next episode is not ready yet.'
+              : 'Thanks — outro confirmed; the next episode is not ready yet.',
           4000,
         );
       };
@@ -4676,6 +4845,46 @@ const Player: React.FC = () => {
 
           cancelSegmentBoundaryTimer('seek-event');
           segmentFeedbackSeekSuppressedUntil = Date.now() + 10_000;
+          const recentAutomaticIntro = recentAutomaticIntroRef.current;
+          if (
+            recentAutomaticIntro
+            && Date.now() - recentAutomaticIntro.completedAt <= 15_000
+            && normalizeSourceIdentity(data.filename) === normalizeSourceIdentity(recentAutomaticIntro.filename)
+            && data.playback_time < recentAutomaticIntro.candidate.end_sec - 1
+          ) {
+            recentAutomaticIntroRef.current = null;
+            suspendSegmentFeedbackPattern(
+              recentAutomaticIntro.context,
+              recentAutomaticIntro.candidate,
+              'intro-undone',
+            );
+            logger.info('segment_feedback.pattern_suspended', '[Segment Feedback] Learned pattern suspended after intro undo', {
+              request_id: recentAutomaticIntro.requestId,
+              candidate_id: recentAutomaticIntro.key,
+              series_key: recentAutomaticIntro.context.seriesKey,
+              season: recentAutomaticIntro.context.season,
+              episode: recentAutomaticIntro.context.episode,
+              kind: recentAutomaticIntro.candidate.kind,
+              provider: recentAutomaticIntro.candidate.source,
+              reason: 'intro-undone',
+              status: 'suspended',
+            }, 'segment_feedback');
+            logger.info('segment_feedback.auto_action_cancelled', '[Segment Feedback] Automatic intro skip undone', {
+              request_id: recentAutomaticIntro.requestId,
+              candidate_id: recentAutomaticIntro.key,
+              kind: recentAutomaticIntro.candidate.kind,
+              provider: recentAutomaticIntro.candidate.source,
+              reason: 'seek-back-undo',
+              duration_ms: Date.now() - recentAutomaticIntro.completedAt,
+              status: 'undone',
+            }, 'segment_feedback');
+            showSmartNextMessage('Automatic intro skipping paused for this pattern.', 3500);
+          } else if (
+            recentAutomaticIntro
+            && Date.now() - recentAutomaticIntro.completedAt > 15_000
+          ) {
+            recentAutomaticIntroRef.current = null;
+          }
           if (data.playback_time != null) {
             lastKnownPlaybackTimeRef.current = data.playback_time;
           }

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  buildSegmentFeedbackPatternKey,
   buildSegmentFeedbackKey,
   evaluateSegmentFeedbackShadowMatch,
+  isSegmentFeedbackPatternSuspended,
   type SegmentFeedbackContext,
   type StoredSegmentFeedback,
 } from '../src/renderer/services/segment-feedback.ts';
@@ -147,4 +149,32 @@ test('legacy Phase 1 records can contribute without being rewritten', () => {
   );
   assert.equal(result.status, 'shadow-promoted');
   assert.deepEqual(result.episodeKeys, ['tt-shadow-test:1:1', 'tt-shadow-test:1:2']);
+});
+
+test('automatic-action suspension is scoped to season, segment kind, and detector source', () => {
+  const candidate = introCandidate(41);
+  const feedbackContext = context(3);
+  const state = {
+    key: buildSegmentFeedbackPatternKey(feedbackContext, candidate),
+    status: 'suspended' as const,
+    reason: 'automatic-cancelled' as const,
+    recordedAt: '2026-08-31T00:00:00.000Z',
+  };
+
+  assert.equal(
+    isSegmentFeedbackPatternSuspended([state], feedbackContext, candidate),
+    true,
+  );
+  assert.equal(
+    isSegmentFeedbackPatternSuspended([state], context(3, 1_800, 2), candidate),
+    false,
+  );
+  assert.equal(
+    isSegmentFeedbackPatternSuspended(
+      [state],
+      feedbackContext,
+      { ...candidate, source: 'chapter' },
+    ),
+    false,
+  );
 });

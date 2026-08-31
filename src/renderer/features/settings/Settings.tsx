@@ -19,6 +19,10 @@ import {
   type IntroDbSkipMode,
 } from '../../services/introdb';
 import {
+  SEGMENT_FEEDBACK_PATTERN_STORAGE_KEY,
+  SEGMENT_FEEDBACK_STORAGE_KEY,
+} from '../../services/segment-feedback';
+import {
   clearXrelReleaseCache,
   getXrelQualitySnapshot,
   refreshSrrdbReleaseQualities,
@@ -2763,7 +2767,7 @@ const Settings: React.FC = () => {
                 When community data is missing, use named chapters first. Otherwise fingerprint only verified local-cache bytes as playback fills the intro and outro analysis windows. Future queued episodes are never opened.
               </span>
               <span className="settings-hint">
-                Plausible near-misses can ask for confirmation in the player. Answers stay on this device and do not change automatic skipping yet.
+                Plausible near-misses can ask for confirmation in the player. Two matching Yes answers enable a cancellable learned action on later episodes; cancelling or undoing pauses that pattern.
               </span>
             </div>
             <button
@@ -2803,14 +2807,15 @@ const Settings: React.FC = () => {
               className="settings-btn"
               onClick={() => {
                 if (!window.confirm('Clear locally saved Intro and Outro confirmation answers?')) return;
-                window.localStorage.removeItem('streamee:segment-feedback:v1');
+                window.localStorage.removeItem(SEGMENT_FEEDBACK_STORAGE_KEY);
+                window.localStorage.removeItem(SEGMENT_FEEDBACK_PATTERN_STORAGE_KEY);
               }}
               type="button"
             >
               Clear Confirmation History
             </button>
             <span className="settings-hint">
-              Clears only Yes, No, and Not sure answers saved by the player prompts.
+              Clears Yes, No, and Not sure answers together with learned-pattern suspension state.
             </span>
           </div>
 

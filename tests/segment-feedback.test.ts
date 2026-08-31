@@ -8,6 +8,7 @@ const player = readFileSync('src/renderer/features/player/Player.tsx', 'utf8');
 const feedback = readFileSync('src/renderer/services/segment-feedback.ts', 'utf8');
 const tauri = readFileSync('src/renderer/services/tauri.ts', 'utf8');
 const osc = readFileSync('mpv/scripts/PlexOSC.lua', 'utf8');
+const settings = readFileSync('src/renderer/features/settings/Settings.tsx', 'utf8');
 
 test('soft segment rejections remain separate from accepted segments', () => {
   assert.match(detector, /pub struct SegmentFeedbackCandidate/);
@@ -25,7 +26,10 @@ test('segment feedback prompt is interactive and uses a durable MPV response pro
   assert.match(osc, /respond_to_segment_feedback\('yes'\)/);
   assert.match(osc, /respond_to_segment_feedback\('no'\)/);
   assert.match(osc, /respond_to_segment_feedback\('not-sure'\)/);
+  assert.match(osc, /automatic and 'automatic' or 'dismissed'/);
+  assert.match(osc, /\[ Keep watching \]/);
   assert.match(osc, /streamee-segment-feedback-response-request/);
+  assert.match(mpvIpc, /"dismissed" \| "automatic"/);
   assert.match(mpvIpc, /player:\/\/segment-feedback/);
   assert.match(tauri, /onSegmentFeedback/);
 });
@@ -33,21 +37,32 @@ test('segment feedback prompt is interactive and uses a durable MPV response pro
 test('feedback prompting is bounded and does not treat timeouts as negative feedback', () => {
   assert.match(player, /segmentFeedbackPromptedKeys\.has\(slotKey\)/);
   assert.match(player, /segmentFeedbackSeekSuppressedUntil = Date\.now\(\) \+ 10_000/);
-  assert.match(player, /if \(payload\.response === 'dismissed'\) return;/);
+  assert.match(player, /if \(payload\.response === 'dismissed'\)/);
   assert.match(feedback, /SEGMENT_FEEDBACK_STORAGE_LIMIT = 400/);
   assert.match(player, /candidate\.kind === 'intro'[\s\S]*seekTime\(candidate\.end_sec/);
   assert.match(player, /const advanced = await handleSmartNextRequest\(active\.filename\)/);
 });
 
-test('shadow learning stays non-acting and emits correlation-friendly diagnostics', () => {
+test('promoted patterns use cancellable automation with correlation-friendly diagnostics', () => {
   assert.match(player, /segment_feedback\.prompt_shown/);
   assert.match(player, /segment_feedback\.response_received/);
   assert.match(player, /segment_feedback\.shadow_promoted/);
   assert.match(player, /segment_feedback\.shadow_would_act/);
-  assert.match(player, /action: 'none-shadow-only'/);
+  assert.match(player, /action: automatic \? 'automatic-countdown'/);
+  assert.match(player, /segment_feedback\.auto_action_scheduled/);
+  assert.match(player, /segment_feedback\.auto_action_completed/);
+  assert.match(player, /segment_feedback\.auto_action_cancelled/);
+  assert.match(player, /segment_feedback\.pattern_suspended/);
   assert.match(player, /request_id: payload\.request_id/);
   assert.match(player, /candidate_id: active\.key/);
-  assert.doesNotMatch(player, /shadow_would_act[\s\S]{0,1200}(seekTime|handleSmartNextRequest)/);
+  assert.match(player, /suspendSegmentFeedbackPattern\(active\.context, candidate, 'automatic-cancelled'\)/);
+  assert.match(player, /Date\.now\(\) - recentAutomaticIntro\.completedAt <= 15_000/);
+  assert.match(player, /reason: 'seek-back-undo'/);
+});
+
+test('clearing confirmation history also clears learned pattern state', () => {
+  assert.match(settings, /removeItem\(SEGMENT_FEEDBACK_STORAGE_KEY\)/);
+  assert.match(settings, /removeItem\(SEGMENT_FEEDBACK_PATTERN_STORAGE_KEY\)/);
 });
 
 test('chapter fallback decision is logged only when a real scan starts', () => {

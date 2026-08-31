@@ -366,7 +366,7 @@ export interface SegmentFeedbackCandidate {
 
 export interface PlayerSegmentFeedbackPayload {
   request_id: number;
-  response: 'yes' | 'no' | 'not-sure' | 'dismissed';
+  response: 'yes' | 'no' | 'not-sure' | 'dismissed' | 'automatic';
   filename: string;
   playlist_pos?: number;
 }
@@ -765,8 +765,16 @@ const tauriAPI = {
       requestId: number,
       kind: 'intro' | 'outro',
       source: string,
+      automatic = false,
+      countdownSeconds = 4,
     ) => {
-      await invoke('show_segment_feedback_prompt', { requestId, kind, source });
+      await invoke('show_segment_feedback_prompt', {
+        requestId,
+        kind,
+        source,
+        automatic,
+        countdownSeconds,
+      });
     },
     loadSubtitle: async (path: string) => {
       try {

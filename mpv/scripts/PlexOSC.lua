@@ -731,10 +731,12 @@ local function respond_to_segment_feedback(response)
     request_init()
 end
 
-local function show_segment_feedback_prompt(request_id, kind, source)
+local function show_segment_feedback_prompt(request_id, kind, source, mode, countdown_seconds)
     local numeric_request_id = tonumber(request_id)
     if not numeric_request_id or numeric_request_id <= 0 then return end
     if kind ~= 'intro' and kind ~= 'outro' then return end
+    local automatic = mode == 'automatic'
+    local countdown = math.max(2, math.min(10, tonumber(countdown_seconds) or 4))
 
     if state.segment_feedback_prompt then
         respond_to_segment_feedback('dismissed')
@@ -743,6 +745,9 @@ local function show_segment_feedback_prompt(request_id, kind, source)
         request_id = numeric_request_id,
         kind = kind,
         source = source or 'local detection',
+        automatic = automatic,
+        countdown_seconds = countdown,
+        shown_at = mp.get_time(),
     }
 
     remove_segment_feedback_bindings()
@@ -751,16 +756,20 @@ local function show_segment_feedback_prompt(request_id, kind, source)
     mp.add_forced_key_binding('n', segment_feedback_no_binding,
         function() respond_to_segment_feedback('no') end)
     mp.add_forced_key_binding('ESC', segment_feedback_dismiss_binding,
-        function() respond_to_segment_feedback('not-sure') end)
+        function()
+            respond_to_segment_feedback(automatic and 'no' or 'not-sure')
+        end)
 
     if not state.segment_feedback_timer then
         state.segment_feedback_timer = mp.add_timeout(
-            12,
-            function() respond_to_segment_feedback('dismissed') end
+            automatic and countdown or 12,
+            function()
+                respond_to_segment_feedback(automatic and 'automatic' or 'dismissed')
+            end
         )
     end
     state.segment_feedback_timer:kill()
-    state.segment_feedback_timer.timeout = 12
+    state.segment_feedback_timer.timeout = automatic and countdown or 12
     state.segment_feedback_timer:resume()
     show_osc()
     request_init()
@@ -1950,9 +1959,10 @@ layouts = function ()
         local prompt_height = 104
         local prompt_x = refX - prompt_width / 2
         local prompt_y = math.max(30, refY - 255)
-        local button_width = math.min(128, (prompt_width - 56) / 3)
+        local button_count = elements['segment_feedback_unsure'] and 3 or 2
+        local button_width = math.min(160, (prompt_width - 56) / button_count)
         local button_gap = 8
-        local buttons_width = button_width * 3 + button_gap * 2
+        local buttons_width = button_width * button_count + button_gap * (button_count - 1)
         local button_x = refX - buttons_width / 2 + button_width / 2
 
         lo = add_layout('segment_feedback_bg')
@@ -1978,10 +1988,12 @@ layouts = function ()
         lo.style = osc_styles.SegmentFeedbackAction
         lo.layer = 92
 
-        lo = add_layout('segment_feedback_unsure')
-        lo.geometry = {x = button_x + (button_width + button_gap) * 2, y = prompt_y + 76, an = 5, w = button_width, h = 32}
-        lo.style = osc_styles.SegmentFeedbackMuted
-        lo.layer = 92
+        if elements['segment_feedback_unsure'] then
+            lo = add_layout('segment_feedback_unsure')
+            lo.geometry = {x = button_x + (button_width + button_gap) * 2, y = prompt_y + 76, an = 5, w = button_width, h = 32}
+            lo.style = osc_styles.SegmentFeedbackMuted
+            lo.layer = 92
+        end
     end
 
 	lo = add_layout('tog_fs')
@@ -2694,6 +2706,16 @@ function osc_init()
         ne.content = function ()
             local prompt = state.segment_feedback_prompt
             if not prompt then return '' end
+            if prompt.automatic then
+                local remaining = math.max(
+                    1,
+                    math.ceil(prompt.countdown_seconds - (mp.get_time() - prompt.shown_at))
+                )
+                if prompt.kind == 'intro' then
+                    return 'Learned intro  ·  skipping in ' .. remaining .. 's  ·  ' .. prompt.source
+                end
+                return 'Learned outro  ·  next episode in ' .. remaining .. 's  ·  ' .. prompt.source
+            end
             if prompt.kind == 'intro' then
                 return 'Is this the intro?  ·  ' .. prompt.source
             end
@@ -2704,20 +2726,28 @@ function osc_init()
         ne = new_element('segment_feedback_yes', 'button')
         ne.content = function ()
             local prompt = state.segment_feedback_prompt
+            if prompt and prompt.automatic then
+                return prompt.kind == 'intro' and '[ Skip now ]' or '[ Next now ]'
+            end
             return prompt and prompt.kind == 'intro' and '[ Yes, skip ]' or '[ Yes, next ]'
         end
         ne.eventresponder['mbtn_left_up'] =
             function () respond_to_segment_feedback('yes') end
 
         ne = new_element('segment_feedback_no', 'button')
-        ne.content = '[ No ]'
+        ne.content = function ()
+            local prompt = state.segment_feedback_prompt
+            return prompt and prompt.automatic and '[ Keep watching ]' or '[ No ]'
+        end
         ne.eventresponder['mbtn_left_up'] =
             function () respond_to_segment_feedback('no') end
 
-        ne = new_element('segment_feedback_unsure', 'button')
-        ne.content = '[ Not sure ]'
-        ne.eventresponder['mbtn_left_up'] =
-            function () respond_to_segment_feedback('not-sure') end
+        if not state.segment_feedback_prompt.automatic then
+            ne = new_element('segment_feedback_unsure', 'button')
+            ne.content = '[ Not sure ]'
+            ne.eventresponder['mbtn_left_up'] =
+                function () respond_to_segment_feedback('not-sure') end
+        end
     end
 
     -- load layout

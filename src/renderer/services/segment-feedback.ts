@@ -1,13 +1,16 @@
 import type { SegmentFeedbackCandidate } from './tauri';
 
 export const SEGMENT_FEEDBACK_STORAGE_KEY = 'streamee:segment-feedback:v1';
+export const SEGMENT_FEEDBACK_PATTERN_STORAGE_KEY = 'streamee:segment-feedback-patterns:v1';
 export const SEGMENT_FEEDBACK_STORAGE_LIMIT = 400;
 export const SEGMENT_FEEDBACK_MIN_EPISODES = 2;
+const SEGMENT_FEEDBACK_PATTERN_STORAGE_LIMIT = 100;
 
 const INTRO_POSITION_TOLERANCE_SECONDS = 3;
 const OUTRO_LEAD_TOLERANCE_SECONDS = 4;
 
 export type SegmentFeedbackResponse = 'yes' | 'no' | 'not-sure';
+export type SegmentFeedbackPatternSuspensionReason = 'automatic-cancelled' | 'intro-undone';
 
 export type SegmentFeedbackContext = {
   seriesKey: string;
@@ -35,11 +38,28 @@ export type SegmentFeedbackShadowMatch = {
   toleranceSeconds: number;
 };
 
+export type SegmentFeedbackPatternState = {
+  key: string;
+  status: 'suspended';
+  reason: SegmentFeedbackPatternSuspensionReason;
+  recordedAt: string;
+};
+
 const roundedHalfSecond = (value: number): number => Math.round(value * 2) / 2;
 
 const episodeKey = (context: SegmentFeedbackContext): string => (
   `${context.seriesKey.toLowerCase()}:${context.season}:${context.episode}`
 );
+
+export const buildSegmentFeedbackPatternKey = (
+  context: SegmentFeedbackContext,
+  candidate: SegmentFeedbackCandidate,
+): string => [
+  context.seriesKey.toLowerCase(),
+  context.season,
+  candidate.kind,
+  candidate.source,
+].join(':');
 
 const candidatePosition = (
   context: SegmentFeedbackContext,
@@ -121,6 +141,70 @@ export const readStoredSegmentFeedback = (): StoredSegmentFeedback[] => {
 export const hasStoredSegmentFeedback = (key: string): boolean => (
   readStoredSegmentFeedback().some((entry) => entry?.key === key)
 );
+
+export const readSegmentFeedbackPatternStates = (): SegmentFeedbackPatternState[] => {
+  try {
+    const parsed = JSON.parse(
+      window.localStorage.getItem(SEGMENT_FEEDBACK_PATTERN_STORAGE_KEY) || '[]',
+    );
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+export const isSegmentFeedbackPatternSuspended = (
+  states: SegmentFeedbackPatternState[],
+  context: SegmentFeedbackContext,
+  candidate: SegmentFeedbackCandidate,
+): boolean => states.some((state) => (
+  state?.key === buildSegmentFeedbackPatternKey(context, candidate)
+  && state.status === 'suspended'
+));
+
+export const suspendSegmentFeedbackPattern = (
+  context: SegmentFeedbackContext,
+  candidate: SegmentFeedbackCandidate,
+  reason: SegmentFeedbackPatternSuspensionReason,
+): SegmentFeedbackPatternState => {
+  const key = buildSegmentFeedbackPatternKey(context, candidate);
+  const state: SegmentFeedbackPatternState = {
+    key,
+    status: 'suspended',
+    reason,
+    recordedAt: new Date().toISOString(),
+  };
+  const retained = readSegmentFeedbackPatternStates().filter((entry) => entry?.key !== key);
+  retained.push(state);
+  try {
+    window.localStorage.setItem(
+      SEGMENT_FEEDBACK_PATTERN_STORAGE_KEY,
+      JSON.stringify(retained.slice(-SEGMENT_FEEDBACK_PATTERN_STORAGE_LIMIT)),
+    );
+  } catch {
+    // Pattern automation is optional; storage failures leave the current playback untouched.
+  }
+  return state;
+};
+
+export const resumeSegmentFeedbackPattern = (
+  context: SegmentFeedbackContext,
+  candidate: SegmentFeedbackCandidate,
+): boolean => {
+  const key = buildSegmentFeedbackPatternKey(context, candidate);
+  const current = readSegmentFeedbackPatternStates();
+  const retained = current.filter((entry) => entry?.key !== key);
+  if (retained.length === current.length) return false;
+  try {
+    window.localStorage.setItem(
+      SEGMENT_FEEDBACK_PATTERN_STORAGE_KEY,
+      JSON.stringify(retained),
+    );
+  } catch {
+    return false;
+  }
+  return true;
+};
 
 export const storeSegmentFeedback = (
   key: string,
