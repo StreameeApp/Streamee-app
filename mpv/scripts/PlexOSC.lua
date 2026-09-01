@@ -707,6 +707,7 @@ end
 local segment_feedback_yes_binding = 'streamee-segment-feedback-yes'
 local segment_feedback_no_binding = 'streamee-segment-feedback-no'
 local segment_feedback_dismiss_binding = 'streamee-segment-feedback-dismiss'
+local segment_feedback_test_request_id = math.floor(os.time() * 1000)
 
 local function remove_segment_feedback_bindings()
     mp.remove_key_binding(segment_feedback_yes_binding)
@@ -714,11 +715,15 @@ local function remove_segment_feedback_bindings()
     mp.remove_key_binding(segment_feedback_dismiss_binding)
 end
 
-local function respond_to_segment_feedback(response)
+local function respond_to_segment_feedback(response, hidden_reason)
     local prompt = state.segment_feedback_prompt
     if not prompt then return end
 
     mp.set_property('user-data/streamee-segment-feedback-response', response)
+    mp.set_property(
+        'user-data/streamee-segment-feedback-hidden-reason',
+        hidden_reason or 'unknown'
+    )
     mp.set_property_number(
         'user-data/streamee-segment-feedback-response-request',
         prompt.request_id
@@ -739,7 +744,7 @@ local function show_segment_feedback_prompt(request_id, kind, source, mode, coun
     local countdown = math.max(2, math.min(10, tonumber(countdown_seconds) or 4))
 
     if state.segment_feedback_prompt then
-        respond_to_segment_feedback('dismissed')
+        respond_to_segment_feedback('dismissed', 'replaced')
     end
     state.segment_feedback_prompt = {
         request_id = numeric_request_id,
@@ -748,23 +753,30 @@ local function show_segment_feedback_prompt(request_id, kind, source, mode, coun
         automatic = automatic,
         countdown_seconds = countdown,
         shown_at = mp.get_time(),
+        rendered = false,
     }
 
     remove_segment_feedback_bindings()
     mp.add_forced_key_binding('y', segment_feedback_yes_binding,
-        function() respond_to_segment_feedback('yes') end)
+        function() respond_to_segment_feedback('yes', 'user-response') end)
     mp.add_forced_key_binding('n', segment_feedback_no_binding,
-        function() respond_to_segment_feedback('no') end)
+        function() respond_to_segment_feedback('no', 'user-response') end)
     mp.add_forced_key_binding('ESC', segment_feedback_dismiss_binding,
         function()
-            respond_to_segment_feedback(automatic and 'no' or 'not-sure')
+            respond_to_segment_feedback(
+                automatic and 'no' or 'not-sure',
+                'user-response'
+            )
         end)
 
     if not state.segment_feedback_timer then
         state.segment_feedback_timer = mp.add_timeout(
             automatic and countdown or 12,
             function()
-                respond_to_segment_feedback(automatic and 'automatic' or 'dismissed')
+                respond_to_segment_feedback(
+                    automatic and 'automatic' or 'dismissed',
+                    automatic and 'countdown-completed' or 'timeout'
+                )
             end
         )
     end
@@ -773,6 +785,22 @@ local function show_segment_feedback_prompt(request_id, kind, source, mode, coun
     state.segment_feedback_timer:resume()
     show_osc()
     request_init()
+end
+
+local function show_segment_feedback_test_prompt()
+    if state.segment_feedback_prompt then return end
+    segment_feedback_test_request_id = segment_feedback_test_request_id + 1
+    msg.info(
+        '[Segment Feedback] Keyboard test prompt requested: request_id=' ..
+        segment_feedback_test_request_id
+    )
+    show_segment_feedback_prompt(
+        segment_feedback_test_request_id,
+        'intro',
+        'Keyboard test',
+        'manual',
+        4
+    )
 end
 
 --
@@ -2732,7 +2760,7 @@ function osc_init()
             return prompt and prompt.kind == 'intro' and '[ Yes, skip ]' or '[ Yes, next ]'
         end
         ne.eventresponder['mbtn_left_up'] =
-            function () respond_to_segment_feedback('yes') end
+            function () respond_to_segment_feedback('yes', 'user-response') end
 
         ne = new_element('segment_feedback_no', 'button')
         ne.content = function ()
@@ -2740,13 +2768,13 @@ function osc_init()
             return prompt and prompt.automatic and '[ Keep watching ]' or '[ No ]'
         end
         ne.eventresponder['mbtn_left_up'] =
-            function () respond_to_segment_feedback('no') end
+            function () respond_to_segment_feedback('no', 'user-response') end
 
         if not state.segment_feedback_prompt.automatic then
             ne = new_element('segment_feedback_unsure', 'button')
             ne.content = '[ Not sure ]'
             ne.eventresponder['mbtn_left_up'] =
-                function () respond_to_segment_feedback('not-sure') end
+                function () respond_to_segment_feedback('not-sure', 'user-response') end
         end
     end
 
@@ -2865,7 +2893,7 @@ end
 
 function mouse_leave()
     close_track_menu()
-    if get_hidetimeout() >= 0 then
+    if not state.segment_feedback_prompt and get_hidetimeout() >= 0 then
         hide_osc()
     end
     -- reset mouse position
@@ -3042,7 +3070,8 @@ function render()
     end
 
     -- autohide
-    if not (state.showtime == nil) and (get_hidetimeout() >= 0) then
+    if not state.segment_feedback_prompt and
+       not (state.showtime == nil) and (get_hidetimeout() >= 0) then
         local timeout = state.showtime + (get_hidetimeout()/1000) - now
         if timeout <= 0 then
             if (state.active_element == nil) and not (mouse_over_osc) then
@@ -3076,6 +3105,14 @@ function render()
     -- submit
     set_osd(osc_param.playresy * osc_param.display_aspect,
             osc_param.playresy, ass.text)
+    if state.segment_feedback_prompt and
+       not state.segment_feedback_prompt.rendered then
+        state.segment_feedback_prompt.rendered = true
+        mp.set_property_number(
+            'user-data/streamee-segment-feedback-rendered-request',
+            state.segment_feedback_prompt.request_id
+        )
+    end
 end
 
 --
@@ -3371,6 +3408,11 @@ mp.register_script_message('streamee-subtitle-lines', open_subtitle_lines)
 mp.register_script_message(
     'streamee-segment-feedback-prompt',
     show_segment_feedback_prompt
+)
+mp.add_key_binding(
+    't',
+    'streamee-segment-feedback-test',
+    show_segment_feedback_test_prompt
 )
 mp.register_script_message('osc-chapterlist', function(dur)
     show_message(get_chapterlist(), dur)

@@ -367,6 +367,13 @@ export interface SegmentFeedbackCandidate {
 export interface PlayerSegmentFeedbackPayload {
   request_id: number;
   response: 'yes' | 'no' | 'not-sure' | 'dismissed' | 'automatic';
+  hidden_reason: 'user-response' | 'timeout' | 'countdown-completed' | 'replaced' | 'unknown';
+  filename: string;
+  playlist_pos?: number;
+}
+
+export interface PlayerSegmentFeedbackRenderedPayload {
+  request_id: number;
   filename: string;
   playlist_pos?: number;
 }
@@ -1228,6 +1235,16 @@ const tauriAPI = {
       return await listen<PlayerSegmentFeedbackPayload>('player://segment-feedback', (event) => {
         callback(event.payload);
       });
+    },
+    onSegmentFeedbackRendered: async (
+      callback: (data: PlayerSegmentFeedbackRenderedPayload) => void,
+    ) => {
+      return await listen<PlayerSegmentFeedbackRenderedPayload>(
+        'player://segment-feedback-rendered',
+        (event) => {
+          callback(event.payload);
+        },
+      );
     },
     onAudioTrackChanged: async (callback: (data: { track_id: number | null }) => void) => {
       return await listen<{ track_id: number | null }>('player://audio-track-changed', (event) => {

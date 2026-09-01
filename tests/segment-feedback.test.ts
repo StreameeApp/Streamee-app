@@ -23,15 +23,44 @@ test('soft segment rejections remain separate from accepted segments', () => {
 test('segment feedback prompt is interactive and uses a durable MPV response property', () => {
   assert.match(osc, /Is this the intro\?/);
   assert.match(osc, /Does the outro start here\?/);
-  assert.match(osc, /respond_to_segment_feedback\('yes'\)/);
-  assert.match(osc, /respond_to_segment_feedback\('no'\)/);
-  assert.match(osc, /respond_to_segment_feedback\('not-sure'\)/);
+  assert.match(osc, /respond_to_segment_feedback\('yes', 'user-response'\)/);
+  assert.match(osc, /respond_to_segment_feedback\('no', 'user-response'\)/);
+  assert.match(osc, /respond_to_segment_feedback\('not-sure', 'user-response'\)/);
   assert.match(osc, /automatic and 'automatic' or 'dismissed'/);
   assert.match(osc, /\[ Keep watching \]/);
   assert.match(osc, /streamee-segment-feedback-response-request/);
+  assert.match(osc, /streamee-segment-feedback-rendered-request/);
+  assert.match(osc, /streamee-segment-feedback-hidden-reason/);
   assert.match(mpvIpc, /"dismissed" \| "automatic"/);
   assert.match(mpvIpc, /player:\/\/segment-feedback/);
+  assert.match(mpvIpc, /player:\/\/segment-feedback-rendered/);
   assert.match(tauri, /onSegmentFeedback/);
+  assert.match(tauri, /onSegmentFeedbackRendered/);
+});
+
+test('active feedback prompts remain visible until their own terminal response', () => {
+  assert.match(
+    osc,
+    /function mouse_leave\(\)[\s\S]{0,180}if not state\.segment_feedback_prompt and get_hidetimeout\(\) >= 0/,
+  );
+  assert.match(
+    osc,
+    /-- autohide[\s\S]{0,180}if not state\.segment_feedback_prompt and[\s\S]{0,100}get_hidetimeout\(\) >= 0/,
+  );
+  assert.match(osc, /automatic and 'countdown-completed' or 'timeout'/);
+  assert.match(osc, /respond_to_segment_feedback\('dismissed', 'replaced'\)/);
+});
+
+test('T opens a manual keyboard-test prompt without replacing a real prompt', () => {
+  assert.match(
+    osc,
+    /local function show_segment_feedback_test_prompt\(\)[\s\S]{0,120}if state\.segment_feedback_prompt then return end/,
+  );
+  assert.match(osc, /'intro',[\s\S]{0,80}'Keyboard test',[\s\S]{0,80}'manual'/);
+  assert.match(
+    osc,
+    /mp\.add_key_binding\([\s\S]{0,60}'t',[\s\S]{0,100}'streamee-segment-feedback-test'/,
+  );
 });
 
 test('feedback prompting is bounded and does not treat timeouts as negative feedback', () => {
@@ -44,8 +73,12 @@ test('feedback prompting is bounded and does not treat timeouts as negative feed
 });
 
 test('promoted patterns use cancellable automation with correlation-friendly diagnostics', () => {
-  assert.match(player, /segment_feedback\.prompt_shown/);
+  assert.match(player, /segment_feedback\.prompt_dispatched/);
+  assert.match(player, /segment_feedback\.prompt_dispatch_failed/);
+  assert.match(player, /segment_feedback\.prompt_rendered/);
   assert.match(player, /segment_feedback\.response_received/);
+  assert.match(player, /hidden_reason: payload\.hidden_reason/);
+  assert.match(player, /rendered: active\.renderedAt != null/);
   assert.match(player, /segment_feedback\.shadow_promoted/);
   assert.match(player, /segment_feedback\.shadow_would_act/);
   assert.match(player, /action: automatic \? 'automatic-countdown'/);

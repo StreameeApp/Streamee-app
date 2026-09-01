@@ -2337,6 +2337,7 @@ pub fn start_player_watcher(app_handle: AppHandle) {
             let mut last_hdr_toggle_request = 0i64;
             let mut last_svp_restart_request = 0i64;
             let mut last_smart_next_request = 0i64;
+            let mut last_segment_feedback_rendered_request = 0i64;
             let mut last_segment_feedback_response_request = 0i64;
             let mut pipe_disconnected = false;
             let mut rife_health_filename = String::new();
@@ -2737,6 +2738,42 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                         }
                     }
 
+                    let segment_feedback_rendered_request = get_property_value(
+                        pipe,
+                        "user-data/streamee-segment-feedback-rendered-request",
+                    )
+                    .and_then(|value| {
+                        value
+                            .as_i64()
+                            .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+                    })
+                    .unwrap_or(0);
+                    if segment_feedback_rendered_request > 0
+                        && segment_feedback_rendered_request
+                            != last_segment_feedback_rendered_request
+                    {
+                        last_segment_feedback_rendered_request = segment_feedback_rendered_request;
+                        let clear_rendered_request = MpvCommand {
+                            command: vec![
+                                serde_json::json!("set_property"),
+                                serde_json::json!(
+                                    "user-data/streamee-segment-feedback-rendered-request"
+                                ),
+                                serde_json::json!(0),
+                            ],
+                            request_id: None,
+                        };
+                        let _ = send_command(pipe, &clear_rendered_request);
+                        let _ = app_handle.emit(
+                            "player://segment-feedback-rendered",
+                            serde_json::json!({
+                                "request_id": segment_feedback_rendered_request,
+                                "filename": current_state.filename,
+                                "playlist_pos": current_state.playlist_pos,
+                            }),
+                        );
+                    }
+
                     let segment_feedback_request = get_property_value(
                         pipe,
                         "user-data/streamee-segment-feedback-response-request",
@@ -2761,6 +2798,22 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                 "yes" | "no" | "not-sure" | "dismissed" | "automatic"
                             )
                         }) {
+                            let hidden_reason = get_property_value(
+                                pipe,
+                                "user-data/streamee-segment-feedback-hidden-reason",
+                            )
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                            .filter(|value| {
+                                matches!(
+                                    value.as_str(),
+                                    "user-response"
+                                        | "timeout"
+                                        | "countdown-completed"
+                                        | "replaced"
+                                        | "unknown"
+                                )
+                            })
+                            .unwrap_or_else(|| "unknown".to_string());
                             last_segment_feedback_response_request = segment_feedback_request;
                             let clear_request = MpvCommand {
                                 command: vec![
@@ -2778,6 +2831,7 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                 serde_json::json!({
                                     "request_id": segment_feedback_request,
                                     "response": response,
+                                    "hidden_reason": hidden_reason,
                                     "filename": current_state.filename,
                                     "playlist_pos": current_state.playlist_pos,
                                 }),

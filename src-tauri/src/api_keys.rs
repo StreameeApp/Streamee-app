@@ -1,9 +1,8 @@
 use crate::credential_vault;
 
-const LEGACY_TMDB_CREDENTIAL_TARGET: &str = "Streamee/api/tmdb/key";
-
 fn credential_target(provider: &str) -> Result<&'static str, String> {
     match provider {
+        "tmdb" => Ok("Streamee/api/tmdb/key"),
         "omdb" => Ok("Streamee/api/omdb/key"),
         _ => Err("Unsupported API-key provider".to_string()),
     }
@@ -33,7 +32,7 @@ pub fn set_api_key(provider: String, api_key: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn clear_api_keys() -> Result<(), String> {
-    credential_vault::delete(LEGACY_TMDB_CREDENTIAL_TARGET)?;
+    credential_vault::delete(credential_target("tmdb")?)?;
     credential_vault::delete(credential_target("omdb")?)
 }
 
@@ -42,9 +41,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_only_supported_provider_ids() {
+    fn accepts_supported_provider_ids_only() {
+        assert_eq!(credential_target("tmdb").unwrap(), "Streamee/api/tmdb/key");
         assert_eq!(credential_target("omdb").unwrap(), "Streamee/api/omdb/key");
-        assert!(credential_target("tmdb").is_err());
         assert!(credential_target("other").is_err());
     }
 }

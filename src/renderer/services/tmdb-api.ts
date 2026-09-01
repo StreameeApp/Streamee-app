@@ -1,4 +1,5 @@
-import axios from 'axios';
+import axios, { type InternalAxiosRequestConfig } from 'axios';
+import { getApiKey } from './api-keys.ts';
 import { logger } from './logger.ts';
 
 const TMDB_REQUEST_DIAGNOSTIC_QUIET_MS = 2_000;
@@ -131,31 +132,124 @@ function recordTmdbWorkerOutcome(config: object | undefined, failed: boolean): v
 }
 
 const configuredWorkerUrl = import.meta.env?.VITE_TMDB_WORKER_URL?.trim().replace(/\/+$/, '');
+const tmdbWorkerBaseUrl = configuredWorkerUrl
+  ? `${configuredWorkerUrl}/v1/tmdb`
+  : 'http://127.0.0.1:8787/v1/tmdb';
+const tmdbDirectBaseUrl = 'https://api.themoviedb.org/3';
 
-export const isTmdbServiceConfigured = Boolean(configuredWorkerUrl) || Boolean(import.meta.env?.DEV);
+type TmdbRequestRoute = 'personal' | 'worker';
+type RoutedTmdbRequestConfig = InternalAxiosRequestConfig & {
+  streameeTmdbRoute?: TmdbRequestRoute;
+  streameeTmdbFallbackAttempted?: boolean;
+};
+
+function isWorkerOnlyRoute(url?: string): boolean {
+  return (url ?? '').split('?')[0].startsWith('/aggregate/');
+}
+
+function removePersonalCredential(request: RoutedTmdbRequestConfig): void {
+  if (request.params && typeof request.params === 'object') {
+    const { api_key: _apiKey, ...params } = request.params as Record<string, unknown>;
+    request.params = params;
+  }
+  request.headers.delete('Authorization');
+}
+
+function applyPersonalCredential(request: RoutedTmdbRequestConfig, apiKey: string): void {
+  if (/^[a-f\d]{32}$/i.test(apiKey)) {
+    request.params = {
+      ...(request.params && typeof request.params === 'object' ? request.params : {}),
+      api_key: apiKey,
+    };
+    return;
+  }
+
+  request.headers.set('Authorization', `Bearer ${apiKey}`);
+}
+
+function canFallbackToWorker(error: unknown): boolean {
+  if (!axios.isAxiosError(error) || axios.isCancel(error)) return false;
+  const status = error.response?.status;
+  return status === undefined
+    || status === 401
+    || status === 403
+    || status === 408
+    || status === 429
+    || status >= 500;
+}
+
+export async function hasPersonalTmdbApiKey(): Promise<boolean> {
+  return !!(await getApiKey('tmdb'));
+}
+
+export const isTmdbServiceConfigured = Boolean(configuredWorkerUrl)
+  || Boolean(import.meta.env?.DEV)
+  || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
 
 export const tmdbClient = axios.create({
-  baseURL: configuredWorkerUrl
-    ? `${configuredWorkerUrl}/v1/tmdb`
-    : 'http://127.0.0.1:8787/v1/tmdb',
+  baseURL: tmdbWorkerBaseUrl,
   timeout: 15_000,
 });
 
-tmdbClient.interceptors.request.use((request) => {
-  if (!isTmdbServiceConfigured) {
-    throw new axios.CanceledError('TMDB Worker URL is not configured for this build.');
+tmdbClient.interceptors.request.use(async (request) => {
+  const routedRequest = request as RoutedTmdbRequestConfig;
+  const personalApiKey = isWorkerOnlyRoute(request.url) || routedRequest.streameeTmdbFallbackAttempted
+    ? ''
+    : await getApiKey('tmdb');
+
+  if (personalApiKey) {
+    routedRequest.streameeTmdbRoute = 'personal';
+    routedRequest.baseURL = tmdbDirectBaseUrl;
+    applyPersonalCredential(routedRequest, personalApiKey);
+    return routedRequest;
   }
-  recordTmdbWorkerRequest(request, request.url);
-  return request;
+
+  if (!isTmdbServiceConfigured) {
+    throw new axios.CanceledError('TMDB access is not configured for this build.');
+  }
+
+  routedRequest.streameeTmdbRoute = 'worker';
+  routedRequest.baseURL = tmdbWorkerBaseUrl;
+  removePersonalCredential(routedRequest);
+  recordTmdbWorkerRequest(routedRequest, routedRequest.url);
+  return routedRequest;
 });
 
 tmdbClient.interceptors.response.use(
   (response) => {
-    recordTmdbWorkerOutcome(response.config, false);
+    const routedRequest = response.config as RoutedTmdbRequestConfig;
+    if (routedRequest.streameeTmdbRoute === 'worker') {
+      recordTmdbWorkerOutcome(routedRequest, false);
+    }
     return response;
   },
-  (error) => {
-    recordTmdbWorkerOutcome(error?.config, true);
+  async (error) => {
+    const routedRequest = error?.config as RoutedTmdbRequestConfig | undefined;
+    if (routedRequest?.streameeTmdbRoute === 'worker') {
+      recordTmdbWorkerOutcome(routedRequest, true);
+    }
+
+    if (
+      routedRequest?.streameeTmdbRoute === 'personal'
+      && !routedRequest.streameeTmdbFallbackAttempted
+      && canFallbackToWorker(error)
+      && (Boolean(configuredWorkerUrl) || Boolean(import.meta.env?.DEV))
+    ) {
+      routedRequest.streameeTmdbFallbackAttempted = true;
+      routedRequest.baseURL = tmdbWorkerBaseUrl;
+      removePersonalCredential(routedRequest);
+      logger.warn(
+        'tmdb.personal_request_fallback',
+        '[TMDB] Personal credential request failed; retrying through the managed service',
+        {
+          route: classifyTmdbRoute(routedRequest.url),
+          status: axios.isAxiosError(error) ? error.response?.status ?? null : null,
+        },
+        'tmdb.requests',
+      );
+      return tmdbClient.request(routedRequest);
+    }
+
     return Promise.reject(error);
   },
 );

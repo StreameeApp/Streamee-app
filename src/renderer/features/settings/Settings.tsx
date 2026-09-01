@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { FiCheck, FiX, FiFolder, FiRefreshCw, FiFileText, FiDownload, FiCpu, FiVolume2, FiTrash2, FiMonitor, FiDatabase, FiKey, FiPlayCircle, FiZap, FiRadio, FiHardDrive, FiInfo, FiWifi, FiCopy, FiExternalLink, FiSearch, FiPackage, FiChevronDown } from 'react-icons/fi';
 import { loadInstalledAddons, uninstallAddon } from '../../services/installed-addons';
 import { getTraktRateLimitRetryAt, isAuthenticated as checkTraktAuth } from '../../services/trakt';
-import { detectSystemTmdbWatchRegion } from '../../services/tmdb';
+import { detectSystemTmdbWatchRegion, setTmdbSettings } from '../../services/tmdb';
 import { setOmdbSettings } from '../../services/omdb';
 import { clearApiKeys, getApiKey } from '../../services/api-keys';
 import { syncToTrakt, syncFromTrakt } from '../../services/trakt-sync';
@@ -50,6 +50,7 @@ import './Settings.css';
 
 const OMDB_API_URL = 'https://www.omdbapi.com/apikey.aspx';
 const OMDB_LICENSE_URL = 'https://creativecommons.org/licenses/by-nc/4.0/';
+const TMDB_API_URL = 'https://www.themoviedb.org/settings/api';
 const TMDB_HOME_URL = 'https://www.themoviedb.org/';
 const JUSTWATCH_HOME_URL = 'https://www.justwatch.com/';
 const TRAKT_REGISTRATION_URL = 'https://trakt.tv/signin';
@@ -417,6 +418,7 @@ const Settings: React.FC = () => {
     setAudioNormalizerPreset,
   } = useStore();
   const [watchRegion, setWatchRegion] = useState('');
+  const [tmdbApiKey, setTmdbApiKey] = useState('');
   const [omdbApiKey, setOmdbApiKey] = useState('');
   const detectedWatchRegion = useMemo(() => detectSystemTmdbWatchRegion(), []);
   const [discoveryContentMode, setDiscoveryContentMode] = useState<DiscoveryContentMode>('all');
@@ -658,8 +660,12 @@ const Settings: React.FC = () => {
     let cancelled = false;
 
     const loadSettings = async () => {
-      const storedOmdbApiKey = await getApiKey('omdb');
+      const [storedTmdbApiKey, storedOmdbApiKey] = await Promise.all([
+        getApiKey('tmdb'),
+        getApiKey('omdb'),
+      ]);
       if (cancelled) return;
+      setTmdbApiKey(storedTmdbApiKey);
       setOmdbApiKey(storedOmdbApiKey);
 
       const settingsStored = localStorage.getItem('streamee-settings');
@@ -1010,7 +1016,10 @@ const Settings: React.FC = () => {
 
   const persistSettings = async () => {
     const previousDiscoveryContentMode = getDiscoveryContentMode();
-    await setOmdbSettings({ apiKey: omdbApiKey });
+    await Promise.all([
+      setTmdbSettings({ apiKey: tmdbApiKey }),
+      setOmdbSettings({ apiKey: omdbApiKey }),
+    ]);
     localStorage.removeItem('streamee-tastedive');
     localStorage.setItem('streamee-settings', JSON.stringify({
       discoveryContentMode,
@@ -1145,6 +1154,7 @@ const Settings: React.FC = () => {
     return () => window.clearTimeout(timeoutId);
   }, [
     watchRegion,
+    tmdbApiKey,
     omdbApiKey,
     discoveryContentMode,
     torrentPort,
@@ -1735,10 +1745,32 @@ const Settings: React.FC = () => {
               <p>
                 Powers the board, catalog, artwork, release dates, cast, and core metadata throughout Streamee.
               </p>
-              <p>Access is managed by Streamee; no personal TMDB key is required.</p>
+              <p>A personal key is optional; Streamee provides managed access when one is not configured.</p>
             </div>
 
             <div className="settings-api-controls">
+              <div className="settings-field">
+                <label>TMDB API Key or Read Access Token</label>
+                <input
+                  type="password"
+                  value={tmdbApiKey}
+                  onChange={(event) => setTmdbApiKey(event.target.value)}
+                  placeholder="Enter your TMDB credential"
+                  autoComplete="off"
+                />
+                <span className="settings-hint">
+                  Stored in Windows Credential Manager and sent only to TMDB. When configured, Streamee uses it first
+                  and automatically retries through the managed service if TMDB rejects it or the direct request fails.{' '}
+                  <button
+                    className="settings-inline-link"
+                    onClick={() => openExternalLink(TMDB_API_URL)}
+                    type="button"
+                  >
+                    Get a TMDB credential
+                  </button>
+                </span>
+              </div>
+
               <div className="settings-field">
                 <label>Streaming Region</label>
                 <input

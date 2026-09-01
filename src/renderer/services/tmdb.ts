@@ -11,11 +11,13 @@ import {
   deleteCachedRequest,
   getCachedRequest,
   getPersistentlyCachedRequest,
+  invalidateRequestCache,
   readPersistentlyCachedValue,
   writePersistentlyCachedValue,
   writePersistentlyCachedValues,
 } from './request-cache';
-import { isTmdbServiceConfigured, tmdbClient } from './tmdb-api';
+import { setApiKey } from './api-keys';
+import { hasPersonalTmdbApiKey, isTmdbServiceConfigured, tmdbClient } from './tmdb-api';
 import { getTmdbEpisodeCacheTtlMs } from './tmdb-request-policy';
 
 const TMDB_DETAIL_CONCURRENCY = 4;
@@ -54,6 +56,11 @@ const waitForTmdbRetry = (attempt: number) => new Promise<void>((resolve) => {
 
 export function isTmdbConfigured(): boolean {
   return isTmdbServiceConfigured;
+}
+
+export async function setTmdbSettings(settings: { apiKey: string }): Promise<void> {
+  await setApiKey('tmdb', settings.apiKey);
+  invalidateRequestCache('tmdb:');
 }
 
 export function detectSystemTmdbWatchRegion(): string {
@@ -537,6 +544,14 @@ export async function getTmdbDiscovery(
   mediaType: 'all' | 'movie' | 'tv' = 'all',
 ): Promise<MetaPreview[]> {
   const contentMode = getDiscoveryContentMode();
+  if (await hasPersonalTmdbApiKey()) {
+    const [movies, tv] = await Promise.all([
+      mediaType === 'tv' ? Promise.resolve([]) : fetchDiscoverMovies(page, options, contentMode),
+      mediaType === 'movie' ? Promise.resolve([]) : fetchDiscoverTv(page, options, contentMode),
+    ]);
+    return [...movies, ...tv];
+  }
+
   const cacheKey = [
     'tmdb:aggregate:discovery:v1',
     contentMode,
@@ -720,6 +735,16 @@ export async function getTmdbBoardCatalogs(
   trendingTv: MetaPreview[];
   popularTv: MetaPreview[];
 }> {
+  if (await hasPersonalTmdbApiKey()) {
+    const [trendingMovies, popularMovies, trendingTv, popularTv] = await Promise.all([
+      getTmdbMovies('trending'),
+      getTmdbMovies('popular'),
+      getTmdbTv('trending'),
+      getTmdbTv('popular'),
+    ]);
+    return { trendingMovies, popularMovies, trendingTv, popularTv };
+  }
+
   return getPersistentlyCachedRequest(
     `tmdb:aggregate:board:${contentMode}`,
     TMDB_CATALOG_CACHE_TTL_MS,
@@ -859,6 +884,15 @@ export async function enrichTmdbItemsById(
     name?: string;
   }>
 ): Promise<MetaPreview[]> {
+  if (await hasPersonalTmdbApiKey()) {
+    const enriched = await Promise.all(items.map((item) => getTmdbItemById(
+      item.mediaType,
+      item.tmdbId,
+      { name: item.name, releaseDate: item.releaseDate },
+    )));
+    return enriched.filter((item): item is MetaPreview => !!item);
+  }
+
   const enrichBatch = async (batch: typeof items): Promise<Array<MetaPreview | null>> => {
     const uniqueItems = [...new Map(
       batch.map((item) => [`${item.mediaType}:${item.tmdbId}`, item]),
@@ -1154,14 +1188,32 @@ export async function getTmdbTitleBundle(
           return { details, watchProviders };
         }
 
-        const response = await tmdbClient.get<{
-          details: TmdbMetaData;
-          watchProviders: TmdbWatchProviderResponse | null;
-        }>(`/aggregate/title/${endpoint}/${tmdbId}`, {
-          params: { include_watch_providers: includeWatchProviders ? '1' : '0' },
-        });
-        details = response.data.details;
-        watchProviders = response.data.watchProviders;
+        if (await hasPersonalTmdbApiKey()) {
+          const [detailsResponse, watchProvidersResponse] = await Promise.all([
+            tmdbClient.get<TmdbMetaData>(`/${endpoint}/${tmdbId}`, {
+              params: {
+                append_to_response: type === 'series'
+                  ? 'credits,aggregate_credits,external_ids,alternative_titles,videos,images'
+                  : 'credits,external_ids,alternative_titles,videos,images',
+                include_image_language: 'en,null',
+              },
+            }),
+            includeWatchProviders
+              ? tmdbClient.get<TmdbWatchProviderResponse>(`/${endpoint}/${tmdbId}/watch/providers`)
+              : Promise.resolve(null),
+          ]);
+          details = detailsResponse.data;
+          watchProviders = watchProvidersResponse?.data ?? null;
+        } else {
+          const response = await tmdbClient.get<{
+            details: TmdbMetaData;
+            watchProviders: TmdbWatchProviderResponse | null;
+          }>(`/aggregate/title/${endpoint}/${tmdbId}`, {
+            params: { include_watch_providers: includeWatchProviders ? '1' : '0' },
+          });
+          details = response.data.details;
+          watchProviders = response.data.watchProviders;
+        }
         await persistSharedTitleData(endpoint, tmdbId, details);
         if (watchProviders) {
           await writePersistentlyCachedValue(

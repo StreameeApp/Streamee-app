@@ -49,7 +49,7 @@ import {
   suspendSegmentFeedbackPattern,
   type SegmentFeedbackContext,
 } from '../../services/segment-feedback';
-import type { IntroDbSegment, IntroDbSegments, IntroSkipperDetectionResult, PlayerChapterSegments, PlayerDetectedSegment, PlayerPlaylistChangedPayload, PlayerSegmentFeedbackPayload, PreparedQbittorrentStreamResult, SegmentFeedbackCandidate, StreamLaunchResult, StreamPlaylistItem, SubtitleProgressEvent, SubtitleSegment, TorrentStartupState } from '../../services/tauri';
+import type { IntroDbSegment, IntroDbSegments, IntroSkipperDetectionResult, PlayerChapterSegments, PlayerDetectedSegment, PlayerPlaylistChangedPayload, PlayerSegmentFeedbackPayload, PlayerSegmentFeedbackRenderedPayload, PreparedQbittorrentStreamResult, SegmentFeedbackCandidate, StreamLaunchResult, StreamPlaylistItem, SubtitleProgressEvent, SubtitleSegment, TorrentStartupState } from '../../services/tauri';
 import './Player.css';
 
 const formatTime = (seconds: number): string => {
@@ -1643,6 +1643,7 @@ const Player: React.FC = () => {
     let playerPlaylistChangedUnlisten: (() => void) | null = null;
     let playerSmartNextUnlisten: (() => void) | null = null;
     let playerSegmentFeedbackUnlisten: (() => void) | null = null;
+    let playerSegmentFeedbackRenderedUnlisten: (() => void) | null = null;
     let playerAudioTrackChangedUnlisten: (() => void) | null = null;
     let playerClosedUnlisten: (() => void) | null = null;
     let playerEofUnlisten: (() => void) | null = null;
@@ -1714,6 +1715,7 @@ const Player: React.FC = () => {
       filename: string;
       automatic: boolean;
       scheduledAt: number;
+      renderedAt: number | null;
     } | null = null;
     let lastPublishedDetectedSegmentsSignature = '';
     type SegmentBoundaryTimerState = {
@@ -2590,7 +2592,8 @@ const Player: React.FC = () => {
 
           const nextSourceType: 'webtorrent' | 'qbittorrent' | 'addon' =
             preparedWarmup?.sourceType
-            || (best.result.sourceProvider === 'addon' && !!best.result.streamUrl
+            || (best.result.sourceProvider === 'addon'
+              && (!!best.result.streamHandle || !!best.result.streamUrl)
               ? 'addon'
               : selectedStream.sourceType === 'qbittorrent'
                   ? 'qbittorrent'
@@ -2818,6 +2821,7 @@ const Player: React.FC = () => {
 
         segmentFeedbackRequestSequence += 1;
         const requestId = segmentFeedbackRequestSequence;
+        const promptScheduledAt = Date.now();
         activeSegmentFeedbackPrompt = {
           requestId,
           key: feedbackKey,
@@ -2825,7 +2829,8 @@ const Player: React.FC = () => {
           context,
           filename,
           automatic,
-          scheduledAt: Date.now(),
+          scheduledAt: promptScheduledAt,
+          renderedAt: null,
         };
         segmentFeedbackPromptedKeys.add(slotKey);
         try {
@@ -2836,7 +2841,7 @@ const Player: React.FC = () => {
             automatic,
             4,
           );
-          logger.info('segment_feedback.prompt_shown', '[Segment Feedback] Prompt shown', {
+          logger.info('segment_feedback.prompt_dispatched', '[Segment Feedback] Prompt dispatched', {
             request_id: requestId,
             candidate_id: feedbackKey,
             series_key: context.seriesKey,
@@ -2850,6 +2855,7 @@ const Player: React.FC = () => {
             score: candidate.score,
             promotion_status: shadowMatch.status,
             prompt_mode: automatic ? 'automatic' : 'manual',
+            status: 'dispatched',
           }, 'segment_feedback');
           if (automatic) {
             logger.info('segment_feedback.auto_action_scheduled', '[Segment Feedback] Automatic action scheduled', {
@@ -2870,8 +2876,45 @@ const Player: React.FC = () => {
             activeSegmentFeedbackPrompt = null;
             segmentFeedbackPromptedKeys.delete(slotKey);
           }
+          logger.warn('segment_feedback.prompt_dispatch_failed', '[Segment Feedback] Prompt dispatch failed', {
+            request_id: requestId,
+            candidate_id: feedbackKey,
+            series_key: context.seriesKey,
+            season: context.season,
+            episode: context.episode,
+            kind: candidate.kind,
+            provider: candidate.source,
+            reason: candidate.reason,
+            prompt_mode: automatic ? 'automatic' : 'manual',
+            duration_ms: Date.now() - promptScheduledAt,
+            error_kind: 'mpv_prompt_dispatch_failed',
+            status: 'failed',
+          }, 'segment_feedback');
           console.debug('[Segment Feedback] Prompt unavailable', error);
         }
+      };
+      const handleSegmentFeedbackRendered = (
+        payload: PlayerSegmentFeedbackRenderedPayload,
+      ) => {
+        const active = activeSegmentFeedbackPrompt;
+        if (!active || payload.request_id !== active.requestId || active.renderedAt != null) return;
+        active.renderedAt = Date.now();
+        const { candidate } = active;
+        logger.info('segment_feedback.prompt_rendered', '[Segment Feedback] Prompt rendered', {
+          request_id: payload.request_id,
+          candidate_id: active.key,
+          series_key: active.context.seriesKey,
+          season: active.context.season,
+          episode: active.context.episode,
+          kind: candidate.kind,
+          start_seconds: candidate.start_sec,
+          end_seconds: candidate.end_sec,
+          provider: candidate.source,
+          reason: candidate.reason,
+          prompt_mode: active.automatic ? 'automatic' : 'manual',
+          duration_ms: active.renderedAt - active.scheduledAt,
+          status: 'rendered',
+        }, 'segment_feedback');
       };
       const handleSegmentFeedback = async (payload: PlayerSegmentFeedbackPayload) => {
         const active = activeSegmentFeedbackPrompt;
@@ -2891,6 +2934,9 @@ const Player: React.FC = () => {
           end_seconds: candidate.end_sec,
           provider: candidate.source,
           reason: candidate.reason,
+          hidden_reason: payload.hidden_reason,
+          rendered: active.renderedAt != null,
+          duration_ms: Date.now() - (active.renderedAt ?? active.scheduledAt),
           status: payload.response === 'yes'
             ? 'confirmed'
             : payload.response === 'no'
@@ -4782,6 +4828,11 @@ const Player: React.FC = () => {
           void consumeSmartNextRequest(data, data.filename);
         });
 
+        playerSegmentFeedbackRenderedUnlisten = await window.electronAPI.playerEvents.onSegmentFeedbackRendered((data) => {
+          if (disposed) return;
+          handleSegmentFeedbackRendered(data);
+        });
+
         playerSegmentFeedbackUnlisten = await window.electronAPI.playerEvents.onSegmentFeedback((data) => {
           if (disposed) return;
           void handleSegmentFeedback(data);
@@ -6655,6 +6706,7 @@ const Player: React.FC = () => {
       playerSeekUnlisten?.();
       playerPlaylistChangedUnlisten?.();
       playerSmartNextUnlisten?.();
+      playerSegmentFeedbackRenderedUnlisten?.();
       playerSegmentFeedbackUnlisten?.();
       playerAudioTrackChangedUnlisten?.();
       playerClosedUnlisten?.();

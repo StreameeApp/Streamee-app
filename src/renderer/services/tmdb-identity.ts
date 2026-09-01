@@ -4,7 +4,7 @@ import {
   readPersistentlyCachedValue,
   writePersistentlyCachedValues,
 } from './request-cache.ts';
-import { tmdbClient } from './tmdb-api.ts';
+import { hasPersonalTmdbApiKey, tmdbClient } from './tmdb-api.ts';
 
 const TMDB_EXTERNAL_ID_CACHE_MS = 90 * 24 * 60 * 60 * 1000;
 const TMDB_EXTERNAL_ID_NEGATIVE_CACHE_MS = 6 * 60 * 60 * 1000;
@@ -87,33 +87,34 @@ async function flushIdentityBatch(): Promise<void> {
   if (batch.length === 0) return;
 
   let identities: Map<string, string | undefined> | null = null;
-  try {
-    const canonicalItems = batch
-      .map((item) => `${item.mediaType}:${item.tmdbId}`)
-      .sort();
-    const response = await tmdbClient.get<{
-      items: Array<{
-        mediaType: 'movie' | 'tv';
-        tmdbId: number;
-        detail: TmdbIdentityDetail;
-      }>;
-    }>('/aggregate/previews', {
-      params: { items: canonicalItems.join(',') },
-    });
-    identities = new Map(response.data.items.map((item) => [
-      `${item.mediaType}:${item.tmdbId}`,
-      readImdbId(item.detail),
-    ]));
-    await writePersistentlyCachedValues(
-      response.data.items.map((item) => ({
-        key: `tmdb:preview-detail:${item.mediaType}:${item.tmdbId}`,
-        value: item.detail,
-      })),
-      TMDB_PREVIEW_DETAIL_CACHE_MS,
-    );
-
-  } catch {
-    identities = null;
+  if (!(await hasPersonalTmdbApiKey())) {
+    try {
+      const canonicalItems = batch
+        .map((item) => `${item.mediaType}:${item.tmdbId}`)
+        .sort();
+      const response = await tmdbClient.get<{
+        items: Array<{
+          mediaType: 'movie' | 'tv';
+          tmdbId: number;
+          detail: TmdbIdentityDetail;
+        }>;
+      }>('/aggregate/previews', {
+        params: { items: canonicalItems.join(',') },
+      });
+      identities = new Map(response.data.items.map((item) => [
+        `${item.mediaType}:${item.tmdbId}`,
+        readImdbId(item.detail),
+      ]));
+      await writePersistentlyCachedValues(
+        response.data.items.map((item) => ({
+          key: `tmdb:preview-detail:${item.mediaType}:${item.tmdbId}`,
+          value: item.detail,
+        })),
+        TMDB_PREVIEW_DETAIL_CACHE_MS,
+      );
+    } catch {
+      identities = null;
+    }
   }
 
   await Promise.all(batch.map(async (item) => {
