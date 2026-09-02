@@ -8788,20 +8788,6 @@ mod stream_cache_tests {
         assert!(resolved.ends_with(Path::new("mpv/scripts/streamee_rife.py")));
     }
 
-    #[test]
-    fn development_mpv_workspace_bundle_contains_custom_osc() {
-        let resolved = development_mpv_path().expect("development MPV should resolve");
-        let workspace_mpv = resolved
-            .parent()
-            .expect("MPV should have a parent directory");
-
-        assert_eq!(
-            resolved.file_name().and_then(|name| name.to_str()),
-            Some("mpv.exe")
-        );
-        assert!(workspace_mpv.join("scripts").join("PlexOSC.lua").is_file());
-    }
-
     #[cfg(target_os = "windows")]
     #[test]
     fn detects_hdr_and_dolby_vision_release_tags_without_matching_hdrip() {

@@ -211,6 +211,9 @@ local state = {
     topinput_enabled = false,
     showhide_enabled = false,
     window_controls_enabled = false,
+    cursor_forced_hidden = false,
+    cursor_autohide_restore = nil,
+    cursor_restore_generation = 0,
     dmx_cache = 0,
     border = true,
     maximized = false,
@@ -2803,6 +2806,38 @@ end
 -- Other important stuff
 --
 
+local function force_hide_idle_cursor()
+    if state.cursor_forced_hidden then return end
+
+    state.cursor_autohide_restore = mp.get_property('cursor-autohide', '1000')
+    state.cursor_forced_hidden = true
+    state.cursor_restore_generation = state.cursor_restore_generation + 1
+    mp.set_property('cursor-autohide', 'always')
+end
+
+local function restore_cursor_autohide_on_mouse_move()
+    if not state.cursor_forced_hidden then return end
+
+    local restore = state.cursor_autohide_restore or '1000'
+    state.cursor_forced_hidden = false
+    state.cursor_autohide_restore = nil
+    state.cursor_restore_generation = state.cursor_restore_generation + 1
+    local generation = state.cursor_restore_generation
+
+    if restore == 'always' then return end
+
+    -- Make the real movement visible immediately, then restore the user's
+    -- configured timer on the next tick so MPV resumes its normal behavior.
+    mp.set_property('cursor-autohide', 'no')
+    if restore ~= 'no' then
+        mp.add_timeout(0, function()
+            if not state.cursor_forced_hidden and
+               state.cursor_restore_generation == generation then
+                mp.set_property('cursor-autohide', restore)
+            end
+        end)
+    end
+end
 
 function show_osc()
     -- show when disabled can happen (e.g. mouse_move) due to async/delayed unbinding
@@ -3076,6 +3111,7 @@ function render()
         if timeout <= 0 then
             if (state.active_element == nil) and not (mouse_over_osc) then
                 hide_osc()
+                force_hide_idle_cursor()
             end
         else
             -- the timer is only used to recheck the state and to possibly run
@@ -3189,6 +3225,7 @@ function process_event(source, what)
 
     elseif source == 'mouse_move' then
 
+        restore_cursor_autohide_on_mouse_move()
         state.mouse_in_window = true
 
         local mouseX, mouseY = get_virt_mouse_pos()
@@ -3469,6 +3506,14 @@ mp.observe_property('osd-dimensions', 'native', function(name, val)
     -- (we could use the value instead of re-querying it all the time, but then
     --  we might have to worry about property update ordering)
     request_init_resize()
+end)
+mp.register_event('file-loaded', function()
+    if get_hidetimeout() >= 0 then
+        -- A replacement MPV window can become visible without receiving a real
+        -- mouse event. Start the ordinary OSC idle countdown for the new file.
+        state.showtime = mp.get_time()
+        request_tick()
+    end
 end)
 
 -- mouse show/hide bindings
