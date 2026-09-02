@@ -95,6 +95,11 @@ test('backend validates and launches the standalone RIFE filter without SVP Mana
   assert.match(backend, /scripts"\)\.join\("streamee_rife\.py"\)/);
   assert.match(backend, /@streamee-rife:vapoursynth/);
   assert.match(backend, /rife_filter_concurrency/);
+  assert.match(backend, /const RIFE_BUFFERED_FRAMES: u32 = 2/);
+  assert.match(
+    backend,
+    /buffered-frames=\{\}:concurrent-frames=\{\}[\s\S]*?RIFE_BUFFERED_FRAMES,[\s\S]*?rife_filter_concurrency/,
+  );
   assert.match(backend, /matches!\(explicit, 1 \| 2 \| 4 \| 6 \| 8 \| 12\)/);
   assert.match(backend, /STREAMEE_RIFE_RUNTIME/);
   assert.match(backend, /STREAMEE_RIFE_MODEL/);

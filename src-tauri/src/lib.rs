@@ -51,10 +51,6 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
-#[cfg(target_os = "windows")]
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_NOREPEAT, VK_F6};
-#[cfg(target_os = "windows")]
-use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY};
 
 #[cfg(target_os = "windows")]
 const WEBVIEW_RECOVERY_RESTART_ENV: &str = "STREAMEE_WEBVIEW_RECOVERY_RESTARTED";
@@ -63,85 +59,7 @@ const WEBVIEW_RECOVERY_STABILIZATION_SECONDS: u64 = 30;
 #[cfg(target_os = "windows")]
 static WEBVIEW_RECOVERY_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(target_os = "windows")]
-const EMERGENCY_SCRAM_HOTKEY_ID: i32 = 0x5354;
 const MPV_STRUCTURED_LOGGING_ENABLED: bool = false;
-
-#[cfg(target_os = "windows")]
-fn emergency_scram_command(process_id: u32) -> String {
-    format!(
-        "taskkill /F /T /IM node.exe >nul 2>&1 & \
-         taskkill /F /T /IM streameenode.exe >nul 2>&1 & \
-         taskkill /F /PID {process_id} >nul 2>&1"
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn trigger_emergency_scram() -> ! {
-    let script = emergency_scram_command(std::process::id());
-    let mut command = std::process::Command::new("cmd.exe");
-    command.args(["/D", "/S", "/C", &script]);
-    hide_console_std(&mut command);
-    let _ = command.spawn();
-
-    std::process::exit(137);
-}
-
-#[cfg(target_os = "windows")]
-fn install_emergency_scram_hotkey() {
-    let _ = std::thread::Builder::new()
-        .name("streamee-emergency-scram".to_string())
-        .spawn(|| {
-            let modifiers = MOD_ALT | MOD_NOREPEAT;
-            if let Err(error) = unsafe {
-                RegisterHotKey(None, EMERGENCY_SCRAM_HOTKEY_ID, modifiers, VK_F6.0 as u32)
-            } {
-                warn!(
-                    event = "app.scram_hotkey_registration_failed",
-                    source = "backend",
-                    subsystem = "app.safety",
-                    error_kind = %error.code(),
-                    "Could not register emergency Alt+F6 shortcut: {error}"
-                );
-                return;
-            }
-
-            info!(
-                event = "app.scram_hotkey_registered",
-                source = "backend",
-                subsystem = "app.safety",
-                shortcut = "Alt+F6",
-                "Emergency SCRAM shortcut registered"
-            );
-
-            let mut message = MSG::default();
-            loop {
-                let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
-                if result.0 <= 0 {
-                    break;
-                }
-                if message.message == WM_HOTKEY
-                    && message.wParam.0 == EMERGENCY_SCRAM_HOTKEY_ID as usize
-                {
-                    trigger_emergency_scram();
-                }
-            }
-        });
-}
-
-#[cfg(all(test, target_os = "windows"))]
-mod emergency_scram_tests {
-    use super::emergency_scram_command;
-
-    #[test]
-    fn scram_targets_all_node_sidecars_and_only_the_current_main_process() {
-        let command = emergency_scram_command(4242);
-        assert!(command.contains("taskkill /F /T /IM node.exe"));
-        assert!(command.contains("taskkill /F /T /IM streameenode.exe"));
-        assert!(command.contains("taskkill /F /PID 4242"));
-        assert!(!command.contains("/IM streamee.exe"));
-    }
-}
 
 #[cfg(target_os = "windows")]
 fn webview_process_failure_kind_name(kind: i32) -> &'static str {
@@ -713,6 +631,11 @@ fn rife_filter_concurrency(
         4
     }
 }
+
+// RIFE only needs a small backward source window for adjacent-frame
+// interpolation. Keep this independent from parallel TensorRT requests: mpv
+// multiplies buffered-frames by concurrent-frames for its effective buffer.
+const RIFE_BUFFERED_FRAMES: u32 = 2;
 
 #[cfg(test)]
 mod rife_launch_tests {
@@ -7066,7 +6989,7 @@ async fn launch_mpv_process(
             "--vf-add=@streamee-rife:vapoursynth=file=%{}%{}:buffered-frames={}:concurrent-frames={}",
             normalized_rife_script.len(),
             normalized_rife_script,
-            rife_filter_concurrency,
+            RIFE_BUFFERED_FRAMES,
             rife_filter_concurrency
         ));
         if rtx_hdr_enabled && upscaler != VideoUpscaler::RtxVsr {
@@ -7230,6 +7153,7 @@ async fn launch_mpv_process(
             gpu_streams = rife_gpu_streams,
             processing_mode = rife_processing_mode,
             scale = rife_scale,
+            buffered_frames = RIFE_BUFFERED_FRAMES,
             concurrent_frames = rife_filter_concurrency,
             before_upscaling = rife_before_upscaling,
             runtime_ready = rife_enabled,
@@ -8555,8 +8479,6 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             info!("Tauri app setup complete");
-            #[cfg(target_os = "windows")]
-            install_emergency_scram_hotkey();
             cleanup_persistent_stream_cache_on_startup(app.handle());
             cleanup_addon_proxy_cache();
 

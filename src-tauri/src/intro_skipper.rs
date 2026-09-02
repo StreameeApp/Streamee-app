@@ -22,6 +22,7 @@ use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 const MAX_ANALYSIS_SECONDS: f64 = 7.0 * 60.0;
 const MIN_ANALYSIS_SECONDS: f64 = 60.0;
 const SECONDARY_INTRO_OVERLAP_SECONDS: u64 = 60;
+const SECONDARY_INTRO_EXTENSION_SECONDS: u64 = 2 * 60;
 const MIN_OUTRO_ANALYSIS_SECONDS: f64 = 2.0 * 60.0;
 const MAX_OUTRO_ANALYSIS_SECONDS: f64 = 12.0 * 60.0;
 const MIN_OUTRO_MATCH_SECONDS: f64 = 10.0;
@@ -34,15 +35,21 @@ const MAX_INTRO_SECONDS: f64 = 2.0 * 60.0;
 const SAMPLE_DURATION_SECONDS: f64 = 4096.0 / 11025.0 / 3.0;
 const MAX_POINT_BIT_DIFFERENCES: u32 = 6;
 const MAX_MATCH_GAP_POINTS: usize = 16;
+const INTRO_WINDOW_BOUNDARY_MARGIN_POINTS: usize = 2;
+const INTRO_CONSENSUS_START_TOLERANCE_SECONDS: f64 = 5.0;
+const INTRO_CONSENSUS_DURATION_TOLERANCE_SECONDS: f64 = 10.0;
 const MIN_MATCH_DENSITY: f64 = 0.65;
 const FUZZY_MAX_MEAN_BIT_DIFFERENCES: f64 = 12.0;
 const FUZZY_CLOSE_POINT_BIT_DIFFERENCES: u32 = 14;
 const FUZZY_MIN_CLOSE_POINT_DENSITY: f64 = 0.75;
+const FUZZY_NEAR_MISS_MAX_MEAN_BIT_DIFFERENCES: f64 = 13.0;
+const FUZZY_NEAR_MISS_MIN_CLOSE_POINT_DENSITY: f64 = 0.72;
 const FUZZY_MIN_ALIGNED_CONTEXT_SECONDS: f64 = 60.0;
 const FPCALC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_MEMORY_FINGERPRINTS: usize = 24;
 const MAX_PERSISTED_FINGERPRINTS: usize = 24;
-const FINGERPRINT_CACHE_VERSION: u32 = 4;
+const PREVIOUS_FINGERPRINT_CACHE_VERSION: u32 = 4;
+const FINGERPRINT_CACHE_VERSION: u32 = 5;
 const LOCAL_CACHE_NOT_READY: &str = "Intro Skipper local cache is not ready";
 const LOCAL_AUDIO_CACHE_NOT_READY: &str = "Intro Skipper selected-audio cache is not ready";
 const OUTRO_FINGERPRINT_CACHE_VERSION: u32 = 3;
@@ -96,6 +103,16 @@ struct MatchedRange {
     exact_density: f64,
     mean_bit_difference: f64,
     close_point_density: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EvaluatedIntroMatch {
+    source_exact: bool,
+    reference_episode: u32,
+    reference_window_start: f64,
+    range: MatchedRange,
+    accepted: bool,
+    boundary_truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -454,16 +471,21 @@ fn intro_analysis_seconds(duration_seconds: f64) -> u64 {
 }
 
 fn intro_analysis_window(duration_seconds: f64, analysis_part: u8) -> Option<(f64, u64)> {
-    let analysis_seconds = intro_analysis_seconds(duration_seconds);
+    let base_analysis_seconds = intro_analysis_seconds(duration_seconds);
     let window_start_seconds = match analysis_part {
         1 => 0,
-        2 => analysis_seconds
-            .saturating_sub(SECONDARY_INTRO_OVERLAP_SECONDS.min(analysis_seconds / 2)),
+        2 => base_analysis_seconds
+            .saturating_sub(SECONDARY_INTRO_OVERLAP_SECONDS.min(base_analysis_seconds / 2)),
         _ => return None,
+    };
+    let requested_analysis_seconds = match analysis_part {
+        1 => base_analysis_seconds,
+        2 => base_analysis_seconds.saturating_add(SECONDARY_INTRO_EXTENSION_SECONDS),
+        _ => unreachable!(),
     };
     let available_seconds = duration_seconds.floor().max(0.0) as u64;
     let analysis_seconds =
-        analysis_seconds.min(available_seconds.saturating_sub(window_start_seconds));
+        requested_analysis_seconds.min(available_seconds.saturating_sub(window_start_seconds));
     (analysis_seconds >= MIN_INTRO_SECONDS.round() as u64)
         .then_some((window_start_seconds as f64, analysis_seconds))
 }
@@ -917,13 +939,13 @@ fn candidate_shifts(lhs: &[u32], rhs: &[u32]) -> Vec<i32> {
         .collect()
 }
 
-fn range_for_shift_with_limits(
+fn ranges_for_shift_with_limits(
     lhs: &[u32],
     rhs: &[u32],
     shift: i32,
     min_duration: f64,
     max_duration: f64,
-) -> Option<MatchedRange> {
+) -> Vec<MatchedRange> {
     let lhs_offset = (-shift).max(0) as usize;
     let rhs_offset = shift.max(0) as usize;
     let overlap = lhs
@@ -931,12 +953,12 @@ fn range_for_shift_with_limits(
         .saturating_sub(lhs_offset)
         .min(rhs.len().saturating_sub(rhs_offset));
 
-    let mut best: Option<(usize, usize, usize)> = None;
+    let mut groups = Vec::<(usize, usize, usize)>::new();
     let mut group_start = None;
     let mut last_match = 0usize;
     let mut match_count = 0usize;
 
-    let finish_group = |best: &mut Option<(usize, usize, usize)>,
+    let finish_group = |groups: &mut Vec<(usize, usize, usize)>,
                         start: Option<usize>,
                         end: usize,
                         matches: usize| {
@@ -944,11 +966,8 @@ fn range_for_shift_with_limits(
         let span = end.saturating_sub(start) + 1;
         let duration = span as f64 * SAMPLE_DURATION_SECONDS;
         let density = matches as f64 / span as f64;
-        if (min_duration..=max_duration).contains(&duration)
-            && density >= MIN_MATCH_DENSITY
-            && best.is_none_or(|current| span > current.1.saturating_sub(current.0) + 1)
-        {
-            *best = Some((start, end, matches));
+        if (min_duration..=max_duration).contains(&duration) && density >= MIN_MATCH_DENSITY {
+            groups.push((start, end, matches));
         }
     };
 
@@ -962,7 +981,7 @@ fn range_for_shift_with_limits(
 
         if group_start.is_some() && relative_index.saturating_sub(last_match) > MAX_MATCH_GAP_POINTS
         {
-            finish_group(&mut best, group_start, last_match, match_count);
+            finish_group(&mut groups, group_start, last_match, match_count);
             group_start = None;
             match_count = 0;
         }
@@ -970,67 +989,133 @@ fn range_for_shift_with_limits(
         last_match = relative_index;
         match_count += 1;
     }
-    finish_group(&mut best, group_start, last_match, match_count);
+    finish_group(&mut groups, group_start, last_match, match_count);
 
-    best.map(|(start, end, matches)| {
-        let span = end.saturating_sub(start) + 1;
-        let (bit_sum, close_points) =
-            (start..=end).fold((0u64, 0usize), |(bit_sum, close_points), relative_index| {
-                let distance = (lhs[lhs_offset + relative_index]
-                    ^ rhs[rhs_offset + relative_index])
-                    .count_ones();
-                (
-                    bit_sum + u64::from(distance),
-                    close_points + usize::from(distance <= FUZZY_CLOSE_POINT_BIT_DIFFERENCES),
-                )
-            });
-        MatchedRange {
-            start: (lhs_offset + start) as f64 * SAMPLE_DURATION_SECONDS,
-            end: (lhs_offset + end + 1) as f64 * SAMPLE_DURATION_SECONDS,
-            reference_start: (rhs_offset + start) as f64 * SAMPLE_DURATION_SECONDS,
-            reference_end: (rhs_offset + end + 1) as f64 * SAMPLE_DURATION_SECONDS,
-            method: IntroMatchMethod::Exact,
-            exact_density: matches as f64 / span as f64,
-            mean_bit_difference: bit_sum as f64 / span as f64,
-            close_point_density: close_points as f64 / span as f64,
-        }
-    })
-}
-
-fn range_for_shift(lhs: &[u32], rhs: &[u32], shift: i32) -> Option<MatchedRange> {
-    range_for_shift_with_limits(lhs, rhs, shift, MIN_INTRO_SECONDS, MAX_INTRO_SECONDS)
-}
-
-fn find_shared_intro(lhs: &[u32], rhs: &[u32]) -> Option<MatchedRange> {
-    candidate_shifts(lhs, rhs)
+    groups
         .into_iter()
-        .filter_map(|shift| range_for_shift(lhs, rhs, shift))
+        .map(|(start, end, matches)| {
+            let span = end.saturating_sub(start) + 1;
+            let (bit_sum, close_points) =
+                (start..=end).fold((0u64, 0usize), |(bit_sum, close_points), relative_index| {
+                    let distance = (lhs[lhs_offset + relative_index]
+                        ^ rhs[rhs_offset + relative_index])
+                        .count_ones();
+                    (
+                        bit_sum + u64::from(distance),
+                        close_points + usize::from(distance <= FUZZY_CLOSE_POINT_BIT_DIFFERENCES),
+                    )
+                });
+            MatchedRange {
+                start: (lhs_offset + start) as f64 * SAMPLE_DURATION_SECONDS,
+                end: (lhs_offset + end + 1) as f64 * SAMPLE_DURATION_SECONDS,
+                reference_start: (rhs_offset + start) as f64 * SAMPLE_DURATION_SECONDS,
+                reference_end: (rhs_offset + end + 1) as f64 * SAMPLE_DURATION_SECONDS,
+                method: IntroMatchMethod::Exact,
+                exact_density: matches as f64 / span as f64,
+                mean_bit_difference: bit_sum as f64 / span as f64,
+                close_point_density: close_points as f64 / span as f64,
+            }
+        })
+        .collect()
+}
+
+fn range_for_shift_with_limits(
+    lhs: &[u32],
+    rhs: &[u32],
+    shift: i32,
+    min_duration: f64,
+    max_duration: f64,
+) -> Option<MatchedRange> {
+    ranges_for_shift_with_limits(lhs, rhs, shift, min_duration, max_duration)
+        .into_iter()
         .max_by(|left, right| {
             (left.end - left.start)
                 .partial_cmp(&(right.end - right.start))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .or_else(|| find_fuzzy_shared_intro(lhs, rhs))
 }
 
-fn fuzzy_window_is_eligible(bit_sum: u32, close_points: usize, points: usize) -> bool {
+fn fuzzy_window_is_eligible(
+    bit_sum: u32,
+    close_points: usize,
+    points: usize,
+    max_mean_bit_differences: f64,
+    min_close_point_density: f64,
+) -> bool {
     points > 0
-        && bit_sum as f64 / points as f64 <= FUZZY_MAX_MEAN_BIT_DIFFERENCES
-        && close_points as f64 / points as f64 >= FUZZY_MIN_CLOSE_POINT_DENSITY
+        && bit_sum as f64 / points as f64 <= max_mean_bit_differences
+        && close_points as f64 / points as f64 >= min_close_point_density
 }
 
+#[cfg(test)]
 fn find_fuzzy_shared_intro(lhs: &[u32], rhs: &[u32]) -> Option<MatchedRange> {
+    find_fuzzy_shared_intro_candidates_with_thresholds(
+        lhs,
+        rhs,
+        FUZZY_MAX_MEAN_BIT_DIFFERENCES,
+        FUZZY_MIN_CLOSE_POINT_DENSITY,
+    )
+    .0
+    .into_iter()
+    .max_by(compare_intro_match_quality)
+}
+
+fn fuzzy_range_for_window_run(
+    lhs: &[u32],
+    rhs: &[u32],
+    shift: i32,
+    start: usize,
+    end: usize,
+) -> Option<MatchedRange> {
+    let max_points = (MAX_INTRO_SECONDS / SAMPLE_DURATION_SECONDS).floor() as usize;
+    let points = end.saturating_sub(start);
+    if points == 0 || points > max_points {
+        return None;
+    }
+    let lhs_offset = (-shift).max(0) as usize;
+    let rhs_offset = shift.max(0) as usize;
+    let (bit_sum, exact_points, close_points) = (start..end).fold(
+        (0u64, 0usize, 0usize),
+        |(bit_sum, exact_points, close_points), relative_index| {
+            let distance =
+                (lhs[lhs_offset + relative_index] ^ rhs[rhs_offset + relative_index]).count_ones();
+            (
+                bit_sum + u64::from(distance),
+                exact_points + usize::from(distance <= MAX_POINT_BIT_DIFFERENCES),
+                close_points + usize::from(distance <= FUZZY_CLOSE_POINT_BIT_DIFFERENCES),
+            )
+        },
+    );
+    Some(MatchedRange {
+        start: (lhs_offset + start) as f64 * SAMPLE_DURATION_SECONDS,
+        end: (lhs_offset + end) as f64 * SAMPLE_DURATION_SECONDS,
+        reference_start: (rhs_offset + start) as f64 * SAMPLE_DURATION_SECONDS,
+        reference_end: (rhs_offset + end) as f64 * SAMPLE_DURATION_SECONDS,
+        method: IntroMatchMethod::Fuzzy,
+        exact_density: exact_points as f64 / points as f64,
+        mean_bit_difference: bit_sum as f64 / points as f64,
+        close_point_density: close_points as f64 / points as f64,
+    })
+}
+
+fn find_fuzzy_shared_intro_candidates_with_thresholds(
+    lhs: &[u32],
+    rhs: &[u32],
+    max_mean_bit_differences: f64,
+    min_close_point_density: f64,
+) -> (Vec<MatchedRange>, bool) {
     let min_points = (MIN_INTRO_SECONDS / SAMPLE_DURATION_SECONDS).ceil() as usize;
     let max_points = (MAX_INTRO_SECONDS / SAMPLE_DURATION_SECONDS).floor() as usize;
     let min_context_points =
         (FUZZY_MIN_ALIGNED_CONTEXT_SECONDS / SAMPLE_DURATION_SECONDS).ceil() as usize;
     if lhs.len() < min_points || rhs.len() < min_points {
-        return None;
+        return (Vec::new(), false);
     }
 
     let min_shift = -(lhs.len().saturating_sub(min_points) as i32);
     let max_shift = rhs.len().saturating_sub(min_points) as i32;
-    let mut best: Option<(i32, usize, u32, usize)> = None;
+    let mut candidates = Vec::new();
+    let mut oversized = false;
 
     for shift in min_shift..=max_shift {
         let lhs_offset = (-shift).max(0) as usize;
@@ -1054,7 +1139,9 @@ fn find_fuzzy_shared_intro(lhs: &[u32], rhs: &[u32]) -> Option<MatchedRange> {
             close_points += usize::from(distance <= FUZZY_CLOSE_POINT_BIT_DIFFERENCES);
         }
 
-        for start in 0..=overlap - min_points {
+        let last_window_start = overlap - min_points;
+        let mut run_start = None;
+        for start in 0..=last_window_start {
             if start > 0 {
                 let removed = point_distance(start - 1);
                 bit_sum -= removed;
@@ -1063,76 +1150,39 @@ fn find_fuzzy_shared_intro(lhs: &[u32], rhs: &[u32]) -> Option<MatchedRange> {
                 bit_sum += added;
                 close_points += usize::from(added <= FUZZY_CLOSE_POINT_BIT_DIFFERENCES);
             }
-            if fuzzy_window_is_eligible(bit_sum, close_points, min_points)
-                && best.is_none_or(|(_, _, best_sum, best_close_points)| {
-                    bit_sum < best_sum || (bit_sum == best_sum && close_points > best_close_points)
-                })
+            let eligible = fuzzy_window_is_eligible(
+                bit_sum,
+                close_points,
+                min_points,
+                max_mean_bit_differences,
+                min_close_point_density,
+            );
+            if eligible {
+                run_start.get_or_insert(start);
+            } else if let Some(first_window_start) = run_start.take() {
+                let end = start - 1 + min_points;
+                if end - first_window_start > max_points {
+                    oversized = true;
+                } else if let Some(range) =
+                    fuzzy_range_for_window_run(lhs, rhs, shift, first_window_start, end)
+                {
+                    candidates.push(range)
+                }
+            }
+        }
+        if let Some(first_window_start) = run_start {
+            let end = last_window_start + min_points;
+            if end - first_window_start > max_points {
+                oversized = true;
+            } else if let Some(range) =
+                fuzzy_range_for_window_run(lhs, rhs, shift, first_window_start, end)
             {
-                best = Some((shift, start, bit_sum, close_points));
+                candidates.push(range)
             }
         }
     }
 
-    let (shift, best_start, _, _) = best?;
-    let lhs_offset = (-shift).max(0) as usize;
-    let rhs_offset = shift.max(0) as usize;
-    let overlap = lhs
-        .len()
-        .saturating_sub(lhs_offset)
-        .min(rhs.len().saturating_sub(rhs_offset));
-    let window_is_eligible = |window_start: usize| {
-        let (bit_sum, close_points) = (window_start..window_start + min_points).fold(
-            (0u32, 0usize),
-            |(bit_sum, close_points), relative_index| {
-                let distance = (lhs[lhs_offset + relative_index]
-                    ^ rhs[rhs_offset + relative_index])
-                    .count_ones();
-                (
-                    bit_sum + distance,
-                    close_points + usize::from(distance <= FUZZY_CLOSE_POINT_BIT_DIFFERENCES),
-                )
-            },
-        );
-        fuzzy_window_is_eligible(bit_sum, close_points, min_points)
-    };
-    let mut first_window_start = best_start;
-    while first_window_start > 0 && window_is_eligible(first_window_start - 1) {
-        first_window_start -= 1;
-    }
-    let mut last_window_start = best_start;
-    while last_window_start + min_points < overlap && window_is_eligible(last_window_start + 1) {
-        last_window_start += 1;
-    }
-    let start = first_window_start;
-    let end = last_window_start + min_points;
-    if end - start > max_points {
-        return None;
-    }
-
-    let points = end.saturating_sub(start);
-    let (bit_sum, exact_points, close_points) = (start..end).fold(
-        (0u64, 0usize, 0usize),
-        |(bit_sum, exact_points, close_points), relative_index| {
-            let distance =
-                (lhs[lhs_offset + relative_index] ^ rhs[rhs_offset + relative_index]).count_ones();
-            (
-                bit_sum + u64::from(distance),
-                exact_points + usize::from(distance <= MAX_POINT_BIT_DIFFERENCES),
-                close_points + usize::from(distance <= FUZZY_CLOSE_POINT_BIT_DIFFERENCES),
-            )
-        },
-    );
-
-    Some(MatchedRange {
-        start: (lhs_offset + start) as f64 * SAMPLE_DURATION_SECONDS,
-        end: (lhs_offset + end) as f64 * SAMPLE_DURATION_SECONDS,
-        reference_start: (rhs_offset + start) as f64 * SAMPLE_DURATION_SECONDS,
-        reference_end: (rhs_offset + end) as f64 * SAMPLE_DURATION_SECONDS,
-        method: IntroMatchMethod::Fuzzy,
-        exact_density: exact_points as f64 / points as f64,
-        mean_bit_difference: bit_sum as f64 / points as f64,
-        close_point_density: close_points as f64 / points as f64,
-    })
+    (candidates, oversized)
 }
 
 fn intro_match_is_eligible(range: &MatchedRange) -> bool {
@@ -1141,6 +1191,161 @@ fn intro_match_is_eligible(range: &MatchedRange) -> bool {
         IntroMatchMethod::Fuzzy => MIN_FUZZY_INTRO_SECONDS,
     };
     range.end - range.start >= minimum_duration
+        && (range.method == IntroMatchMethod::Exact
+            || (range.mean_bit_difference <= FUZZY_MAX_MEAN_BIT_DIFFERENCES
+                && range.close_point_density >= FUZZY_MIN_CLOSE_POINT_DENSITY))
+}
+
+fn intro_match_quality(range: &MatchedRange) -> f64 {
+    let minimum_duration = match range.method {
+        IntroMatchMethod::Exact => MIN_INTRO_SECONDS,
+        IntroMatchMethod::Fuzzy => MIN_FUZZY_INTRO_SECONDS,
+    };
+    let mean_difference_score = if range.mean_bit_difference <= f64::EPSILON {
+        f64::INFINITY
+    } else {
+        FUZZY_MAX_MEAN_BIT_DIFFERENCES / range.mean_bit_difference
+    };
+    ((range.end - range.start) / minimum_duration)
+        .min(mean_difference_score)
+        .min(range.close_point_density / FUZZY_MIN_CLOSE_POINT_DENSITY)
+}
+
+fn intro_match_score(range: &MatchedRange) -> f64 {
+    intro_match_quality(range).clamp(0.0, 1.0)
+}
+
+fn compare_intro_match_quality(left: &MatchedRange, right: &MatchedRange) -> std::cmp::Ordering {
+    intro_match_quality(left)
+        .partial_cmp(&intro_match_quality(right))
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| {
+            (left.end - left.start)
+                .partial_cmp(&(right.end - right.start))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn intro_match_touches_fingerprint_boundary(
+    range: &MatchedRange,
+    current_points: usize,
+    reference_points: usize,
+) -> bool {
+    let margin = INTRO_WINDOW_BOUNDARY_MARGIN_POINTS as f64 * SAMPLE_DURATION_SECONDS;
+    let current_end = current_points as f64 * SAMPLE_DURATION_SECONDS;
+    let reference_end = reference_points as f64 * SAMPLE_DURATION_SECONDS;
+    range.end >= current_end - margin || range.reference_end >= reference_end - margin
+}
+
+fn intro_matches_agree(left: &MatchedRange, right: &MatchedRange) -> bool {
+    let left_duration = left.end - left.start;
+    let right_duration = right.end - right.start;
+    (left.start - right.start).abs() <= INTRO_CONSENSUS_START_TOLERANCE_SECONDS
+        && (left_duration - right_duration).abs() <= INTRO_CONSENSUS_DURATION_TOLERANCE_SECONDS
+}
+
+fn intro_match_support_count(
+    evaluated: &[EvaluatedIntroMatch],
+    candidate: &EvaluatedIntroMatch,
+) -> usize {
+    evaluated
+        .iter()
+        .filter(|entry| entry.accepted && intro_matches_agree(&entry.range, &candidate.range))
+        .map(|entry| entry.reference_episode)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn compare_evaluated_intro_matches(
+    evaluated: &[EvaluatedIntroMatch],
+    left: &EvaluatedIntroMatch,
+    right: &EvaluatedIntroMatch,
+) -> std::cmp::Ordering {
+    intro_match_support_count(evaluated, left)
+        .cmp(&intro_match_support_count(evaluated, right))
+        .then_with(|| left.source_exact.cmp(&right.source_exact))
+        .then_with(|| compare_intro_match_quality(&left.range, &right.range))
+}
+
+fn consider_intro_candidate(
+    accepted: &mut Option<MatchedRange>,
+    feedback: &mut Option<MatchedRange>,
+    range: MatchedRange,
+    allow_automatic: bool,
+) {
+    let target = if allow_automatic && intro_match_is_eligible(&range) {
+        accepted
+    } else if range.end - range.start >= MIN_FEEDBACK_INTRO_SECONDS {
+        feedback
+    } else {
+        return;
+    };
+    if target
+        .as_ref()
+        .is_none_or(|current| compare_intro_match_quality(&range, current).is_gt())
+    {
+        *target = Some(range);
+    }
+}
+
+fn find_shared_intro_candidates(lhs: &[u32], rhs: &[u32]) -> Vec<MatchedRange> {
+    let mut accepted = None;
+    let mut feedback = None;
+
+    for shift in candidate_shifts(lhs, rhs) {
+        for range in
+            ranges_for_shift_with_limits(lhs, rhs, shift, MIN_INTRO_SECONDS, MAX_INTRO_SECONDS)
+        {
+            consider_intro_candidate(&mut accepted, &mut feedback, range, true);
+        }
+    }
+    let (strict_fuzzy_candidates, strict_oversized) =
+        find_fuzzy_shared_intro_candidates_with_thresholds(
+            lhs,
+            rhs,
+            FUZZY_MAX_MEAN_BIT_DIFFERENCES,
+            FUZZY_MIN_CLOSE_POINT_DENSITY,
+        );
+    for range in strict_fuzzy_candidates {
+        if !strict_oversized || intro_match_is_eligible(&range) {
+            consider_intro_candidate(&mut accepted, &mut feedback, range, true);
+        }
+    }
+    if accepted.is_none() && !strict_oversized {
+        let (relaxed_fuzzy_candidates, relaxed_oversized) =
+            find_fuzzy_shared_intro_candidates_with_thresholds(
+                lhs,
+                rhs,
+                FUZZY_NEAR_MISS_MAX_MEAN_BIT_DIFFERENCES,
+                FUZZY_NEAR_MISS_MIN_CLOSE_POINT_DENSITY,
+            );
+        if !relaxed_oversized {
+            for range in relaxed_fuzzy_candidates {
+                // Relaxed thresholds are exclusively for manual confirmation.
+                // A range must also be found by the strict pass to be automatic.
+                if !intro_match_is_eligible(&range) {
+                    consider_intro_candidate(&mut accepted, &mut feedback, range, false);
+                }
+            }
+        }
+    }
+
+    accepted.into_iter().chain(feedback).collect()
+}
+
+#[cfg(test)]
+fn find_shared_intro(lhs: &[u32], rhs: &[u32]) -> Option<MatchedRange> {
+    find_shared_intro_candidates(lhs, rhs).into_iter().next()
+}
+
+fn intro_detection_status(reference_count: usize, has_feedback_candidate: bool) -> &'static str {
+    if has_feedback_candidate {
+        "near-miss"
+    } else if reference_count == 0 {
+        "learned"
+    } else {
+        "no-match"
+    }
 }
 
 fn find_shared_outro_with_minimum(
@@ -1197,6 +1402,11 @@ fn load_season_cache(path: &Path) -> SeasonFingerprintCache {
     };
     match serde_json::from_slice::<SeasonFingerprintCache>(&bytes) {
         Ok(cache) if cache.version == FINGERPRINT_CACHE_VERSION => cache,
+        Ok(mut cache) if cache.version == PREVIOUS_FINGERPRINT_CACHE_VERSION => {
+            cache.version = FINGERPRINT_CACHE_VERSION;
+            cache.episodes.retain(|entry| entry.analysis_part == 1);
+            cache
+        }
         Ok(_) => SeasonFingerprintCache::default(),
         Err(error) => {
             warn!("[Segment Detection][Local] Ignoring invalid fingerprint cache: {error}");
@@ -1800,82 +2010,106 @@ pub async fn detect_intro_skipper_segment(
                 entry.episode.abs_diff(episode),
             )
         });
+        let current_point_count = current.len();
         let evaluated = latest_references
             .iter()
-            .filter_map(|reference| {
-                let range = find_shared_intro(&current, &reference.points)?;
-                let match_duration_seconds = range.end - range.start;
-                let minimum_duration_seconds = match range.method {
-                    IntroMatchMethod::Exact => MIN_INTRO_SECONDS,
-                    IntroMatchMethod::Fuzzy => MIN_FUZZY_INTRO_SECONDS,
-                };
-                let accepted = intro_match_is_eligible(&range);
-                info!(
-                    event = "segment_detection.local.intro_candidate_evaluated",
-                    subsystem = "segment_detection.local",
-                    status = if accepted { "accepted" } else { "rejected" },
-                    season,
-                    episode,
-                    analysis_part,
-                    reference_episode = reference.episode,
-                    reference_audio_exact = reference.audio_identity == selected_audio.identity,
-                    reference_source_exact = reference.source_identity == source_identity,
-                    match_method = range.method.as_str(),
-                    match_duration_seconds,
-                    minimum_duration_seconds,
-                    exact_density = range.exact_density,
-                    mean_bit_difference = range.mean_bit_difference,
-                    close_point_density = range.close_point_density,
-                    current_start_seconds = window_start_seconds + range.start,
-                    reference_start_seconds =
-                        reference.window_start_seconds + range.reference_start,
-                    "[Segment Detection][Local] Intro fingerprint candidate evaluated"
-                );
-                Some((
-                    reference.source_identity == source_identity,
-                    reference.episode,
-                    reference.window_start_seconds,
-                    range,
-                    accepted,
-                ))
+            .flat_map(|reference| {
+                let reference_audio_exact = reference.audio_identity == selected_audio.identity;
+                let reference_source_exact = reference.source_identity == source_identity;
+                let reference_point_count = reference.points.len();
+                find_shared_intro_candidates(&current, &reference.points)
+                    .into_iter()
+                    .map(move |range| {
+                        let match_duration_seconds = range.end - range.start;
+                        let minimum_duration_seconds = match range.method {
+                            IntroMatchMethod::Exact => MIN_INTRO_SECONDS,
+                            IntroMatchMethod::Fuzzy => MIN_FUZZY_INTRO_SECONDS,
+                        };
+                        let candidate_score = intro_match_score(&range);
+                        let candidate_quality = intro_match_quality(&range);
+                        let boundary_truncated = intro_match_touches_fingerprint_boundary(
+                            &range,
+                            current_point_count,
+                            reference_point_count,
+                        );
+                        let accepted = intro_match_is_eligible(&range) && !boundary_truncated;
+                        info!(
+                            event = "segment_detection.local.intro_candidate_evaluated",
+                            subsystem = "segment_detection.local",
+                            status = if boundary_truncated {
+                                "truncated"
+                            } else if accepted {
+                                "accepted"
+                            } else {
+                                "rejected"
+                            },
+                            season,
+                            episode,
+                            analysis_part,
+                            reference_episode = reference.episode,
+                            reference_audio_exact,
+                            reference_source_exact,
+                            match_method = range.method.as_str(),
+                            match_duration_seconds,
+                            minimum_duration_seconds,
+                            candidate_score,
+                            candidate_quality,
+                            boundary_truncated,
+                            exact_density = range.exact_density,
+                            mean_bit_difference = range.mean_bit_difference,
+                            close_point_density = range.close_point_density,
+                            current_start_seconds = window_start_seconds + range.start,
+                            reference_start_seconds =
+                                reference.window_start_seconds + range.reference_start,
+                            "[Segment Detection][Local] Intro fingerprint candidate evaluated"
+                        );
+                        EvaluatedIntroMatch {
+                            source_exact: reference_source_exact,
+                            reference_episode: reference.episode,
+                            reference_window_start: reference.window_start_seconds,
+                            range,
+                            accepted,
+                            boundary_truncated,
+                        }
+                    })
             })
             .collect::<Vec<_>>();
         let matched = evaluated
             .iter()
             .copied()
-            .filter(|entry| entry.4)
-            .max_by(|left, right| {
-                left.0.cmp(&right.0).then_with(|| {
-                    (left.3.end - left.3.start)
-                        .partial_cmp(&(right.3.end - right.3.start))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            })
-            .map(|entry| (entry.0, entry.1, entry.2, entry.3));
+            .filter(|entry| entry.accepted)
+            .max_by(|left, right| compare_evaluated_intro_matches(&evaluated, left, right))
+            .map(|entry| {
+                let supporting_reference_count = intro_match_support_count(&evaluated, &entry);
+                (entry, supporting_reference_count)
+            });
         let feedback_candidate = evaluated
             .iter()
             .copied()
-            .filter(|entry| !entry.4 && entry.3.end - entry.3.start >= MIN_FEEDBACK_INTRO_SECONDS)
-            .max_by(|left, right| {
-                (left.3.end - left.3.start)
-                    .partial_cmp(&(right.3.end - right.3.start))
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            .filter(|entry| {
+                !entry.accepted
+                    && !entry.boundary_truncated
+                    && entry.range.end - entry.range.start >= MIN_FEEDBACK_INTRO_SECONDS
             })
+            .max_by(|left, right| compare_intro_match_quality(&left.range, &right.range))
             .and_then(|entry| {
-                let minimum = match entry.3.method {
-                    IntroMatchMethod::Exact => MIN_INTRO_SECONDS,
-                    IntroMatchMethod::Fuzzy => MIN_FUZZY_INTRO_SECONDS,
-                };
                 feedback_candidate_from_range(
                     "intro",
-                    window_start_seconds + entry.3.start,
-                    window_start_seconds + entry.3.end,
+                    window_start_seconds + entry.range.start,
+                    window_start_seconds + entry.range.end,
                     "intro-skipper",
-                    match entry.3.method {
+                    match entry.range.method {
                         IntroMatchMethod::Exact => "short-exact-fingerprint-match",
+                        IntroMatchMethod::Fuzzy
+                            if entry.range.mean_bit_difference > FUZZY_MAX_MEAN_BIT_DIFFERENCES
+                                || entry.range.close_point_density
+                                    < FUZZY_MIN_CLOSE_POINT_DENSITY =>
+                        {
+                            "fuzzy-fingerprint-near-match"
+                        }
                         IntroMatchMethod::Fuzzy => "short-fuzzy-fingerprint-match",
                     },
-                    Some((entry.3.end - entry.3.start) / minimum),
+                    Some(intro_match_score(&entry.range)),
                 )
             });
         if let Err(error) = store_episode_fingerprint(
@@ -1898,12 +2132,8 @@ pub async fn detect_intro_skipper_segment(
             latest_references.len(),
         )
     };
-    let Some((_, reference_episode, reference_window_start, range)) = matched else {
-        let status = if reference_count == 0 {
-            "learned"
-        } else {
-            "no-match"
-        };
+    let Some((matched, supporting_reference_count)) = matched else {
+        let status = intro_detection_status(reference_count, feedback_candidate.is_some());
         info!(
             "[Segment Detection][Local] Rolling fingerprint complete: status={}, cached_episodes={}",
             status,
@@ -1921,6 +2151,9 @@ pub async fn detect_intro_skipper_segment(
         });
     };
 
+    let reference_episode = matched.reference_episode;
+    let reference_window_start = matched.reference_window_start;
+    let range = matched.range;
     let absolute_start = window_start_seconds + range.start;
     let absolute_end = window_start_seconds + range.end;
     let absolute_reference_end = reference_window_start + range.reference_end;
@@ -1933,6 +2166,7 @@ pub async fn detect_intro_skipper_segment(
         episode,
         analysis_part,
         reference_episode,
+        supporting_reference_count,
         match_method = range.method.as_str(),
         match_duration_seconds = range.end - range.start,
         exact_density = range.exact_density,
@@ -2446,12 +2680,207 @@ mod tests {
     }
 
     #[test]
+    fn measures_borderline_fuzzy_quality_for_manual_confirmation() {
+        let shared = varied_points(140, 182);
+        let near_shared = shared
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                point
+                    ^ if index % 4 == 0 {
+                        0x0000_7fff
+                    } else {
+                        0x0000_0fff
+                    }
+            })
+            .collect::<Vec<_>>();
+        let mut lhs = varied_points(1_000, 190);
+        lhs.extend_from_slice(&shared);
+        lhs.extend(varied_points(1_000, 191));
+        let mut rhs = varied_points(900, 192);
+        rhs.extend_from_slice(&near_shared);
+        rhs.extend(varied_points(1_100, 193));
+
+        assert!(find_fuzzy_shared_intro(&lhs, &rhs).is_none());
+        let matched = find_shared_intro(&lhs, &rhs)
+            .expect("borderline fuzzy quality should remain available as a near miss");
+        assert_eq!(matched.method, IntroMatchMethod::Fuzzy);
+        assert!(matched.mean_bit_difference > FUZZY_MAX_MEAN_BIT_DIFFERENCES);
+        assert!(matched.end - matched.start >= MIN_FEEDBACK_INTRO_SECONDS);
+        assert!(!intro_match_is_eligible(&matched));
+        assert_eq!(intro_detection_status(1, true), "near-miss");
+        assert_eq!(intro_detection_status(1, false), "no-match");
+    }
+
+    #[test]
+    fn ranks_intro_candidates_by_composite_quality_before_duration() {
+        let obvious_match = MatchedRange {
+            start: 270.0,
+            end: 294.0,
+            reference_start: 30.0,
+            reference_end: 54.0,
+            method: IntroMatchMethod::Fuzzy,
+            exact_density: 0.4,
+            mean_bit_difference: 8.0,
+            close_point_density: 0.9,
+        };
+        let longer_near_miss = MatchedRange {
+            start: 90.0,
+            end: 115.0,
+            reference_start: 60.0,
+            reference_end: 85.0,
+            method: IntroMatchMethod::Fuzzy,
+            exact_density: 0.1,
+            mean_bit_difference: 14.0,
+            close_point_density: 0.65,
+        };
+
+        assert!(
+            obvious_match.end - obvious_match.start < longer_near_miss.end - longer_near_miss.start
+        );
+        assert!(intro_match_score(&obvious_match) > intro_match_score(&longer_near_miss));
+        assert_eq!(
+            compare_intro_match_quality(&obvious_match, &longer_near_miss),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn compares_all_fuzzy_regions_before_selecting_a_part_winner() {
+        let short_distractor = varied_points(140, 210);
+        let full_intro = varied_points(280, 211);
+        let mut lhs = varied_points(300, 212);
+        lhs.extend_from_slice(&short_distractor);
+        lhs.extend(varied_points(200, 213));
+        let expected_intro_start = lhs.len() as f64 * SAMPLE_DURATION_SECONDS;
+        lhs.extend_from_slice(&full_intro);
+        lhs.extend(varied_points(300, 214));
+
+        let mut rhs = varied_points(450, 215);
+        rhs.extend(short_distractor.iter().map(|point| point ^ 0x0000_0001));
+        rhs.extend(varied_points(160, 216));
+        rhs.extend(full_intro.iter().map(|point| point ^ 0x0000_07ff));
+        rhs.extend(varied_points(310, 217));
+
+        assert!(candidate_shifts(&lhs, &rhs).is_empty());
+        let candidates = find_shared_intro_candidates(&lhs, &rhs);
+        assert!(candidates
+            .iter()
+            .any(|range| !intro_match_is_eligible(range)));
+        assert!(candidates.iter().any(intro_match_is_eligible));
+
+        let selected = find_shared_intro(&lhs, &rhs).expect("full intro should win the part");
+        assert!(intro_match_is_eligible(&selected));
+        assert!(
+            (selected.start - expected_intro_start).abs() <= 5.0,
+            "selected={selected:?}, candidates={candidates:?}"
+        );
+        assert!(selected.end - selected.start >= MIN_FUZZY_INTRO_SECONDS);
+    }
+
+    #[test]
+    fn ranks_accepted_matches_with_uncapped_quality() {
+        let clean_match = MatchedRange {
+            start: 270.0,
+            end: 300.0,
+            reference_start: 30.0,
+            reference_end: 60.0,
+            method: IntroMatchMethod::Fuzzy,
+            exact_density: 0.7,
+            mean_bit_difference: 6.0,
+            close_point_density: 0.95,
+        };
+        let longer_borderline_match = MatchedRange {
+            start: 90.0,
+            end: 125.0,
+            reference_start: 60.0,
+            reference_end: 95.0,
+            method: IntroMatchMethod::Fuzzy,
+            exact_density: 0.65,
+            mean_bit_difference: 11.8,
+            close_point_density: 0.76,
+        };
+
+        assert!(intro_match_is_eligible(&clean_match));
+        assert!(intro_match_is_eligible(&longer_borderline_match));
+        assert_eq!(intro_match_score(&clean_match), 1.0);
+        assert_eq!(intro_match_score(&longer_borderline_match), 1.0);
+        assert_eq!(
+            compare_intro_match_quality(&clean_match, &longer_borderline_match),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn rejects_matches_clipped_by_either_fingerprint_boundary() {
+        let points = 3_371;
+        let fingerprint_end = points as f64 * SAMPLE_DURATION_SECONDS;
+        let clipped_reference = MatchedRange {
+            start: 160.0,
+            end: 193.0,
+            reference_start: fingerprint_end - 33.0,
+            reference_end: fingerprint_end,
+            method: IntroMatchMethod::Exact,
+            exact_density: 0.99,
+            mean_bit_difference: 1.7,
+            close_point_density: 1.0,
+        };
+        let complete = MatchedRange {
+            reference_start: 300.0,
+            reference_end: 333.0,
+            ..clipped_reference
+        };
+
+        assert!(intro_match_touches_fingerprint_boundary(
+            &clipped_reference,
+            points,
+            points
+        ));
+        assert!(!intro_match_touches_fingerprint_boundary(
+            &complete, points, points
+        ));
+    }
+
+    #[test]
+    fn prefers_multi_episode_agreement_without_requiring_episode_one() {
+        let build =
+            |reference_episode: u32, start: f64, duration: f64, quality: f64| EvaluatedIntroMatch {
+                source_exact: false,
+                reference_episode,
+                reference_window_start: 0.0,
+                range: MatchedRange {
+                    start,
+                    end: start + duration,
+                    reference_start: 30.0,
+                    reference_end: 30.0 + duration,
+                    method: IntroMatchMethod::Fuzzy,
+                    exact_density: 0.7,
+                    mean_bit_difference: 12.0 / quality,
+                    close_point_density: 0.9,
+                },
+                accepted: true,
+                boundary_truncated: false,
+            };
+        let lone_episode_one = build(1, 100.0, 35.0, 1.2);
+        let episode_two = build(2, 200.0, 32.0, 1.05);
+        let episode_three = build(3, 202.0, 34.0, 1.04);
+        let evaluated = vec![lone_episode_one, episode_two, episode_three];
+
+        assert_eq!(intro_match_support_count(&evaluated, &lone_episode_one), 1);
+        assert_eq!(intro_match_support_count(&evaluated, &episode_two), 2);
+        assert_eq!(
+            compare_evaluated_intro_matches(&evaluated, &episode_two, &lone_episode_one),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
     fn outro_analysis_window_scales_without_changing_intro_limits() {
         assert_eq!(intro_analysis_seconds(20.0 * 60.0), 300);
         assert_eq!(intro_analysis_seconds(60.0 * 60.0), 420);
         assert_eq!(intro_analysis_window(60.0 * 60.0, 1), Some((0.0, 420)));
-        assert_eq!(intro_analysis_window(60.0 * 60.0, 2), Some((360.0, 420)));
-        assert_eq!(intro_analysis_window(20.0 * 60.0, 2), Some((240.0, 300)));
+        assert_eq!(intro_analysis_window(60.0 * 60.0, 2), Some((360.0, 540)));
+        assert_eq!(intro_analysis_window(20.0 * 60.0, 2), Some((240.0, 420)));
         assert_eq!(intro_analysis_window(60.0 * 60.0, 3), None);
         assert_eq!(outro_analysis_seconds(8.0 * 60.0), 120);
         assert_eq!(outro_analysis_seconds(22.0 * 60.0), 330);
@@ -2464,7 +2893,8 @@ mod tests {
         lhs.extend_from_slice(&shared);
         let mut rhs = varied_points(240, 32);
         rhs.extend_from_slice(&shared);
-        assert!(find_shared_intro(&lhs, &rhs).is_none());
+        let oversized_intro = find_shared_intro(&lhs, &rhs);
+        assert!(oversized_intro.is_none(), "selected={oversized_intro:?}");
         let outro = find_shared_outro(&lhs, &rhs, 720.0).expect("long outro should match");
         assert!(outro.end - outro.start > MAX_INTRO_SECONDS);
     }
@@ -2687,6 +3117,15 @@ mod tests {
                 .count(),
             1
         );
+        cache.version = PREVIOUS_FINGERPRINT_CACHE_VERSION;
+        fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        let migrated = load_season_cache(&path);
+        assert_eq!(migrated.version, FINGERPRINT_CACHE_VERSION);
+        assert_eq!(migrated.episodes.len(), 3);
+        assert!(migrated
+            .episodes
+            .iter()
+            .all(|entry| entry.analysis_part == 1));
         let _ = fs::remove_dir_all(root);
     }
 

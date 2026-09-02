@@ -395,6 +395,7 @@ export interface IntroSkipperDetectionResult {
     | 'waiting-for-tail-cache'
     | 'learned'
     | 'no-match'
+    | 'near-miss'
     | 'detected';
   reference_episode: number | null;
   reference_end_sec: number | null;

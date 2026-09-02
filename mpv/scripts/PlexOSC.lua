@@ -710,7 +710,6 @@ end
 local segment_feedback_yes_binding = 'streamee-segment-feedback-yes'
 local segment_feedback_no_binding = 'streamee-segment-feedback-no'
 local segment_feedback_dismiss_binding = 'streamee-segment-feedback-dismiss'
-local segment_feedback_test_request_id = math.floor(os.time() * 1000)
 
 local function remove_segment_feedback_bindings()
     mp.remove_key_binding(segment_feedback_yes_binding)
@@ -788,22 +787,6 @@ local function show_segment_feedback_prompt(request_id, kind, source, mode, coun
     state.segment_feedback_timer:resume()
     show_osc()
     request_init()
-end
-
-local function show_segment_feedback_test_prompt()
-    if state.segment_feedback_prompt then return end
-    segment_feedback_test_request_id = segment_feedback_test_request_id + 1
-    msg.info(
-        '[Segment Feedback] Keyboard test prompt requested: request_id=' ..
-        segment_feedback_test_request_id
-    )
-    show_segment_feedback_prompt(
-        segment_feedback_test_request_id,
-        'intro',
-        'Keyboard test',
-        'manual',
-        4
-    )
 end
 
 --
@@ -3445,11 +3428,6 @@ mp.register_script_message('streamee-subtitle-lines', open_subtitle_lines)
 mp.register_script_message(
     'streamee-segment-feedback-prompt',
     show_segment_feedback_prompt
-)
-mp.add_key_binding(
-    't',
-    'streamee-segment-feedback-test',
-    show_segment_feedback_test_prompt
 )
 mp.register_script_message('osc-chapterlist', function(dur)
     show_message(get_chapterlist(), dur)

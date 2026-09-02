@@ -5,15 +5,16 @@ import {
   buildSegmentFeedbackKey,
   evaluateSegmentFeedbackShadowMatch,
   isSegmentFeedbackPatternSuspended,
+  mergeIntroDetectionCandidate,
   type SegmentFeedbackContext,
   type StoredSegmentFeedback,
 } from '../src/renderer/services/segment-feedback.ts';
-import type { SegmentFeedbackCandidate } from '../src/renderer/services/tauri.ts';
+import type { IntroSkipperDetectionResult, SegmentFeedbackCandidate } from '../src/renderer/services/tauri.ts';
 
-const introCandidate = (start: number): SegmentFeedbackCandidate => ({
+const introCandidate = (start: number, duration = 24): SegmentFeedbackCandidate => ({
   kind: 'intro',
   start_sec: start,
-  end_sec: start + 24,
+  end_sec: start + duration,
   source: 'intro-skipper',
   reason: 'short-fuzzy-fingerprint-match',
   score: 0.82,
@@ -55,10 +56,81 @@ const record = (
   };
 };
 
+const detection = (
+  status: IntroSkipperDetectionResult['status'],
+  candidate: SegmentFeedbackCandidate | null,
+): IntroSkipperDetectionResult => ({
+  segment: null,
+  candidate,
+  status,
+  reference_episode: null,
+  reference_end_sec: null,
+  cached_episode_count: 3,
+  buffered_seconds: 420,
+  required_buffer_seconds: 420,
+});
+
+test('Part 1 and Part 2 near misses retain only the highest-scoring candidate', () => {
+  const partOneCandidate = { ...introCandidate(270), score: 0.91 };
+  const weakerPartTwoCandidate = { ...introCandidate(700, 30), score: 0.84 };
+  const partOne = mergeIntroDetectionCandidate(
+    null,
+    detection('near-miss', partOneCandidate),
+  );
+  const partTwo = mergeIntroDetectionCandidate(
+    partOne.bestCandidate,
+    detection('near-miss', weakerPartTwoCandidate),
+  );
+  assert.deepEqual(partTwo.bestCandidate, partOneCandidate);
+  assert.deepEqual(partTwo.detection.candidate, partOneCandidate);
+
+  const strongerPartTwoCandidate = { ...introCandidate(710), score: 0.96 };
+  const strongerPartTwo = mergeIntroDetectionCandidate(
+    partOne.bestCandidate,
+    detection('near-miss', strongerPartTwoCandidate),
+  );
+  assert.deepEqual(strongerPartTwo.bestCandidate, strongerPartTwoCandidate);
+  assert.deepEqual(strongerPartTwo.detection.candidate, strongerPartTwoCandidate);
+});
+
+test('Part 1 near miss survives Part 2 waiting and no-match without replacing a detection', () => {
+  const partOneCandidate = { ...introCandidate(270), score: 0.91 };
+  const waiting = mergeIntroDetectionCandidate(
+    partOneCandidate,
+    detection('waiting-for-local-cache', null),
+  );
+  assert.deepEqual(waiting.bestCandidate, partOneCandidate);
+  assert.equal(waiting.detection.status, 'waiting-for-local-cache');
+  assert.equal(waiting.detection.candidate, null);
+
+  const noMatch = mergeIntroDetectionCandidate(
+    waiting.bestCandidate,
+    detection('no-match', null),
+  );
+  assert.equal(noMatch.detection.status, 'near-miss');
+  assert.deepEqual(noMatch.detection.candidate, partOneCandidate);
+
+  const detected = mergeIntroDetectionCandidate(partOneCandidate, {
+    ...detection('detected', null),
+    segment: {
+      start_ms: 270_000,
+      end_ms: 294_000,
+      start_sec: 270,
+      end_sec: 294,
+      confidence: null,
+      submission_count: null,
+      source: 'intro-skipper',
+    },
+  });
+  assert.equal(detected.detection.status, 'detected');
+  assert.equal(detected.detection.candidate, null);
+  assert.ok(detected.detection.segment);
+});
+
 test('shadow promotion requires matching Yes confirmations from two distinct episodes', () => {
-  const candidate = introCandidate(41);
+  const candidate = introCandidate(400);
   const oneEpisode = evaluateSegmentFeedbackShadowMatch(
-    [record(1, introCandidate(40)), record(1, introCandidate(41))],
+    [record(1, introCandidate(40)), record(1, introCandidate(240))],
     context(3),
     candidate,
   );
@@ -66,20 +138,22 @@ test('shadow promotion requires matching Yes confirmations from two distinct epi
   assert.equal(oneEpisode.episodeCount, 1);
 
   const twoEpisodes = evaluateSegmentFeedbackShadowMatch(
-    [record(1, introCandidate(40)), record(2, introCandidate(42))],
+    [record(1, introCandidate(40)), record(2, introCandidate(240))],
     context(3),
     candidate,
   );
   assert.equal(twoEpisodes.status, 'shadow-promoted');
   assert.equal(twoEpisodes.episodeCount, 2);
-  assert.equal(twoEpisodes.learnedPositionSeconds, 41);
+  assert.equal(twoEpisodes.metric, 'intro-duration');
+  assert.equal(twoEpisodes.learnedValueSeconds, 24);
+  assert.equal(twoEpisodes.candidateValueSeconds, 24);
 });
 
-test('confirmations must agree with each other, not only straddle the current candidate', () => {
+test('intro confirmations must agree on duration even when each is close to the current candidate', () => {
   const result = evaluateSegmentFeedbackShadowMatch(
-    [record(1, introCandidate(38)), record(2, introCandidate(44))],
+    [record(1, introCandidate(38, 20)), record(2, introCandidate(244, 28))],
     context(3),
-    introCandidate(41),
+    introCandidate(400, 24),
   );
   assert.equal(result.status, 'insufficient');
   assert.equal(result.episodeCount, 1);
@@ -127,7 +201,8 @@ test('outros compare their lead time from EOF across different episode durations
   );
   assert.equal(result.status, 'shadow-promoted');
   assert.equal(result.episodeCount, 2);
-  assert.equal(result.learnedPositionSeconds, 44.5);
+  assert.equal(result.metric, 'outro-lead');
+  assert.equal(result.learnedValueSeconds, 44.5);
   assert.equal(result.toleranceSeconds, 4);
 });
 

@@ -87,7 +87,7 @@ export function validateIntroDbSegment(
     ? 4
     : 5;
   const placementIsValid = type === 'intro' && segment.source === 'intro-skipper'
-    ? segmentDuration >= 15 && segmentDuration <= 120 && segment.start_sec <= Math.min(13 * 60, duration * 0.5)
+    ? segmentDuration >= 15 && segmentDuration <= 120 && segment.start_sec <= Math.min(15 * 60, duration * 0.5)
     : type === 'outro' && segment.source === 'intro-skipper-outro'
       ? segmentDuration >= 10
         && segmentDuration <= 12 * 60 + 2

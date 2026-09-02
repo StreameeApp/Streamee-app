@@ -20,6 +20,17 @@ test('soft segment rejections remain separate from accepted segments', () => {
   assert.match(tauri, /candidate: SegmentFeedbackCandidate \| null/);
 });
 
+test('intro near misses are scored across references and both analysis parts', () => {
+  assert.match(detector, /candidate_score = intro_match_score\(&range\)/);
+  assert.match(detector, /compare_evaluated_intro_matches\(&evaluated, left, right\)/);
+  assert.match(detector, /intro_match_touches_fingerprint_boundary/);
+  assert.match(detector, /supporting_reference_count/);
+  assert.match(player, /bestCandidate\?: SegmentFeedbackCandidate/);
+  assert.match(player, /partOneResult\.status !== 'near-miss'/);
+  assert.match(player, /const partTwoResult = await window\.electronAPI\.introDb\.detectLocalIntro/);
+  assert.match(player, /mergeIntroDetectionCandidate/);
+});
+
 test('segment feedback prompt is interactive and uses a durable MPV response property', () => {
   assert.match(osc, /Is this the intro\?/);
   assert.match(osc, /Does the outro start here\?/);
@@ -49,18 +60,6 @@ test('active feedback prompts remain visible until their own terminal response',
   );
   assert.match(osc, /automatic and 'countdown-completed' or 'timeout'/);
   assert.match(osc, /respond_to_segment_feedback\('dismissed', 'replaced'\)/);
-});
-
-test('T opens a manual keyboard-test prompt without replacing a real prompt', () => {
-  assert.match(
-    osc,
-    /local function show_segment_feedback_test_prompt\(\)[\s\S]{0,120}if state\.segment_feedback_prompt then return end/,
-  );
-  assert.match(osc, /'intro',[\s\S]{0,80}'Keyboard test',[\s\S]{0,80}'manual'/);
-  assert.match(
-    osc,
-    /mp\.add_key_binding\([\s\S]{0,60}'t',[\s\S]{0,100}'streamee-segment-feedback-test'/,
-  );
 });
 
 test('feedback prompting is bounded and does not treat timeouts as negative feedback', () => {

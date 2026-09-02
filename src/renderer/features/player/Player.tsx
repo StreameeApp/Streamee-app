@@ -42,6 +42,7 @@ import {
   evaluateSegmentFeedbackShadowMatch,
   hasStoredSegmentFeedback,
   isSegmentFeedbackPatternSuspended,
+  mergeIntroDetectionCandidate,
   readSegmentFeedbackPatternStates,
   readStoredSegmentFeedback,
   resumeSegmentFeedbackPattern,
@@ -1672,6 +1673,7 @@ const Player: React.FC = () => {
       failureRetries: number;
       generation: number;
       analysisPart?: 1 | 2;
+      bestCandidate?: SegmentFeedbackCandidate;
     };
     type SegmentDetectionSnapshot = {
       filename: string;
@@ -2804,8 +2806,9 @@ const Player: React.FC = () => {
             kind: candidate.kind,
             provider: candidate.source,
             reason: candidate.reason,
-            position_seconds: shadowMatch.positionSeconds,
-            learned_position_seconds: shadowMatch.learnedPositionSeconds,
+            learning_metric: shadowMatch.metric,
+            candidate_value_seconds: shadowMatch.candidateValueSeconds,
+            learned_value_seconds: shadowMatch.learnedValueSeconds,
             tolerance_seconds: shadowMatch.toleranceSeconds,
             supporting_episode_count: shadowMatch.episodeCount,
             promotion_status: shadowMatch.status,
@@ -3021,7 +3024,9 @@ const Player: React.FC = () => {
             episode: active.context.episode,
             kind: candidate.kind,
             provider: candidate.source,
-            learned_position_seconds: nextShadowMatch.learnedPositionSeconds,
+            learning_metric: nextShadowMatch.metric,
+            candidate_value_seconds: nextShadowMatch.candidateValueSeconds,
+            learned_value_seconds: nextShadowMatch.learnedValueSeconds,
             tolerance_seconds: nextShadowMatch.toleranceSeconds,
             supporting_episode_count: nextShadowMatch.episodeCount,
             promotion_status: nextShadowMatch.status,
@@ -3317,21 +3322,37 @@ const Player: React.FC = () => {
             lookupState.analysisPart ?? 1,
           )
             .then(async (result) => {
+              const mergeBestCandidate = (
+                candidateResult: IntroSkipperDetectionResult,
+              ): IntroSkipperDetectionResult => {
+                const merged = mergeIntroDetectionCandidate(
+                  lookupState.bestCandidate ?? null,
+                  candidateResult,
+                );
+                lookupState.bestCandidate = merged.bestCandidate ?? undefined;
+                return merged.detection;
+              };
+
+              const partOneResult = mergeBestCandidate(result);
               if (
                 lookupState.analysisPart !== 1
-                || (result.status !== 'learned' && result.status !== 'no-match')
+                || (
+                  partOneResult.status !== 'learned'
+                  && partOneResult.status !== 'no-match'
+                  && partOneResult.status !== 'near-miss'
+                )
                 || disposed
                 || lookupGeneration !== introSkipperGeneration
                 || introSkipperLookups.get(key) !== lookupState
               ) {
-                return result;
+                return partOneResult;
               }
               lookupState.analysisPart = 2;
               console.debug('[Segment Detection][Local] Rolling fingerprint Part 2 started', {
                 season: episode.season,
                 episode: episode.episode,
               });
-              return window.electronAPI.introDb.detectLocalIntro(
+              const partTwoResult = await window.electronAPI.introDb.detectLocalIntro(
                 seriesKey,
                 sourceIdentity,
                 episode.season,
@@ -3340,6 +3361,7 @@ const Player: React.FC = () => {
                 duration,
                 2,
               );
+              return mergeBestCandidate(partTwoResult);
             })
             .then((result) => {
               if (result.candidate?.kind === 'intro') {
@@ -3396,6 +3418,14 @@ const Player: React.FC = () => {
                 part: lookupState.analysisPart ?? 1,
                 segment: result.segment
                   ? { start: result.segment.start_sec, end: result.segment.end_sec }
+                  : null,
+                candidate: result.candidate
+                  ? {
+                    start: result.candidate.start_sec,
+                    end: result.candidate.end_sec,
+                    score: result.candidate.score,
+                    reason: result.candidate.reason,
+                  }
                   : null,
               });
               return result;

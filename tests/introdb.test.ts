@@ -146,10 +146,10 @@ test('accepts duration-matched and conservative local provider segments', () => 
 test('bounds local fingerprint matches to the overlapping Part 2 search envelope', () => {
   const partTwoOpening = {
     ...segment,
-    start_ms: 700_000,
-    end_ms: 760_000,
-    start_sec: 700,
-    end_sec: 760,
+    start_ms: 850_000,
+    end_ms: 910_000,
+    start_sec: 850,
+    end_sec: 910,
     confidence: null,
     submission_count: null,
   };
@@ -160,10 +160,10 @@ test('bounds local fingerprint matches to the overlapping Part 2 search envelope
   }, 2_400)?.source, 'intro-skipper');
   assert.equal(validateIntroDbSegment('intro', {
     ...partTwoOpening,
-    start_ms: 781_000,
-    end_ms: 841_000,
-    start_sec: 781,
-    end_sec: 841,
+    start_ms: 901_000,
+    end_ms: 961_000,
+    start_sec: 901,
+    end_sec: 961,
     source: 'intro-skipper',
   }, 2_400), null);
   assert.equal(validateIntroDbSegment('intro', {

@@ -1,4 +1,4 @@
-import type { SegmentFeedbackCandidate } from './tauri';
+import type { IntroSkipperDetectionResult, SegmentFeedbackCandidate } from './tauri';
 
 export const SEGMENT_FEEDBACK_STORAGE_KEY = 'streamee:segment-feedback:v1';
 export const SEGMENT_FEEDBACK_PATTERN_STORAGE_KEY = 'streamee:segment-feedback-patterns:v1';
@@ -6,7 +6,9 @@ export const SEGMENT_FEEDBACK_STORAGE_LIMIT = 400;
 export const SEGMENT_FEEDBACK_MIN_EPISODES = 2;
 const SEGMENT_FEEDBACK_PATTERN_STORAGE_LIMIT = 100;
 
-const INTRO_POSITION_TOLERANCE_SECONDS = 3;
+const INTRO_DURATION_MIN_TOLERANCE_SECONDS = 4;
+const INTRO_DURATION_MAX_TOLERANCE_SECONDS = 10;
+const INTRO_DURATION_TOLERANCE_RATIO = 0.20;
 const OUTRO_LEAD_TOLERANCE_SECONDS = 4;
 
 export type SegmentFeedbackResponse = 'yes' | 'no' | 'not-sure';
@@ -33,8 +35,9 @@ export type SegmentFeedbackShadowMatch = {
   source: SegmentFeedbackCandidate['source'];
   episodeCount: number;
   episodeKeys: string[];
-  positionSeconds: number;
-  learnedPositionSeconds: number | null;
+  metric: 'intro-duration' | 'outro-lead';
+  candidateValueSeconds: number;
+  learnedValueSeconds: number | null;
   toleranceSeconds: number;
 };
 
@@ -43,6 +46,61 @@ export type SegmentFeedbackPatternState = {
   status: 'suspended';
   reason: SegmentFeedbackPatternSuspensionReason;
   recordedAt: string;
+};
+
+export const selectHigherScoringSegmentFeedbackCandidate = (
+  current: SegmentFeedbackCandidate | null,
+  candidate: SegmentFeedbackCandidate | null,
+): SegmentFeedbackCandidate | null => {
+  if (!candidate) return current;
+  if (!current) return candidate;
+  const candidateScore = typeof candidate.score === 'number' && Number.isFinite(candidate.score)
+    ? candidate.score
+    : -1;
+  const currentScore = typeof current.score === 'number' && Number.isFinite(current.score)
+    ? current.score
+    : -1;
+  if (candidateScore !== currentScore) {
+    return candidateScore > currentScore ? candidate : current;
+  }
+  const candidateDuration = candidate.end_sec - candidate.start_sec;
+  const currentDuration = current.end_sec - current.start_sec;
+  if (candidateDuration !== currentDuration) {
+    return candidateDuration > currentDuration ? candidate : current;
+  }
+  return candidate.start_sec < current.start_sec ? candidate : current;
+};
+
+export const mergeIntroDetectionCandidate = (
+  current: SegmentFeedbackCandidate | null,
+  detection: IntroSkipperDetectionResult,
+): {
+  bestCandidate: SegmentFeedbackCandidate | null;
+  detection: IntroSkipperDetectionResult;
+} => {
+  const bestCandidate = selectHigherScoringSegmentFeedbackCandidate(
+    current,
+    detection.candidate?.kind === 'intro' ? detection.candidate : null,
+  );
+  if (
+    !bestCandidate
+    || detection.segment
+    || (
+      detection.status !== 'learned'
+      && detection.status !== 'no-match'
+      && detection.status !== 'near-miss'
+    )
+  ) {
+    return { bestCandidate, detection };
+  }
+  return {
+    bestCandidate,
+    detection: {
+      ...detection,
+      status: 'near-miss',
+      candidate: bestCandidate,
+    },
+  };
 };
 
 const roundedHalfSecond = (value: number): number => Math.round(value * 2) / 2;
@@ -61,19 +119,25 @@ export const buildSegmentFeedbackPatternKey = (
   candidate.source,
 ].join(':');
 
-const candidatePosition = (
+const candidateLearningValue = (
   context: SegmentFeedbackContext,
   candidate: SegmentFeedbackCandidate,
 ): number => (
   candidate.kind === 'outro'
     ? Math.max(0, context.duration - candidate.start_sec)
-    : candidate.start_sec
+    : Math.max(0, candidate.end_sec - candidate.start_sec)
 );
 
 const candidateTolerance = (candidate: SegmentFeedbackCandidate): number => (
   candidate.kind === 'outro'
     ? OUTRO_LEAD_TOLERANCE_SECONDS
-    : INTRO_POSITION_TOLERANCE_SECONDS
+    : Math.max(
+      INTRO_DURATION_MIN_TOLERANCE_SECONDS,
+      Math.min(
+        INTRO_DURATION_MAX_TOLERANCE_SECONDS,
+        (candidate.end_sec - candidate.start_sec) * INTRO_DURATION_TOLERANCE_RATIO,
+      ),
+    )
 );
 
 const median = (values: number[]): number => {
@@ -228,7 +292,7 @@ export const evaluateSegmentFeedbackShadowMatch = (
   context: SegmentFeedbackContext,
   candidate: SegmentFeedbackCandidate,
 ): SegmentFeedbackShadowMatch => {
-  const positionSeconds = candidatePosition(context, candidate);
+  const candidateValueSeconds = candidateLearningValue(context, candidate);
   const toleranceSeconds = candidateTolerance(candidate);
   const matchingByEpisode = new Map<string, number>();
 
@@ -250,9 +314,9 @@ export const evaluateSegmentFeedbackShadowMatch = (
     ) {
       continue;
     }
-    const recordPosition = candidatePosition(recordContext, record.candidate);
-    if (Math.abs(recordPosition - positionSeconds) <= toleranceSeconds) {
-      matchingByEpisode.set(episodeKey(recordContext), recordPosition);
+    const recordValue = candidateLearningValue(recordContext, record.candidate);
+    if (Math.abs(recordValue - candidateValueSeconds) <= toleranceSeconds) {
+      matchingByEpisode.set(episodeKey(recordContext), recordValue);
     }
   }
 
@@ -273,7 +337,8 @@ export const evaluateSegmentFeedbackShadowMatch = (
       cluster.length > bestCluster.length
       || (
         cluster.length === bestCluster.length
-        && Math.abs(clusterMedian - positionSeconds) < Math.abs(bestMedian - positionSeconds)
+        && Math.abs(clusterMedian - candidateValueSeconds)
+          < Math.abs(bestMedian - candidateValueSeconds)
       )
     ) {
       bestCluster = cluster;
@@ -290,8 +355,9 @@ export const evaluateSegmentFeedbackShadowMatch = (
     source: candidate.source,
     episodeCount: episodeKeys.length,
     episodeKeys,
-    positionSeconds,
-    learnedPositionSeconds: positions.length > 0 ? median(positions) : null,
+    metric: candidate.kind === 'outro' ? 'outro-lead' : 'intro-duration',
+    candidateValueSeconds,
+    learnedValueSeconds: positions.length > 0 ? median(positions) : null,
     toleranceSeconds,
   };
 };

@@ -203,6 +203,8 @@ local file_check_period = 1/60
 
 local allow_fast_seek = true
 local fast_preview = false
+local helper_decoder_resize
+local decoder_resize_disabled = false
 local request_timer
 local start_request_timer
 local request_generation = 0
@@ -400,6 +402,49 @@ local function should_use_fast_preview()
     local height = params and (params["dh"] or params["h"]) or 0
 
     return math.max(width, height) >= 3000 and source_is_hdr()
+end
+
+local cuvid_decoders = {
+    av1 = "av1_cuvid",
+    h264 = "h264_cuvid",
+    avc1 = "h264_cuvid",
+    hevc = "hevc_cuvid",
+    h265 = "hevc_cuvid",
+    mjpeg = "mjpeg_cuvid",
+    mpeg1video = "mpeg1_cuvid",
+    mpeg2video = "mpeg2_cuvid",
+    mpeg4 = "mpeg4_cuvid",
+    vc1 = "vc1_cuvid",
+    vp8 = "vp8_cuvid",
+    vp9 = "vp9_cuvid",
+}
+
+local function decoder_resize_config()
+    if os_name ~= "windows" or decoder_resize_disabled then return nil end
+    if (properties["video-crop"] or "") ~= "" then return nil end
+
+    local track = properties["current-tracks/video"] or {}
+    local decoder = cuvid_decoders[string.lower(tostring(track.codec or ""))]
+    if not decoder then return nil end
+
+    local params = source_video_params()
+    local width = params and (params["dw"] or params["w"]) or 0
+    local height = params and (params["dh"] or params["h"]) or 0
+    if width <= 0 or height <= 0 or math.max(width, height) < 3000 then return nil end
+
+    local vf_table = properties["vf"] or {}
+    for _, filter in ipairs(vf_table) do
+        if filter.name == "crop" or filter.name == "lavfi-crop" then return nil end
+    end
+
+    -- CUVID reduces the frame as part of decoding, before MPV's software
+    -- thumbnail filters see it. Keep a small even intermediate at or above
+    -- the final size so the existing filter chain only has a cheap last step.
+    local target_ratio = math.max(effective_w / width, effective_h / height)
+    local ratio = math.min(1, math.max(0.1, target_ratio))
+    local resize_w = math.max(144, math.ceil(width * ratio / 2) * 2)
+    local resize_h = math.max(144, math.ceil(height * ratio / 2) * 2)
+    return {decoder=decoder, size=resize_w.."x"..resize_h}
 end
 
 local function vf_string(filters, full)
@@ -611,6 +656,8 @@ local function spawn(time)
     local vid = properties["vid"]
     has_vid = vid or 0
     fast_preview = should_use_fast_preview()
+    helper_decoder_resize = decoder_resize_config()
+    local helper_hwdec = helper_decoder_resize and "no" or options.hwdec
 
     helper_generation = helper_generation + 1
     local generation = helper_generation
@@ -624,10 +671,15 @@ local function spawn(time)
         -- preview was already available.  Decode only what the seek needs.
         "--cache=no", "--demuxer-readahead-secs=0",
         "--start="..time,
-        "--hwdec="..options.hwdec,
+        "--hwdec="..helper_hwdec,
         "--vf="..vf_string(filters_all, true),
         "--ovc=rawvideo", "--of=image2", "--ofopts=update=1", "--o="..options.thumbnail
     }
+
+    if helper_decoder_resize then
+        table.insert(args, "--vd="..helper_decoder_resize.decoder)
+        table.insert(args, "--vd-lavc-o=resize="..helper_decoder_resize.size)
+    end
 
     if fast_preview then
         -- A seek-bar preview only needs a nearby recognizable frame. Avoid
@@ -663,10 +715,11 @@ local function spawn(time)
     spawned = true
     spawn_waiting = true
     thumbfast_log("info", string.format(
-        "helper started: generation=%d request_time=%.3f fast_preview=%s status=started",
+        "helper started: generation=%d request_time=%.3f fast_preview=%s decoder_resize=%s status=started",
         generation,
         time,
-        tostring(fast_preview)
+        tostring(fast_preview),
+        helper_decoder_resize and (helper_decoder_resize.decoder..":"..helper_decoder_resize.size) or "off"
     ))
 
     local request_id
@@ -675,14 +728,29 @@ local function spawn(time)
             if generation ~= helper_generation then return end
             helper_request_id = nil
             if spawn_waiting and (success == false or (result.status ~= 0 and result.status ~= -2)) then
+                local retry_time = issued_seek_time
+                local retry_without_resize = helper_decoder_resize ~= nil and retry_time ~= nil
                 spawned = false
                 spawn_waiting = false
-                options.tone_mapping = "no"
                 thumbfast_log("error", string.format(
                     "helper failed: generation=%d status=failed result_status=%s",
                     generation,
                     tostring(result and result.status)
                 ))
+                if retry_without_resize then
+                    decoder_resize_disabled = true
+                    helper_decoder_resize = nil
+                    thumbfast_log("warn", "CUVID thumbnail resize unavailable; retrying with copy-back scaling")
+                    spawn(retry_time)
+                    if spawned then
+                        request_started_at = mp.get_time()
+                        request_seek()
+                        if not file_timer:is_enabled() then file_timer:resume() end
+                        start_request_timer(retry_time)
+                    end
+                    return
+                end
+                options.tone_mapping = "no"
                 mp.msg.error("mpv subprocess create failed")
                 if result then
                     if result.stderr and result.stderr ~= "" then
@@ -1231,6 +1299,8 @@ end
 
 local function file_load()
     shutting_down = false
+    decoder_resize_disabled = false
+    helper_decoder_resize = nil
     terminate_helper()
     clear()
     reset_request()
