@@ -27,6 +27,7 @@ import { getXrelQualitySnapshot, subscribeXrelQualitySnapshot } from '../../serv
 import { getUpNextNoResultCachePolicy, UP_NEXT_RESOLVED_RESULT_CACHE_TTL_MS } from '../../services/tmdb-request-policy';
 import { fetchAddonCatalogPage } from '../../services/addon-catalogs';
 import { getSupportedCatalogs, loadInstalledAddons } from '../../services/installed-addons';
+import { usePageScroll } from '../../hooks/usePageScroll';
 import './Board.css';
 
 function formatRelativeTime(dateStr: string): string {
@@ -382,23 +383,6 @@ const Board: React.FC = () => {
       window.removeEventListener('online', schedule);
     };
   }, [catalogs, releaseQualitySnapshot.backgroundPaused, releaseQualitySnapshot.enabled]);
-
-  useEffect(() => {
-    const container = document.querySelector('.main-content');
-    if (!(container instanceof HTMLElement)) {
-      return;
-    }
-
-    const handleScroll = () => {
-      setBoardScrollPosition(container.scrollTop);
-    };
-
-    container.addEventListener('scroll', handleScroll, { passive: true });
-
-    return () => {
-      container.removeEventListener('scroll', handleScroll);
-    };
-  }, [setBoardScrollPosition]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1280,18 +1264,16 @@ const Board: React.FC = () => {
     image.src = activeFeatured.background;
   }, [activeFeatured?.background]);
 
-  useLayoutEffect(() => {
-    if (loading || boardScrollPosition <= 0) {
-      return;
-    }
-
-    const container = document.querySelector('.main-content');
-    if (!(container instanceof HTMLElement)) {
-      return;
-    }
-
-    container.scrollTo({ top: boardScrollPosition, behavior: 'auto' });
-  }, [loading, boardScrollPosition]);
+  usePageScroll({
+    key: `board:${catalogSourceKey}:${discoveryContentMode}`,
+    position: boardScrollPosition,
+    save: (position) => {
+      if ((useStore.getState().catalogSourceInstallationId || 'tmdb') === catalogSourceKey) {
+        setBoardScrollPosition(position);
+      }
+    },
+    ready: !loading,
+  });
 
   if (tmdbConfigured === false && catalogs.length === 0) {
     return (

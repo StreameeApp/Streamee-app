@@ -2135,6 +2135,14 @@
   flex-direction: column;
 }
 
+.settings-runtime-card {
+  display: grid;
+  gap: 16px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--border-subtle);
+  overflow-wrap: anywhere;
+}
+
 .settings-runtime-copy {
   gap: 5px;
 }

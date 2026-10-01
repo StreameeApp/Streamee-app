@@ -324,9 +324,13 @@ interface AppState {
   discoverListState: DiscoverListState;
   watchlistScrollPosition: number;
   watchlistPage: number;
+  watchlistFilter: 'all' | 'movies' | 'shows';
   historyScrollPosition: number;
   historyPage: number;
+  historyFilter: 'all' | 'movies' | 'shows';
   calendarScrollPosition: number;
+  calendarFilter: 'all' | 'shows' | 'movies' | 'finales';
+  calendarStartDate: string | null;
   downloadStats: DownloadStats;
   subtitleAssist: SubtitleAssistState;
   whisperProcessedSeconds: number | null;
@@ -516,9 +520,13 @@ export const useStore = create<AppState>()(
       },
       watchlistScrollPosition: 0,
       watchlistPage: 1,
+      watchlistFilter: 'all',
       historyScrollPosition: 0,
       historyPage: 1,
+      historyFilter: 'all',
       calendarScrollPosition: 0,
+      calendarFilter: 'all',
+      calendarStartDate: null,
       downloadStats: {
         status: 'idle',
         downloaded: 0,
@@ -552,25 +560,7 @@ export const useStore = create<AppState>()(
       currentPlayingTitle: null,
       playbackTransitionActive: false,
 
-      setView: (view) => set((state) => {
-        let resets = {};
-        
-        // Reset scroll/page state when leaving a tab
-        if (state.view === 'catalog' && view !== 'catalog' && view !== 'meta') {
-          resets = { ...resets, catalogScrollPosition: 0, catalogPage: 1 };
-        }
-        if (state.view === 'search' && view !== 'search' && view !== 'meta') {
-          resets = { ...resets, discoverScrollPosition: 0, discoverPage: 1 };
-        }
-        if (state.view === 'watchlist' && view !== 'watchlist' && view !== 'meta') {
-          resets = { ...resets, watchlistScrollPosition: 0, watchlistPage: 1 };
-        }
-        if (state.view === 'history' && view !== 'history' && view !== 'meta') {
-          resets = { ...resets, historyScrollPosition: 0, historyPage: 1 };
-        }
-        
-        return { ...resets, view, previousView: state.view };
-      }),
+      setView: (view) => set((state) => ({ view, previousView: state.view })),
       setSelectedMeta: (selectedMeta, fromView) => set((state) => ({ 
         selectedMeta, 
         view: selectedMeta ? 'meta' : (state.previousView || fromView || 'board'),
@@ -586,7 +576,12 @@ export const useStore = create<AppState>()(
         selectedCatalog, 
         view: selectedCatalog ? 'catalog' : 'board',
         previousView: selectedCatalog ? state.view : null,
-        ...(!selectedCatalog ? { catalogScrollPosition: 0, catalogPage: 1 } : {})
+        ...(!selectedCatalog
+          || selectedCatalog.id !== state.selectedCatalog?.id
+          || selectedCatalog.type !== state.selectedCatalog?.type
+          || selectedCatalog.source !== state.selectedCatalog?.source
+          || selectedCatalog.addonInstallationId !== state.selectedCatalog?.addonInstallationId
+          ? { catalogScrollPosition: 0, catalogPage: 1 } : {})
       })),
       setSelectedStream: (selectedStream) => set({ selectedStream, view: selectedStream ? 'player' : 'meta' }),
       setAddonTransferSessionId: (addonTransferSessionId) => set({ addonTransferSessionId }),

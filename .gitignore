@@ -13,6 +13,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+/Optical_Flow_SDK_*/
 
 # Local Cloudflare credentials and deployment state
 /cloudflare/

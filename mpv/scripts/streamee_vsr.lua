@@ -17,6 +17,7 @@ local FILTER_LABEL = "@streamee-vsr"
 local HDR_FILTER_LABEL = "@streamee-rtx-hdr"
 local SVP_FILTER_LABEL = "svp"
 local RIFE_FILTER_LABEL = "streamee-rife"
+local OPTIFLOW_FILTER_LABEL = "streamee-optiflow"
 local last_mode = nil
 local order_check_pending = false
 
@@ -29,6 +30,10 @@ local vsr_enabled = vsr_available
 local rtx_hdr_enabled = option_enabled(o.rtx_hdr)
 local rtx_hdr_active = false
 local base_contrast = mp.get_property_number("contrast", 0)
+
+local function windows_hdr_active()
+    return mp.get_property_native("user-data/streamee-hdr-state", "off") == "on"
+end
 
 local function publish_menu_state()
     mp.set_property_number("user-data/streamee-vsr-available", vsr_available and 1 or 0)
@@ -64,8 +69,14 @@ local function source_video_params()
     end
 
     local transfer = tostring(params.gamma or params.transfer or ""):lower()
+    local format = (tostring(params.pixelformat or "") .. " " ..
+        tostring(params["hw-pixelformat"] or "")):lower()
+    local depth = tonumber(params["component-bits"]) or 8
     local native_hdr = transfer == "pq" or transfer == "hlg"
-    return tonumber(params.w), tonumber(params.h), native_hdr
+        or (tonumber(params["dovi-profile"]) or 0) > 0 or params["hdr10plus"] == true
+    local preserve_precision = native_hdr or depth > 8 or format:find("p010", 1, true)
+        or format:find("10", 1, true) or format:find("12", 1, true)
+    return tonumber(params.w), tonumber(params.h), preserve_precision
 end
 
 local function desired_mode()
@@ -76,13 +87,16 @@ local function desired_mode()
 
     local long_edge = math.max(width, height)
     local short_edge = math.min(width, height)
+    if native_hdr then
+        return "native-hdr", width, height
+    end
     if vsr_enabled
         and long_edge <= tonumber(o.max_width)
         and short_edge <= tonumber(o.max_height) then
         return native_hdr and "vsr-native-hdr" or "vsr", width, height
     end
 
-    if rtx_hdr_enabled and not native_hdr then
+    if rtx_hdr_enabled and not native_hdr and windows_hdr_active() then
         return "hdr", width, height
     end
 
@@ -141,6 +155,9 @@ local function hdr_filter()
 end
 
 local function frame_generation_target()
+    if filter_position(OPTIFLOW_FILTER_LABEL) then
+        return OPTIFLOW_FILTER_LABEL, "OptiFlow"
+    end
     if filter_position(RIFE_FILTER_LABEL) then
         return RIFE_FILTER_LABEL, "RIFE"
     end
@@ -151,6 +168,9 @@ local function frame_generation_target()
 end
 
 local function vsr_before_frame_generation(target_label)
+    if target_label == OPTIFLOW_FILTER_LABEL then
+        return false
+    end
     if target_label == RIFE_FILTER_LABEL then
         return not option_enabled(o.rife_before_upscaling)
     end
@@ -200,10 +220,6 @@ local function schedule_order_check()
 end
 
 local function apply_for_source()
-    if not vsr_available then
-        return
-    end
-
     local mode, width, height = desired_mode()
     if not mode or mode == last_mode then
         return
@@ -241,7 +257,7 @@ local function apply_for_source()
         mp.msg.info(string.format("RTX VSR bypassed for %dx%d source", width, height))
     end
 
-    if rtx_hdr_enabled and (mode == "vsr" or mode == "hdr") then
+    if rtx_hdr_enabled and windows_hdr_active() and (mode == "vsr" or mode == "hdr") then
         rtx_hdr_active = run_vf("add", hdr_filter(), true)
     end
     apply_hdr_contrast()
@@ -290,4 +306,7 @@ end)
 mp.observe_property("video-params", "native", apply_for_source)
 mp.observe_property("vf", "native", schedule_order_check)
 mp.observe_property("user-data/streamee-bm3dcuda-enabled", "number", schedule_order_check)
-mp.observe_property("user-data/streamee-hdr-state", "native", apply_hdr_contrast)
+mp.observe_property("user-data/streamee-hdr-state", "native", function()
+    reapply_for_source()
+    apply_hdr_contrast()
+end)

@@ -26,7 +26,7 @@ Streamee combines a polished discovery library with a highly tuned desktop playb
 - Automatic intro and recap skipping, outro-aware next-episode playback, and local detection fallbacks
 - Smart Next preparation that can warm the next aired episode before the current one ends
 - A real-time LUFS-based Audio Normalizer with adaptive gating, gain riding, and final peak protection
-- Configurable RIFE frame generation, upscaling, sharpening, denoising, debanding, HDR handling, Smart Black Bar Fill with optional edge lighting, and optional SVP integration
+- Configurable RIFE frame generation, experimental user-supplied NVIDIA Optical Flow FRUC, upscaling, sharpening, denoising, debanding, HDR handling, Smart Black Bar Fill with optional edge lighting, and optional SVP integration
 - Direct playback of local video files and folders through the same MPV experience
 - Cache-only seekbar thumbnails, reusable stream caching, playback statistics, and a local phone remote
 
@@ -152,6 +152,7 @@ Streamee exposes a configurable MPV processing chain rather than locking playbac
 - **Denoising** — Bilateral and advanced MPV/VapourSynth processing with selectable strength and GPU-oriented BM3D modes where supported.
 - **Debanding** — Optional MPV debanding for visible color gradients.
 - **RIFE frame generation** — Optional TensorRT-powered 2x or 3x frame generation runs directly in Streamee's MPV pipeline without requiring or starting SVP. Choose among RIFE 4.6, 4.9, 4.16 Lite, 4.18, and 4.25 models, tune processing resolution and GPU concurrency, and place RIFE before or after RTX VSR.
+- **NVIDIA Optical Flow FRUC (WIP)** — Optional 2x frame interpolation can use SDK 5.0.7 files that the user separately obtains from NVIDIA and imports locally. Supported 8-bit D3D11 video uses Streamee's GPU-resident native MPV path when available, with the existing VapourSynth path retained as a compatibility fallback. Streamee does not bundle or download NVIDIA's SDK files.
 - **Smart Black Bar Fill** — Detects embedded black bars and fits the active picture to displays of any aspect ratio. It handles side bars on ultrawide displays and top/bottom bars on standard displays without moving soft subtitles or player controls. Independent **Black Bar Lighting** can detect and replace embedded bars while leaving the full picture uncropped, or extend averaged edge colours into naturally unused canvas space. Disabling lighting keeps smooth fixed-canvas cropping with black surroundings. Settings provide saved defaults, while the MPV right-click menu can override both features for the current title.
 - **Efficient aspect detection** — **Efficient** scans briefly at playback start, after seeking, and periodically. Lighting-only playback uses the same low-cost schedule without enabling Fill. **Dynamic** follows aspect-ratio changes using a low-resolution, reduced-frame-rate lookahead probe. When either fixed-canvas feature is active, duplicate SVP lighting is suppressed only for the current playback pipeline so SVP does not render an unnecessarily enlarged intermediate frame; SVP's generated source script and global settings remain unchanged.
 - **Season-aware settings** — Player-menu processing changes can carry through later episodes of the same season without becoming a global default.
@@ -174,6 +175,12 @@ Streamee can generate intermediate frames locally with RIFE through VapourSynth,
 - Compiled engine count and disk use are visible under Advanced tuning. Failed zero-byte artifacts are cleaned automatically, and **Clear compiled engines** safely resets the cache when playback is stopped.
 
 RIFE currently requires Windows, a supported NVIDIA GPU and driver, and substantial GPU memory and processing headroom. The first playback after changing the model, resolution, scale, or GPU-specific configuration can pause while TensorRT compiles and caches an engine; later playback reuses that cache.
+
+#### OptiFlow (experimental)
+
+OptiFlow uses NVIDIA's driver optical-flow hardware and Streamee's own GPU interpolation shaders with the custom MPV player. The first input path is progressive D3D11 NV12/P010, with encoded-signal HDR preservation and conservative midpoint holds when dynamic metadata changes. Enabling it excludes RIFE and SVP.
+
+No SDK or CUDA runtime import is needed. Settings reports driver and player availability; the decoder device is checked at playback initialization. Unsupported input and initialization failures retain ordinary playback. Existing enable and optional clock preferences migrate automatically. Quality parity with NVFRUC and the 4K performance target are still under validation. See [implementation and acceptance status](docs/OPTIFLOW.md).
 
 #### Smart Black Bar Fill and edge lighting
 

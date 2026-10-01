@@ -7,6 +7,8 @@ mod intro_skipper;
 mod introdb;
 mod logging;
 mod mpv_ipc;
+mod optiflow_clocks;
+mod optiflow_runtime;
 mod remote_server;
 mod rife_runtime;
 mod torrent;
@@ -6328,6 +6330,17 @@ async fn install_rife_runtime(
 }
 
 #[tauri::command]
+async fn get_optiflow_runtime_info(
+    app: AppHandle,
+) -> Result<optiflow_runtime::OptiflowRuntimeInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let assets = find_native_optiflow_assets(&app);
+        optiflow_runtime::runtime_info(assets.as_ref().map(|(p, b)| (p.as_path(), b.as_path())))
+    })
+    .await
+    .map_err(|error| format!("OptiFlow capability check failed: {error}"))
+}
+#[tauri::command]
 async fn prepare_rife_engine(
     app: AppHandle,
     request: rife_runtime::RifeEnginePreparationRequest,
@@ -6454,6 +6467,25 @@ pub(crate) fn find_mpv(app: &AppHandle) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(target_os = "windows")]
+fn find_native_optiflow_assets(app: &AppHandle) -> Option<(PathBuf, PathBuf)> {
+    // Driver-device capability checks run in the native filter at playback start.
+    let resolve_pair = |directory: PathBuf| {
+        let player = directory.join("streamee-optiflow-mpv.exe");
+        let bridge = directory.join("streamee_optiflow_d3d11.dll");
+        (player.is_file() && bridge.is_file()).then_some((player, bridge))
+    };
+    #[cfg(debug_assertions)]
+    if let Some(found) = resolve_pair(Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("mpv"))
+    {
+        return Some(found);
+    }
+    app.path()
+        .resolve("mpv", BaseDirectory::Resource)
+        .ok()
+        .and_then(resolve_pair)
 }
 
 fn find_rife_script(mpv_dir: &Path) -> PathBuf {
@@ -6675,7 +6707,16 @@ async fn launch_mpv_process(
     preferred_audio_language: Option<String>,
     prefer_sdh_subtitles: bool,
 ) -> Result<u32, String> {
-    let mpv_path = find_mpv(app).ok_or_else(|| "MPV not found".to_string())?;
+    let optiflow_requested =
+        get_store_setting(app, "mpvOptiflowEnabled").as_deref() == Some("true");
+    let native_optiflow_assets = optiflow_requested
+        .then(|| find_native_optiflow_assets(app))
+        .flatten();
+    let mpv_path = native_optiflow_assets
+        .as_ref()
+        .map(|(player, _)| player.to_string_lossy().into_owned())
+        .or_else(|| find_mpv(app))
+        .ok_or_else(|| "MPV not found".to_string())?;
     match initial_url.as_ref() {
         Some(url) => info!(
             "Found MPV at: {}, launching stream: {}",
@@ -6729,7 +6770,8 @@ async fn launch_mpv_process(
     let black_bar_lighting_enabled =
         get_store_setting(app, "mpvBlackBarLightingEnabled").as_deref() != Some("false");
     let vsr_before_svp = get_store_setting(app, "mpvVsrBeforeSvp").as_deref() != Some("false");
-    let rife_requested = get_store_setting(app, "mpvRifeEnabled").as_deref() == Some("true");
+    let rife_requested =
+        !optiflow_requested && get_store_setting(app, "mpvRifeEnabled").as_deref() == Some("true");
     let rife_runtime_path = rife_runtime::managed_runtime_dir()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -6818,6 +6860,11 @@ async fn launch_mpv_process(
         .ok_or_else(|| "Could not determine MPV directory".to_string())?
         .to_path_buf();
     let rife_script_path = find_rife_script(&mpv_dir);
+    let optiflow_native_enabled = native_optiflow_assets.is_some();
+    let optiflow_enabled = optiflow_requested && optiflow_native_enabled;
+    if optiflow_requested && !optiflow_enabled {
+        warn!("OptiFlow assets unavailable; using ordinary playback");
+    }
     let rife_runtime_dir = PathBuf::from(&rife_runtime_path);
     let rife_runtime_status = rife_requested
         .then(|| rife_runtime::runtime_info(rife_model))
@@ -6866,6 +6913,9 @@ async fn launch_mpv_process(
     }
 
     let mut cmd_args = Vec::new();
+    if optiflow_native_enabled {
+        cmd_args.push(format!("--config-dir={}", mpv_dir.display()));
+    }
     let is_remote_initial_stream = initial_url
         .as_deref()
         .map(|url| {
@@ -6957,12 +7007,11 @@ async fn launch_mpv_process(
         cmd_args.push("--ad-lavc-downmix=no".to_string());
     }
 
+    // streamee_vsr.lua owns HDR filter activation after both the display HDR
+    // state and source transfer function are known, including later changes.
     match upscaler {
         VideoUpscaler::RtxVsr => {}
         VideoUpscaler::SSimSuperRes => {
-            if rtx_hdr_enabled && !rife_enabled {
-                cmd_args.push("--vf=d3d11vpp=nvidia-true-hdr".to_string());
-            }
             cmd_args.push("--scale=ewa_lanczossharp".to_string());
             cmd_args.push("--cscale=ewa_lanczos".to_string());
             cmd_args.push(format!(
@@ -6971,9 +7020,6 @@ async fn launch_mpv_process(
             ));
         }
         VideoUpscaler::Fsr => {
-            if rtx_hdr_enabled && !rife_enabled {
-                cmd_args.push("--vf=d3d11vpp=nvidia-true-hdr".to_string());
-            }
             cmd_args.push("--scale=ewa_lanczossharp".to_string());
             cmd_args.push("--cscale=ewa_lanczos".to_string());
             cmd_args.push(format!(
@@ -6992,9 +7038,9 @@ async fn launch_mpv_process(
             RIFE_BUFFERED_FRAMES,
             rife_filter_concurrency
         ));
-        if rtx_hdr_enabled && upscaler != VideoUpscaler::RtxVsr {
-            cmd_args.push("--vf-add=@streamee-rtx-hdr:d3d11vpp=nvidia-true-hdr".to_string());
-        }
+    }
+    if optiflow_enabled {
+        cmd_args.push("--vf-add=@streamee-optiflow:streamee-optiflow".to_string());
     }
     let mut script_opts = vec![
         format!(
@@ -7124,12 +7170,23 @@ async fn launch_mpv_process(
             .env("STREAMEE_RIFE_PROCESSING_MODE", rife_processing_mode)
             .env("STREAMEE_RIFE_SCALE", rife_scale);
     }
-    if rife_requested {
+    if optiflow_enabled {
+        if let Some((_, bridge)) = native_optiflow_assets.as_ref() {
+            cmd.env("STREAMEE_OPTIFLOW_D3D11_BRIDGE", bridge);
+        }
+    }
+    if rife_requested || optiflow_requested {
         let svp_path = get_svp_executable_path(app);
         if let Err(error) = stop_svp_process(&svp_path) {
-            debug!("RIFE is enabled; no configured SVP process needed cleanup: {error}");
-        } else {
+            if rife_requested {
+                debug!("RIFE is enabled; no configured SVP process needed cleanup: {error}");
+            } else {
+                debug!("OptiFlow is enabled; no configured SVP process needed cleanup: {error}");
+            }
+        } else if rife_requested {
             info!("RIFE is enabled; SVP was stopped and auto-start was suppressed");
+        } else {
+            info!("OptiFlow is enabled; SVP was stopped and auto-start was suppressed");
         }
     }
     let child = match cmd.spawn() {
@@ -7160,6 +7217,22 @@ async fn launch_mpv_process(
             "[RIFE] Session configuration registered"
         );
     }
+    if optiflow_requested {
+        info!(
+            event = "optiflow.session_configured",
+            source = "backend",
+            subsystem = "optiflow.playback",
+            status = if optiflow_enabled { "Ready" } else { "Failed" },
+            playback_session_id = pid,
+            multiplier = 2,
+            buffered_frames = 2,
+            concurrent_frames = 1,
+            runtime_ready = optiflow_enabled,
+            "[OptiFlow] WIP session configuration registered"
+        );
+    }
+    mpv_ipc::register_optiflow_expectation(pid, optiflow_enabled);
+    optiflow_clocks::start(app, pid, optiflow_enabled);
     mpv_ipc::register_rife_expectation(
         app,
         pid,
@@ -7180,7 +7253,7 @@ async fn launch_mpv_process(
         pid,
         "MPV process spawned"
     );
-    if !rife_requested {
+    if !rife_requested && !optiflow_requested {
         start_svp_from_settings(app);
     }
     if let Err(err) = attach_mpv_to_main_window(app, pid).await {
@@ -8029,6 +8102,10 @@ fn clean_executable_path(executable_path: &str) -> String {
 fn ensure_svp_allowed(app: &AppHandle) -> Result<(), String> {
     if get_bool_setting(app, "mpvRifeEnabled") || mpv_ipc::rife_session_active_or_expected() {
         Err("SVP cannot start while Streamee RIFE is enabled".to_string())
+    } else if get_bool_setting(app, "mpvOptiflowEnabled")
+        || mpv_ipc::optiflow_session_active_or_expected()
+    {
+        Err("SVP cannot start while Streamee OptiFlow is enabled".to_string())
     } else {
         Ok(())
     }
@@ -8498,6 +8575,23 @@ pub fn run() {
             }
 
             if let Ok(store) = app.handle().store("settings.json") {
+                let mut migrated = false;
+                for (old, new) in [
+                    ("mpvNvfrucEnabled", "mpvOptiflowEnabled"),
+                    ("mpvNvfrucClockControl", "mpvOptiflowClockControl"),
+                ] {
+                    if store.get(new).is_none() {
+                        if let Some(value) = store.get(old) {
+                            store.set(new, value);
+                            migrated = true;
+                        }
+                    }
+                }
+                if migrated {
+                    if let Err(error) = store.save() {
+                        warn!("Could not persist OptiFlow preference migration: {error}");
+                    }
+                }
                 if let Some(value) = store.get("audioNormalizerConfig") {
                     match serde_json::from_value::<audio_normalizer::NormalizerConfig>(
                         value.clone(),
@@ -8637,6 +8731,9 @@ pub fn run() {
             get_rife_cache_info,
             clear_rife_cache,
             install_rife_runtime,
+            get_optiflow_runtime_info,
+            optiflow_clocks::get_optiflow_clock_settings,
+            optiflow_clocks::save_optiflow_clock_settings,
             prepare_rife_engine,
             cancel_rife_engine_preparation,
             stop_whisperlive_server,

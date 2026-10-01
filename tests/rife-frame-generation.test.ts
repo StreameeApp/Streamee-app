@@ -67,7 +67,7 @@ test('RIFE playback is verified and cannot run alongside SVP', () => {
   assert.match(backend, /RIFE is enabled; SVP was stopped and auto-start was suppressed/);
   assert.match(settings, /setSvpAutoStartEnabled\(false\)/);
   assert.match(settings, /setSvpAutoRestartOnPlaylistChange\(false\)/);
-  assert.match(settings, /disabled=\{mpvRifeEnabled\}/);
+  assert.match(settings, /disabled=\{mpvRifeEnabled \|\| mpvOptiflowEnabled\}/);
   assert.match(player, /getSetting\('mpvRifeEnabled'\)/);
   assert.match(mpvIpc, /rife:\/\/playback-status/);
   assert.match(mpvIpc, /current_rife_playback_status/);

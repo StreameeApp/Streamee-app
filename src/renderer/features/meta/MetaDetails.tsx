@@ -17,6 +17,7 @@ import { sortEpisodes } from '../../services/torrent-utils';
 import { createPerformanceTrace } from '../../services/performance';
 import { ensureXrelQualityForItem } from '../../services/xrel';
 import XrelQualityBadge from '../../components/XrelQualityBadge';
+import { useCachedPageScroll } from '../../hooks/usePageScroll';
 import './MetaDetails.css';
 
 type SortBy = 'seeds' | 'size' | 'quality';
@@ -906,19 +907,10 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     setContinueLoading(false);
   }, [meta.id]);
 
-  useEffect(() => {
-    const container = document.querySelector('.main-content');
-    if (!(container instanceof HTMLElement)) {
-      window.scrollTo({ top: 0, behavior: 'auto' });
-      return;
-    }
-
-    const frame = window.requestAnimationFrame(() => {
-      container.scrollTo({ top: 0, behavior: 'auto' });
-    });
-
-    return () => window.cancelAnimationFrame(frame);
-  }, [meta.id]);
+  useCachedPageScroll(
+    `meta:${meta.addonInstallationId ?? ''}:${meta.type}:${meta.id}`,
+    secondaryMetadataReady && !torrentsLoading,
+  );
 
   useEffect(() => {
     if (!details?.background) return;

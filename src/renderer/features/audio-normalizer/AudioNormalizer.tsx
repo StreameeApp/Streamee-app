@@ -9,6 +9,7 @@ import {
   NormalizerTelemetry,
 } from '../../services/tauri';
 import { useStore } from '../../store';
+import { useCachedPageScroll } from '../../hooks/usePageScroll';
 import './AudioNormalizer.css';
 
 const GRAPH_WINDOW_SECONDS = 60;
@@ -414,6 +415,7 @@ function formatAdaptiveGainState(state: string) {
 }
 
 const AudioNormalizer: React.FC = () => {
+  useCachedPageScroll('audio-normalizer');
   const {
     audioNormalizerPreset,
     setAudioNormalizerEnabled,

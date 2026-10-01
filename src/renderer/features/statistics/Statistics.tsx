@@ -17,6 +17,7 @@ import {
   StatisticsLedger,
   subscribeToStatistics,
 } from '../../services/statistics';
+import { useCachedPageScroll } from '../../hooks/usePageScroll';
 import './Statistics.css';
 
 type Range = 'month' | 'year' | 'lifetime';
@@ -109,12 +110,20 @@ const getCurrentStreak = (keys: string[], now: Date) => {
   return streak;
 };
 
+let lastStatisticsRange: Range = 'year';
+let lastActivityMetric: ActivityMetric = 'watch';
+
 const Statistics: React.FC = () => {
   const watched = useStore((state) => state.watched);
   const watchedEpisodes = useStore((state) => state.watchedEpisodes);
   const continueWatching = useStore((state) => state.continueWatching);
-  const [range, setRange] = useState<Range>('year');
-  const [activityMetric, setActivityMetric] = useState<ActivityMetric>('watch');
+  const [range, setRange] = useState<Range>(lastStatisticsRange);
+  const [activityMetric, setActivityMetric] = useState<ActivityMetric>(lastActivityMetric);
+  useCachedPageScroll(`statistics:${range}:${activityMetric}`);
+  useEffect(() => {
+    lastStatisticsRange = range;
+    lastActivityMetric = activityMetric;
+  }, [range, activityMetric]);
   const [ledger, setLedger] = useState<StatisticsLedger>(() => readStatisticsLedger());
   const [now, setNow] = useState(() => new Date());
 

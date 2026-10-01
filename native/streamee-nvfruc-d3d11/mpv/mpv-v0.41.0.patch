@@ -1,0 +1,27 @@
+diff --git a/filters/user_filters.c b/filters/user_filters.c
+--- a/filters/user_filters.c
++++ b/filters/user_filters.c
+@@ -99,5 +99,6 @@
+ #endif
+ #if HAVE_D3D_HWACCEL
+     &vf_d3d11vpp,
++    &vf_streamee_optiflow,
+ #endif
+ #if (HAVE_GL && HAVE_EGL) || HAVE_VULKAN
+diff --git a/filters/user_filters.h b/filters/user_filters.h
+--- a/filters/user_filters.h
++++ b/filters/user_filters.h
+@@ -35,4 +35,5 @@
+ extern const struct mp_user_filter_entry vf_vdpaupp;
+ extern const struct mp_user_filter_entry vf_vavpp;
+ extern const struct mp_user_filter_entry vf_d3d11vpp;
++extern const struct mp_user_filter_entry vf_streamee_optiflow;
+ extern const struct mp_user_filter_entry vf_fingerprint;
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -1392,4 +1392,5 @@
+     sources += files('video/d3d.c',
+                      'video/filter/vf_d3d11vpp.c')
++    sources += files('video/filter/vf_streamee_optiflow.c')
+ endif

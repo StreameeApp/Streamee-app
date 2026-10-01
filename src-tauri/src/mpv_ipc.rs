@@ -36,6 +36,8 @@ static SPAWNED_MPV_PID: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_os = "windows")]
 static EXPECTED_RIFE_PID: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_os = "windows")]
+static EXPECTED_OPTIFLOW_PID: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "windows")]
 static EXPECTED_RIFE_MULTIPLIER: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_os = "windows")]
 static SMART_NEXT_PENDING_REQUEST: once_cell::sync::Lazy<Mutex<Option<SmartNextPendingRequest>>> =
@@ -147,6 +149,44 @@ pub fn rife_session_active_or_expected() -> bool {
 #[cfg(not(target_os = "windows"))]
 pub fn rife_session_active_or_expected() -> bool {
     false
+}
+
+#[cfg(target_os = "windows")]
+pub fn register_optiflow_expectation(pid: u32, enabled: bool) {
+    EXPECTED_OPTIFLOW_PID.store(if enabled { pid } else { 0 }, Ordering::SeqCst);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn register_optiflow_expectation(_pid: u32, _enabled: bool) {}
+
+#[cfg(target_os = "windows")]
+pub fn optiflow_session_active_or_expected() -> bool {
+    let pid = EXPECTED_OPTIFLOW_PID.load(Ordering::SeqCst);
+    pid != 0 && process_is_running(pid)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn optiflow_session_active_or_expected() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn clear_optiflow_expectation(pid: u32) {
+    let _ = EXPECTED_OPTIFLOW_PID.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+#[cfg(all(test, target_os = "windows"))]
+#[test]
+fn optiflow_session_guard_lasts_until_matching_player_teardown() {
+    let pid = std::process::id();
+    register_optiflow_expectation(pid, true);
+    assert!(optiflow_session_active_or_expected());
+    clear_optiflow_expectation(pid.wrapping_add(1));
+    assert!(optiflow_session_active_or_expected());
+    clear_optiflow_expectation(pid);
+    assert!(!optiflow_session_active_or_expected());
+    register_optiflow_expectation(pid, false);
+    assert!(!optiflow_session_active_or_expected());
 }
 
 #[cfg(target_os = "windows")]
@@ -2314,7 +2354,9 @@ pub fn start_player_watcher(app_handle: AppHandle) {
             set_svp_enabled_property(
                 pipe,
                 crate::get_bool_setting(&app_handle, "svpAutoStartEnabled")
-                    && !crate::get_bool_setting(&app_handle, "mpvRifeEnabled"),
+                    && !crate::get_bool_setting(&app_handle, "mpvRifeEnabled")
+                    && !crate::get_bool_setting(&app_handle, "mpvOptiflowEnabled")
+                    && !optiflow_session_active_or_expected(),
             );
 
             let mut current_state = PlaybackSessionState::new();
@@ -2377,6 +2419,21 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                 // Poll pause state every 500ms
                 if last_pause_poll.elapsed() >= pause_poll_interval {
                     last_pause_poll = std::time::Instant::now();
+                    let _ = send_command(
+                        pipe,
+                        &MpvCommand {
+                            command: vec![
+                                serde_json::json!("set_property"),
+                                serde_json::json!("user-data/streamee-optiflow-clock-allowed"),
+                                serde_json::json!({
+                                    "allowed": crate::optiflow_clocks::allowed(&app_handle, mpv_pid),
+                                    "heartbeat": std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                                }),
+                            ],
+                            request_id: None,
+                        },
+                    );
                     // Command polling on the observed pipe can consume MPV
                     // property notifications. Reconcile playlist identity on
                     // the same cadence through a separate IPC client.
@@ -3215,6 +3272,7 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                 EXPECTED_RIFE_MULTIPLIER.store(0, Ordering::SeqCst);
             }
             clear_rife_playback_status(mpv_pid);
+            clear_optiflow_expectation(mpv_pid);
             clear_pending_smart_next_request_for_pid(mpv_pid, "MPV session ended");
             std::thread::sleep(Duration::from_millis(500));
         }

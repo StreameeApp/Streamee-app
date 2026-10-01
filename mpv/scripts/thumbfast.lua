@@ -207,6 +207,10 @@ local helper_decoder_resize
 local decoder_resize_disabled = false
 local request_timer
 local start_request_timer
+local request_seek
+local retry_request
+local check_new_thumb
+local draw
 local request_generation = 0
 -- A cache-only request is served from memory/disk or rejected immediately by
 -- the local proxy.  Leave enough room for a 4K keyframe decode, but do not
@@ -726,12 +730,44 @@ local function spawn(time)
     request_id = subprocess(args, true,
         function(success, result)
             if generation ~= helper_generation then return end
+            helper_generation = helper_generation + 1
             helper_request_id = nil
-            if spawn_waiting and (success == false or (result.status ~= 0 and result.status ~= -2)) then
-                local retry_time = issued_seek_time
+            local pending_time = issued_seek_time
+            local queued = queued_seek_time
+            -- A short-lived helper can exit before the next 60 Hz file poll.
+            -- Collect its completed frame before treating EOF as a cache miss;
+            -- defer the queued seek until a fresh helper owns the request.
+            queued_seek_time = nil
+            if pending_time and check_new_thumb() then
+                draw(real_w, real_h, script_name)
+                pending_time = nil
+            end
+            local retry_time = queued or pending_time
+            -- Every callback means the process is gone, including exits after
+            -- a successful frame. Close its pipe and release the request so
+            -- later hovers cannot seek an exited helper or wait on its timer.
+            spawned = false
+            spawn_waiting = false
+            if file then
+                file:close()
+                file = nil
+                file_bytes = 0
+            end
+            if request_timer then
+                request_timer:kill()
+                request_timer = nil
+            end
+            file_timer:kill()
+            last_seek_time = nil
+            issued_seek_time = nil
+            queued_seek_time = nil
+            request_started_at = nil
+            if pending_time then
+                failed_time = pending_time
+                failed_at = mp.get_time()
+            end
+            if not success or not result or (result.status ~= 0 and result.status ~= -2) then
                 local retry_without_resize = helper_decoder_resize ~= nil and retry_time ~= nil
-                spawned = false
-                spawn_waiting = false
                 thumbfast_log("error", string.format(
                     "helper failed: generation=%d status=failed result_status=%s",
                     generation,
@@ -741,17 +777,16 @@ local function spawn(time)
                     decoder_resize_disabled = true
                     helper_decoder_resize = nil
                     thumbfast_log("warn", "CUVID thumbnail resize unavailable; retrying with copy-back scaling")
-                    spawn(retry_time)
-                    if spawned then
-                        request_started_at = mp.get_time()
-                        request_seek()
-                        if not file_timer:is_enabled() then file_timer:resume() end
-                        start_request_timer(retry_time)
-                    end
+                    retry_request(retry_time)
                     return
                 end
-                options.tone_mapping = "no"
-                mp.msg.error("mpv subprocess create failed")
+                -- A missing cached range or decoder error does not change
+                -- the source's color space. Keep HDR conversion enabled.
+                if queued and queued ~= pending_time then
+                    retry_request(queued)
+                    return
+                end
+                mp.msg.error("mpv thumbnail subprocess failed")
                 if result then
                     if result.stderr and result.stderr ~= "" then
                         mp.msg.error("thumbfast helper stderr: " .. string.gsub(result.stderr, "[\r\n]+$", ""))
@@ -791,26 +826,12 @@ local function spawn(time)
                 -- idle helper until the watchdog fires: treat it as an
                 -- immediate cache miss, preserve the last frame, and let the
                 -- next hover position launch a fresh local-only helper.
-                if spawned and issued_seek_time then
-                    local time = issued_seek_time
-                    helper_request_id = nil
-                    spawned = false
-                    spawn_waiting = false
-                    if request_timer then
-                        request_timer:kill()
-                        request_timer = nil
-                    end
-                    file_timer:kill()
-                    failed_time = time
-                    failed_at = mp.get_time()
-                    last_seek_time = nil
-                    issued_seek_time = nil
-                    queued_seek_time = nil
-                    request_started_at = nil
+                if pending_time then
                     thumbfast_log("info", string.format(
                         "preview unavailable: cache_state=helper_eof request_time=%.3f status=cache_miss",
-                        time
+                        pending_time
                     ))
+                    if queued and queued ~= pending_time then retry_request(queued) end
                     return
                 end
                 if not spawn_working and properties["current-vo"] == "libmpv" and options.mpv_path ~= mpv_path then
@@ -823,6 +844,7 @@ local function spawn(time)
                     generation,
                     tostring(result.status)
                 ))
+                if queued and queued ~= rendered_time then retry_request(queued) end
             end
         end
     )
@@ -891,7 +913,7 @@ local function terminate_helper()
     real_w, real_h = nil, nil
 end
 
-local function draw(w, h, script)
+draw = function(w, h, script)
     if not w or not show_thumbnail then return end
     if x ~= nil then
         local scale_w, scale_h = options.scale_factor ~= 1 and (w * options.scale_factor) or nil, options.scale_factor ~= 1 and (h * options.scale_factor) or nil
@@ -939,16 +961,31 @@ local function move_file(from, to)
 end
 
 local function seek(fast)
-    if last_seek_time then
-        run("async seek " .. last_seek_time .. (fast and " absolute+keyframes" or " absolute+exact"))
+    if issued_seek_time then
+        run("async seek " .. issued_seek_time .. (fast and " absolute+keyframes" or " absolute+exact"))
     end
 end
 
-local function request_seek()
+request_seek = function()
     -- SDR previews remain exact. Only the intentionally approximate 4K HDR
     -- path seeks to a nearby keyframe, which also guarantees one output per
     -- request and lets us associate it with the correct hover position.
     seek(fast_preview and allow_fast_seek)
+end
+
+retry_request = function(time)
+    if not show_thumbnail or shutting_down then return end
+    spawn(time)
+    if not spawned then return end
+    last_seek_time = time
+    issued_seek_time = time
+    queued_seek_time = nil
+    failed_time = nil
+    failed_at = nil
+    request_started_at = mp.get_time()
+    request_seek()
+    if not file_timer:is_enabled() then file_timer:resume() end
+    start_request_timer(time)
 end
 
 local function same_time(first, second)
@@ -1018,7 +1055,7 @@ start_request_timer = function(time)
     end)
 end
 
-local function check_new_thumb()
+check_new_thumb = function()
     local tmp = options.thumbnail..".tmp"
     local finfo = mp.utils.file_info(tmp)
     local w, h
@@ -1045,6 +1082,7 @@ local function check_new_thumb()
     if not w then return false end
 
     spawn_waiting = false
+    spawn_working = true
     move_file(tmp, options.thumbnail..".bgra")
 
     failed_time = nil

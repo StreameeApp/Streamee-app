@@ -4,6 +4,7 @@ import { useStore, MetaPreview } from '../../store';
 import { getContinueWatchingProgress } from '../../services/progress';
 import { pushWatchlistToTrakt } from '../../services/trakt-sync';
 import XrelQualityBadge from '../../components/XrelQualityBadge';
+import { usePageScroll } from '../../hooks/usePageScroll';
 import './Watchlist.css';
 
 const ITEMS_PER_PAGE = 20;
@@ -28,9 +29,9 @@ function formatRelativeTime(dateStr: string): string {
 }
 
 const Watchlist: React.FC = () => {
-  const { watchlist, removeFromWatchlist, setSelectedMeta, continueWatching, watchlistScrollPosition, setWatchlistScrollPosition, watchlistPage, setWatchlistPage, view, traktConnected } = useStore();
+  const { watchlist, removeFromWatchlist, setSelectedMeta, continueWatching, watchlistScrollPosition, setWatchlistScrollPosition, watchlistPage, setWatchlistPage, watchlistFilter, traktConnected } = useStore();
   const [page, setPage] = useState(watchlistPage);
-  const [filter, setFilter] = useState<'all' | 'movies' | 'shows'>('all');
+  const [filter, setFilter] = useState<'all' | 'movies' | 'shows'>(watchlistFilter);
   const loadingRef = useRef(false);
 
   // Sort by listedAt (most recent first), then filter
@@ -78,7 +79,9 @@ const Watchlist: React.FC = () => {
   };
 
   const handleFilterChange = (nextFilter: 'all' | 'movies' | 'shows') => {
+    if (nextFilter === filter) return;
     setFilter(nextFilter);
+    useStore.setState({ watchlistFilter: nextFilter });
     setPage(1);
     setWatchlistPage(1);
     setWatchlistScrollPosition(0);
@@ -141,22 +144,11 @@ const Watchlist: React.FC = () => {
     };
   }, [hasMore, filteredItems.length, setWatchlistPage]);
 
-  useEffect(() => {
-    if (view !== 'watchlist' || watchlistScrollPosition <= 0 || displayedItems.length === 0) {
-      return;
-    }
-
-    const container = document.querySelector('.main-content');
-    if (!container) {
-      return;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      container.scrollTop = watchlistScrollPosition;
-    }, 100);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [view, watchlistScrollPosition, displayedItems.length, page]);
+  usePageScroll({
+    key: `watchlist:${filter}`,
+    position: watchlistScrollPosition,
+    save: setWatchlistScrollPosition,
+  });
 
   return (
     <div className="watchlist">

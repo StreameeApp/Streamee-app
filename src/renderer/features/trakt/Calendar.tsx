@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { FiChevronLeft, FiChevronRight, FiCalendar, FiFilm, FiTv } from 'react-icons/fi';
 import { getCalendarShows, getCalendarMovies, getCalendarFinales, TraktCalendarShow, TraktCalendarMovie } from '../../services/trakt';
 import { enrichTmdbItemsById } from '../../services/tmdb';
 import { useStore } from '../../store';
 import { getContinueWatchingProgressForTmdb } from '../../services/progress';
+import { usePageScroll } from '../../hooks/usePageScroll';
 import './Calendar.css';
 
 type CalendarFilter = 'all' | 'shows' | 'movies' | 'finales';
@@ -72,15 +73,22 @@ function getDefaultStartDate(): string {
 
 const Calendar: React.FC = () => {
   const [items, setItems] = useState<CalendarItem[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [filter, setFilter] = useState<CalendarFilter>('all');
-  const [startDate, setStartDate] = useState(() => getDefaultStartDate());
+  const [loading, setLoading] = useState(true);
   const calendarRequestIdRef = useRef(0);
 
-  const { traktConnected, setSelectedMeta, watched, watchedEpisodes, continueWatching, calendarScrollPosition, setCalendarScrollPosition } = useStore();
+  const { traktConnected, setSelectedMeta, watched, watchedEpisodes, continueWatching, calendarScrollPosition, setCalendarScrollPosition, calendarFilter, calendarStartDate } = useStore();
+
+  const [filter, setFilter] = useState<CalendarFilter>(calendarFilter);
+  const [startDate, setStartDate] = useState(() => calendarStartDate ?? getDefaultStartDate());
+  useEffect(() => {
+    useStore.setState({ calendarFilter: filter, calendarStartDate: startDate });
+  }, [filter, startDate]);
 
   const fetchCalendar = useCallback(async () => {
-    if (!traktConnected) return;
+    if (!traktConnected) {
+      setLoading(false);
+      return;
+    }
 
     const requestId = ++calendarRequestIdRef.current;
     const isCurrentRequest = () => calendarRequestIdRef.current === requestId;
@@ -265,35 +273,12 @@ const Calendar: React.FC = () => {
     return watched.some(w => w.id === `movie:${item.tmdbId}`);
   };
 
-  useEffect(() => {
-    const container = document.querySelector('.main-content');
-    if (!(container instanceof HTMLElement)) {
-      return;
-    }
-
-    const handleScroll = () => {
-      setCalendarScrollPosition(container.scrollTop);
-    };
-
-    container.addEventListener('scroll', handleScroll, { passive: true });
-
-    return () => {
-      container.removeEventListener('scroll', handleScroll);
-    };
-  }, [setCalendarScrollPosition]);
-
-  useLayoutEffect(() => {
-    if (loading || calendarScrollPosition <= 0) {
-      return;
-    }
-
-    const container = document.querySelector('.main-content');
-    if (!(container instanceof HTMLElement)) {
-      return;
-    }
-
-    container.scrollTo({ top: calendarScrollPosition, behavior: 'auto' });
-  }, [loading, calendarScrollPosition, items.length, filter, startDate]);
+  usePageScroll({
+    key: `calendar:${filter}:${startDate}`,
+    position: calendarScrollPosition,
+    save: setCalendarScrollPosition,
+    ready: !loading,
+  });
 
   if (!traktConnected) {
     return (

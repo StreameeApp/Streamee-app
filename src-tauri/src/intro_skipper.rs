@@ -32,6 +32,8 @@ const MIN_FUZZY_INTRO_SECONDS: f64 = 25.0;
 const MIN_FEEDBACK_INTRO_SECONDS: f64 = 10.0;
 const MIN_FEEDBACK_OUTRO_SECONDS: f64 = 5.0;
 const MAX_INTRO_SECONDS: f64 = 2.0 * 60.0;
+const INTRO_START_INSET_SECONDS: f64 = 1.0;
+const INTRO_END_INSET_SECONDS: f64 = 1.0;
 const SAMPLE_DURATION_SECONDS: f64 = 4096.0 / 11025.0 / 3.0;
 const MAX_POINT_BIT_DIFFERENCES: u32 = 6;
 const MAX_MATCH_GAP_POINTS: usize = 16;
@@ -1682,6 +1684,16 @@ fn segment_from_range(start: f64, end: f64, source: &str) -> Option<IntroDbSegme
     })
 }
 
+fn inset_intro_range(start: f64, end: f64) -> Option<(f64, f64)> {
+    let adjusted_start = start + INTRO_START_INSET_SECONDS;
+    let adjusted_end = end - INTRO_END_INSET_SECONDS;
+    (adjusted_start.is_finite()
+        && adjusted_end.is_finite()
+        && adjusted_start >= 0.0
+        && adjusted_end > adjusted_start)
+        .then_some((adjusted_start, adjusted_end))
+}
+
 fn feedback_candidate_from_range(
     kind: &str,
     start: f64,
@@ -2093,10 +2105,14 @@ pub async fn detect_intro_skipper_segment(
             })
             .max_by(|left, right| compare_intro_match_quality(&left.range, &right.range))
             .and_then(|entry| {
-                feedback_candidate_from_range(
-                    "intro",
+                let (candidate_start, candidate_end) = inset_intro_range(
                     window_start_seconds + entry.range.start,
                     window_start_seconds + entry.range.end,
+                )?;
+                feedback_candidate_from_range(
+                    "intro",
+                    candidate_start,
+                    candidate_end,
                     "intro-skipper",
                     match entry.range.method {
                         IntroMatchMethod::Exact => "short-exact-fingerprint-match",
@@ -2154,9 +2170,14 @@ pub async fn detect_intro_skipper_segment(
     let reference_episode = matched.reference_episode;
     let reference_window_start = matched.reference_window_start;
     let range = matched.range;
-    let absolute_start = window_start_seconds + range.start;
-    let absolute_end = window_start_seconds + range.end;
-    let absolute_reference_end = reference_window_start + range.reference_end;
+    let raw_absolute_start = window_start_seconds + range.start;
+    let raw_absolute_end = window_start_seconds + range.end;
+    let (absolute_start, absolute_end) = inset_intro_range(raw_absolute_start, raw_absolute_end)
+        .ok_or_else(|| {
+            "Intro Skipper match became invalid after applying boundary offsets".to_string()
+        })?;
+    let absolute_reference_end =
+        reference_window_start + range.reference_end - INTRO_END_INSET_SECONDS;
     let segment = segment_from_range(absolute_start, absolute_end, "intro-skipper");
     info!(
         event = "segment_detection.local.intro_detected",
@@ -2174,6 +2195,10 @@ pub async fn detect_intro_skipper_segment(
         close_point_density = range.close_point_density,
         start_seconds = absolute_start,
         end_seconds = absolute_end,
+        raw_start_seconds = raw_absolute_start,
+        raw_end_seconds = raw_absolute_end,
+        start_inset_seconds = INTRO_START_INSET_SECONDS,
+        end_inset_seconds = INTRO_END_INSET_SECONDS,
         reference_start_seconds = reference_window_start + range.reference_start,
         reference_end_seconds = absolute_reference_end,
         cached_episode_count,
@@ -2897,6 +2922,13 @@ mod tests {
         assert!(oversized_intro.is_none(), "selected={oversized_intro:?}");
         let outro = find_shared_outro(&lhs, &rhs, 720.0).expect("long outro should match");
         assert!(outro.end - outro.start > MAX_INTRO_SECONDS);
+    }
+
+    #[test]
+    fn insets_intro_playback_boundaries_by_one_second() {
+        assert_eq!(inset_intro_range(270.0, 294.0), Some((271.0, 293.0)));
+        assert_eq!(inset_intro_range(10.0, 12.0), None);
+        assert_eq!(inset_intro_range(f64::NAN, 294.0), None);
     }
 
     #[test]

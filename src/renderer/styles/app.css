@@ -21,6 +21,7 @@
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
+  overflow-anchor: none;
   background: linear-gradient(180deg, rgba(9, 12, 17, 0.88), rgba(7, 9, 13, 0.94));
   border: 1px solid var(--border-subtle);
   border-radius: 0;

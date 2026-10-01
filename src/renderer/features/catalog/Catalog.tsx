@@ -15,6 +15,7 @@ import {
 import XrelQualityBadge from '../../components/XrelQualityBadge';
 import { fetchAddonCatalogBatch, type AddonCatalogPage } from '../../services/addon-catalogs';
 import { getSupportedCatalogs, loadInstalledAddons } from '../../services/installed-addons';
+import { usePageScroll } from '../../hooks/usePageScroll';
 import './Catalog.css';
 
 const CATALOG_PAGE_SIZE = 20;
@@ -202,13 +203,13 @@ const Catalog: React.FC = () => {
     continueWatching,
     addToContinueWatching,
     catalogScrollPosition,
+    setCatalogScrollPosition,
     catalogItems,
     setCatalogItems,
     catalogPage,
     setCatalogPage,
     catalogCacheKey,
     setCatalogCacheKey,
-    view,
     traktConnected,
   } = useStore(useShallow((state) => ({
     selectedCatalog: state.selectedCatalog,
@@ -223,13 +224,13 @@ const Catalog: React.FC = () => {
     continueWatching: state.continueWatching,
     addToContinueWatching: state.addToContinueWatching,
     catalogScrollPosition: state.catalogScrollPosition,
+    setCatalogScrollPosition: state.setCatalogScrollPosition,
     catalogItems: state.catalogItems,
     setCatalogItems: state.setCatalogItems,
     catalogPage: state.catalogPage,
     setCatalogPage: state.setCatalogPage,
     catalogCacheKey: state.catalogCacheKey,
     setCatalogCacheKey: state.setCatalogCacheKey,
-    view: state.view,
     traktConnected: state.traktConnected,
   })));
   const [discoveryContentMode, setDiscoveryContentMode] = useState(getDiscoveryContentMode);
@@ -239,7 +240,6 @@ const Catalog: React.FC = () => {
   const [hasMore, setHasMore] = useState(true);
   const [virtualWindow, setVirtualWindow] = useState<CatalogVirtualWindow>(DEFAULT_VIRTUAL_WINDOW);
   const gridRef = useRef<HTMLDivElement | null>(null);
-  const restoredScrollKeyRef = useRef<string | null>(null);
   const pageRef = useRef(1);
   const loadingRef = useRef(false);
   const lastLoadRef = useRef(0);
@@ -617,39 +617,15 @@ const Catalog: React.FC = () => {
     }, scrollPosition);
   };
 
-  // Restore only after cached items and the virtual scroll height are ready.
-  useLayoutEffect(() => {
-    const restoreKey = selectedCatalog
-      ? `${selectedCatalog.source}:${selectedCatalog.id}:${selectedCatalog.type}:${catalogScrollPosition}`
-      : null;
-    if (
-      view !== 'catalog'
-      || !selectedCatalog
-      || catalogScrollPosition <= 0
-      || loading
-      || items.length === 0
-      || (isVirtualized && !virtualWindow.measured)
-      || restoredScrollKeyRef.current === restoreKey
-    ) {
-      return;
-    }
-
-    const container = document.querySelector('.main-content');
-    if (!(container instanceof HTMLElement)) return;
-
-    restoredScrollKeyRef.current = restoreKey;
-    container.scrollTop = catalogScrollPosition;
-    if (isVirtualized) updateVirtualWindow();
-  }, [
-    catalogScrollPosition,
-    isVirtualized,
-    items.length,
-    loading,
-    selectedCatalog,
-    updateVirtualWindow,
-    view,
-    virtualWindow.measured,
-  ]);
+  usePageScroll({
+    key: selectedCatalog ? buildCatalogCacheKey(selectedCatalog, discoveryContentMode) : 'catalog',
+    position: catalogScrollPosition,
+    save: (position) => {
+      if (useStore.getState().selectedCatalog === selectedCatalog) setCatalogScrollPosition(position);
+    },
+    ready: !loading && (!isVirtualized || virtualWindow.measured),
+    onRestored: updateVirtualWindow,
+  });
 
   if (!selectedCatalog) return null;
   const hideWatchedToggle = !!selectedCatalog.hideWatchedToggle;

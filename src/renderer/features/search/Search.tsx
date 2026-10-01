@@ -27,6 +27,7 @@ import {
   getDiscoveryContentMode,
   type DiscoveryContentMode,
 } from '../../services/discovery-content';
+import { usePageScroll } from '../../hooks/usePageScroll';
 import './Search.css';
 
 const YEARS = Array.from({ length: 30 }, (_, i) => new Date().getFullYear() - i);
@@ -46,6 +47,14 @@ type ActorCreditFilter = 'all' | 'movie' | 'series';
 type ListItemFilter = 'all' | 'movie' | 'series';
 type ListWatchFilter = 'all' | 'watched' | 'unwatched';
 type ListSort = 'list' | 'rating' | 'title' | 'release';
+
+let actorSession: {
+  cacheKey: string;
+  people: TmdbPerson[];
+  selectedActor: TmdbPerson | null;
+  credits: TmdbPersonCreditPreview[];
+  creditFilter: ActorCreditFilter;
+} | null = null;
 
 function formatReleaseDate(dateStr?: string): string {
   if (!dateStr) return '';
@@ -95,7 +104,6 @@ const Discover: React.FC = () => {
   const lastLoadRef = useRef(0);
   const initialLoadDone = useRef(false);
   const handledCacheKeyRef = useRef('');
-  const restoredScrollRef = useRef(false);
   const actorCreditsSectionRef = useRef<HTMLElement | null>(null);
   const listItemsSectionRef = useRef<HTMLElement | null>(null);
   const actorRequestIdRef = useRef(0);
@@ -296,6 +304,9 @@ const Discover: React.FC = () => {
 
   const refreshFilters = () => {
     handledCacheKeyRef.current = '';
+    actorSession = null;
+    const container = document.querySelector<HTMLElement>('.main-content');
+    if (container) container.scrollTop = 0;
     pageRef.current = 1;
     initialLoadDone.current = false;
     setHasMore(true);
@@ -518,7 +529,6 @@ const Discover: React.FC = () => {
     handledCacheKeyRef.current = cacheKey;
     pageRef.current = 1;
     initialLoadDone.current = false;
-    restoredScrollRef.current = false;
     setHasMore(true);
     if (
       listMode &&
@@ -541,6 +551,16 @@ const Discover: React.FC = () => {
       restoredListSessionRef.current = true;
       setPeople([]);
       setItems([]);
+      pageRef.current = discoverPage;
+      setLoading(false);
+      initialLoadDone.current = true;
+      return;
+    }
+    if (actorMode && actorSession?.cacheKey === cacheKey) {
+      setPeople(actorSession.people);
+      setSelectedActor(actorSession.selectedActor);
+      setActorCredits(actorSession.credits);
+      setActorCreditFilter(actorSession.creditFilter);
       pageRef.current = discoverPage;
       setLoading(false);
       initialLoadDone.current = true;
@@ -669,22 +689,17 @@ const Discover: React.FC = () => {
   }, [searchQuery, syncModeWithQuery]);
 
   useEffect(() => {
-    if (view !== 'search' || discoverScrollPosition <= 0 || !initialLoadDone.current || restoredScrollRef.current) {
-      return;
+    if (actorMode && !loading && !actorCreditsLoading && initialLoadDone.current) {
+      actorSession = { cacheKey, people, selectedActor, credits: actorCredits, creditFilter: actorCreditFilter };
     }
+  }, [actorMode, loading, actorCreditsLoading, cacheKey, people, selectedActor, actorCredits, actorCreditFilter]);
 
-    const container = document.querySelector('.main-content');
-    if (!container) {
-      return;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      container.scrollTop = discoverScrollPosition;
-      restoredScrollRef.current = true;
-    }, 100);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [view, discoverScrollPosition, discoverPage]);
+  usePageScroll({
+    key: `${cacheKey}:${selectedList?.id ?? ''}`,
+    position: discoverScrollPosition,
+    save: setDiscoverScrollPosition,
+    ready: !loading && initialLoadDone.current,
+  });
 
   const handleItemClick = (item: MetaPreview) => {
     const container = document.querySelector('.main-content');
@@ -768,6 +783,7 @@ const Discover: React.FC = () => {
     setSelectedList(list);
     updateDiscoverListState({ cacheKey, selectedList: list, complete: false });
     if (!resume) {
+      setDiscoverScrollPosition(0);
       setListItems([]);
       setListItemsTotal(list.itemCount);
       updateDiscoverListState({

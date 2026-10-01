@@ -440,6 +440,12 @@ export interface RifeRuntimeInfo {
   message: string;
 }
 
+export interface OptiflowRuntimeInfo {
+  ready: boolean;
+  driverApiVersion: number | null;
+  message: string;
+}
+
 export interface RifeInstallProgress {
   phase: 'downloading' | 'extracting' | 'complete';
   message: string;
@@ -1378,6 +1384,11 @@ const tauriAPI = {
       return await listen<RifePlaybackStatus>('rife://playback-status', (event) => {
         callback(event.payload);
       });
+    },
+  },
+  optiflow: {
+    getRuntimeInfo: async () => {
+      return await invoke<OptiflowRuntimeInfo>('get_optiflow_runtime_info');
     },
   },
   audioNormalizer: {

@@ -7,6 +7,7 @@ import { getTraktRateLimitRetryAt, isAuthenticated as checkTraktAuth } from '../
 import { detectSystemTmdbWatchRegion, setTmdbSettings } from '../../services/tmdb';
 import { setOmdbSettings } from '../../services/omdb';
 import { clearApiKeys, getApiKey } from '../../services/api-keys';
+import { loadOptiflowEnabled, saveOptiflowEnabled } from '../../services/optiflow-settings';
 import { syncToTrakt, syncFromTrakt } from '../../services/trakt-sync';
 import {
   announceDiscoveryContentModeChange,
@@ -33,10 +34,12 @@ import {
   setXrelLanguagePreference,
   subscribeXrelQualitySnapshot,
 } from '../../services/xrel';
-import type { RifeCacheInfo, RifePlaybackStatus, RifeRuntimeInfo, WhisperRuntimeInfo } from '../../services/tauri';
+import type { OptiflowRuntimeInfo, RifeCacheInfo, RifePlaybackStatus, RifeRuntimeInfo, WhisperRuntimeInfo } from '../../services/tauri';
 import { useStore } from '../../store';
+import { useCachedPageScroll } from '../../hooks/usePageScroll';
 import TraktConnect from '../trakt/TraktConnect';
 import AddonSettings from './AddonSettings';
+import OptiflowClockSettings from './OptiflowClockSettings';
 import LegalDocuments from './LegalDocuments';
 import { openAudioNormalizerWindow } from '../../services/audio-normalizer-window';
 import {
@@ -346,6 +349,8 @@ const resetNativeSettings = async () => {
     window.electronAPI.settings.setSetting('svpAutoRestartOnPlaylistChange', 'false'),
     window.electronAPI.settings.setSetting('svpAutoCloseOnMpvClose', 'false'),
     window.electronAPI.settings.setSetting('mpvRifeEnabled', 'false'),
+    window.electronAPI.settings.setSetting('mpvOptiflowEnabled', 'false'),
+    window.electronAPI.settings.setSetting('mpvOptiflowClockControl', '{"enabled":false,"minimumMhz":0,"maximumMhz":0}'),
     window.electronAPI.settings.setSetting('mpvRifeModel', '4.6'),
     window.electronAPI.settings.setSetting('mpvRifeMultiplier', '2'),
     window.electronAPI.settings.setSetting('mpvRifeGpuStreams', '2'),
@@ -410,6 +415,8 @@ const normalizePreferredMediaLanguage = (value: unknown): PreferredMediaLanguage
     : 'en';
 };
 
+let lastSettingsCategory: SettingsCategoryId = 'providers';
+
 const Settings: React.FC = () => {
   const {
     audioNormalizerEnabled,
@@ -460,6 +467,14 @@ const Settings: React.FC = () => {
   const [svpAutoRestartOnPlaylistChange, setSvpAutoRestartOnPlaylistChange] = useState(false);
   const [svpAutoCloseOnMpvClose, setSvpAutoCloseOnMpvClose] = useState(false);
   const [mpvRifeEnabled, setMpvRifeEnabled] = useState(false);
+  const [mpvOptiflowEnabled, setMpvOptiflowEnabled] = useState(false);
+  const mpvOptiflowEnabledRef = useRef(false);
+  const [optiflowSettingLoaded, setOptiflowSettingLoaded] = useState(false);
+  const [optiflowSaving, setOptiflowSaving] = useState(false);
+  const optiflowSavingRef = useRef(false);
+  const [optiflowSaveMessage, setOptiflowSaveMessage] = useState<string | null>(null);
+  const [optiflowRuntimeInfo, setOptiflowRuntimeInfo] = useState<OptiflowRuntimeInfo | null>(null);
+  const [optiflowRuntimeMessage, setOptiflowRuntimeMessage] = useState('Checking NVIDIA Optical Flow runtime...');
   const [mpvRifeModel, setMpvRifeModel] = useState<RifeModel>('4.6');
   const [mpvRifeMultiplier, setMpvRifeMultiplier] = useState<RifeMultiplier>(2);
   const [mpvRifeGpuStreams, setMpvRifeGpuStreams] = useState<RifeGpuStreams>(2);
@@ -502,7 +517,11 @@ const Settings: React.FC = () => {
   const [clearSyncDataStatus, setClearSyncDataStatus] = useState<'idle' | 'clearing' | 'success' | 'error'>('idle');
   const [clearSyncDataMessage, setClearSyncDataMessage] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
-  const [activeCategoryId, setActiveCategoryId] = useState<SettingsCategoryId>('providers');
+  const [activeCategoryId, setActiveCategoryId] = useState<SettingsCategoryId>(lastSettingsCategory);
+  useCachedPageScroll(`settings:${activeCategoryId}`);
+  useEffect(() => {
+    lastSettingsCategory = activeCategoryId;
+  }, [activeCategoryId]);
   const [settingsSearchQuery, setSettingsSearchQuery] = useState('');
   const [settingsSearchFocused, setSettingsSearchFocused] = useState(false);
   const [settingsSearchEntries, setSettingsSearchEntries] = useState<SettingsSearchEntry[]>([]);
@@ -581,7 +600,6 @@ const Settings: React.FC = () => {
 
   const handleCategoryClick = (categoryId: SettingsCategoryId) => {
     setActiveCategoryId(categoryId);
-    scrollSettingsContainerTo(0);
   };
 
   const handleSettingsSearchResultClick = (entry: SettingsSearchEntry) => {
@@ -912,6 +930,17 @@ const Settings: React.FC = () => {
       }
 
       try {
+        const enabled = await loadOptiflowEnabled(window.electronAPI.settings);
+        if (cancelled) return;
+        mpvOptiflowEnabledRef.current = enabled;
+        setMpvOptiflowEnabled(enabled);
+        setOptiflowSettingLoaded(true);
+      } catch (error) {
+        if (cancelled) return;
+        setOptiflowSaveMessage(`Could not load OptiFlow setting: ${errorMessage(error)}`);
+      }
+
+      try {
         const normalizerConfig = await window.electronAPI.audioNormalizer.getConfig();
         if (cancelled) return;
         setAudioNormalizerEnabled(normalizerConfig.enabled);
@@ -1014,6 +1043,25 @@ const Settings: React.FC = () => {
     }
   };
 
+  const handleOptiflowChange = async (enabled: boolean): Promise<boolean> => {
+    if (!optiflowSettingLoaded || optiflowSavingRef.current) return false;
+    optiflowSavingRef.current = true;
+    setOptiflowSaving(true);
+    setOptiflowSaveMessage(null);
+    try {
+      await saveOptiflowEnabled(window.electronAPI.settings, localStorage, enabled);
+      mpvOptiflowEnabledRef.current = enabled;
+      setMpvOptiflowEnabled(enabled);
+      return true;
+    } catch (error) {
+      setOptiflowSaveMessage(`Could not save OptiFlow setting: ${errorMessage(error)}`);
+      return false;
+    } finally {
+      optiflowSavingRef.current = false;
+      setOptiflowSaving(false);
+    }
+  };
+
   const persistSettings = async () => {
     const previousDiscoveryContentMode = getDiscoveryContentMode();
     await Promise.all([
@@ -1062,6 +1110,7 @@ const Settings: React.FC = () => {
       svpAutoRestartOnPlaylistChange,
       svpAutoCloseOnMpvClose,
       mpvRifeEnabled,
+      mpvOptiflowEnabled: mpvOptiflowEnabledRef.current,
       mpvRifeModel,
       mpvRifeMultiplier,
       mpvRifeGpuStreams,
@@ -1195,6 +1244,7 @@ const Settings: React.FC = () => {
     svpAutoRestartOnPlaylistChange,
     svpAutoCloseOnMpvClose,
     mpvRifeEnabled,
+    mpvOptiflowEnabled,
     mpvRifeModel,
     mpvRifeMultiplier,
     mpvRifeGpuStreams,
@@ -1329,6 +1379,24 @@ const Settings: React.FC = () => {
       unlistenPlayerClosed?.();
     };
   }, [mpvRifeModel]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.electronAPI.optiflow.getRuntimeInfo()
+      .then((runtime) => {
+        if (cancelled) return;
+        setOptiflowRuntimeInfo(runtime);
+        setOptiflowRuntimeMessage(runtime.message);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setOptiflowRuntimeInfo({ ready: false, driverApiVersion: null, message: errorMessage(error) });
+        setOptiflowRuntimeMessage(`Could not check NVIDIA Optical Flow runtime: ${errorMessage(error)}`);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleInstallRife = async () => {
     setRifeInstallStatus('installing');
@@ -1847,6 +1915,63 @@ const Settings: React.FC = () => {
               />
             </div>
           </div>
+        </div>
+      </section>
+
+      <section
+        className={`settings-section${activeCategoryId === 'integrations' ? ' is-visible' : ''}`}
+        data-settings-page="integrations"
+        id="optiflow"
+      >
+        <h2><FiZap /> OptiFlow <small>WIP</small></h2>
+        <p className="settings-description">
+          Experimental 2× interpolation using NVIDIA optical-flow hardware and Streamee&apos;s own
+          GPU shaders. Processes D3D11 NV12/P010, preserving the HDR signal. Quality and real-time
+          4K performance remain under validation. Frames with incompatible
+          dynamic HDR metadata are held instead of interpolated. No SDK import is required.
+        </p>
+
+        <div className="settings-form">
+          <div className="settings-runtime-card">
+            <div className="settings-runtime-copy">
+              <strong>Custom OptiFlow engine</strong>
+              <span>{optiflowRuntimeInfo?.ready ? 'Driver API and custom player available' : optiflowRuntimeInfo ? 'OptiFlow unavailable' : 'Checking OptiFlow availability'}</span>
+              <small>{optiflowRuntimeMessage}</small>
+            </div>
+          </div>
+
+          <div className="settings-toggle">
+            <div className="settings-toggle-info">
+              <label>Enable OptiFlow (WIP)</label>
+              <span className="settings-toggle-desc">
+                Uses the custom OptiFlow player on the next playback. Enabling it turns off RIFE
+                and SVP so only one interpolation system runs.
+              </span>
+            </div>
+            <button
+              className={`toggle-btn ${mpvOptiflowEnabled ? 'active' : ''}`}
+              onClick={async () => {
+                const enabled = !mpvOptiflowEnabled;
+                if (!await handleOptiflowChange(enabled)) return;
+                if (enabled) {
+                  setMpvRifeEnabled(false);
+                  setSvpAutoStartEnabled(false);
+                  setSvpAutoRestartOnPlaylistChange(false);
+                  void window.electronAPI.stopSvp(svpExecutablePath).catch((error) => {
+                    console.warn('[Settings][OptiFlow] Could not stop SVP while enabling OptiFlow:', error);
+                  });
+                }
+              }}
+              aria-label="Toggle OptiFlow"
+              aria-pressed={mpvOptiflowEnabled}
+              disabled={!optiflowSettingLoaded || optiflowSaving || (!mpvOptiflowEnabled && !optiflowRuntimeInfo?.ready)}
+              type="button"
+            >
+              <span className="toggle-slider" />
+            </button>
+          </div>
+          {optiflowSaveMessage && <p role="alert">{optiflowSaveMessage}</p>}
+          <OptiflowClockSettings />
         </div>
       </section>
 
@@ -3029,8 +3154,9 @@ const Settings: React.FC = () => {
             </div>
             <button
               className={`toggle-btn ${mpvRifeEnabled ? 'active' : ''}`}
-              onClick={() => {
+              onClick={async () => {
                 const enabled = !mpvRifeEnabled;
+                if (enabled && !await handleOptiflowChange(false)) return;
                 setMpvRifeEnabled(enabled);
                 if (enabled) {
                   setSvpAutoStartEnabled(false);
@@ -3041,7 +3167,7 @@ const Settings: React.FC = () => {
                 }
               }}
               aria-label="Toggle Streamee RIFE frame generation"
-              disabled={(!mpvRifeEnabled && !rifeRuntimeInfo?.ready) || rifeInstallStatus === 'installing' || rifePreparationStatus === 'preparing'}
+              disabled={optiflowSaving || (!mpvRifeEnabled && !rifeRuntimeInfo?.ready) || rifeInstallStatus === 'installing' || rifePreparationStatus === 'preparing'}
               type="button"
             >
               <span className="toggle-slider" />
@@ -3304,8 +3430,8 @@ const Settings: React.FC = () => {
             <div className="settings-toggle-info">
               <label>Start SVP with MPV</label>
               <span className="settings-toggle-desc">
-                {mpvRifeEnabled
-                  ? 'Disabled while Streamee RIFE is enabled to prevent two interpolation systems running together.'
+                {mpvRifeEnabled || mpvOptiflowEnabled
+                  ? 'Disabled while Streamee frame interpolation is enabled.'
                   : 'Starts the selected SVP manager whenever Streamee launches MPV.'}
               </span>
             </div>
@@ -3313,7 +3439,7 @@ const Settings: React.FC = () => {
               className={`toggle-btn ${svpAutoStartEnabled ? 'active' : ''}`}
               onClick={() => setSvpAutoStartEnabled((prev) => !prev)}
               aria-label="Toggle SVP startup with MPV"
-              disabled={mpvRifeEnabled}
+              disabled={mpvRifeEnabled || mpvOptiflowEnabled}
               type="button"
             >
               <span className="toggle-slider" />
@@ -3325,8 +3451,8 @@ const Settings: React.FC = () => {
             <div className="settings-toggle-info">
               <label>Restart SVP on playlist changes</label>
               <span className="settings-toggle-desc">
-                {mpvRifeEnabled
-                  ? 'Disabled while Streamee RIFE is enabled.'
+                {mpvRifeEnabled || mpvOptiflowEnabled
+                  ? 'Disabled while Streamee frame interpolation is enabled.'
                   : 'Restarts SVP after MPV moves to a different playlist item.'}
               </span>
             </div>
@@ -3334,7 +3460,7 @@ const Settings: React.FC = () => {
               className={`toggle-btn ${svpAutoRestartOnPlaylistChange ? 'active' : ''}`}
               onClick={() => setSvpAutoRestartOnPlaylistChange((prev) => !prev)}
               aria-label="Toggle SVP restart on playlist changes"
-              disabled={mpvRifeEnabled}
+              disabled={mpvRifeEnabled || mpvOptiflowEnabled}
               type="button"
             >
               <span className="toggle-slider" />

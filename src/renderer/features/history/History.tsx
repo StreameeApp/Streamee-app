@@ -1,7 +1,8 @@
-import React, { useState, useMemo, useEffect, useLayoutEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { FiClock, FiFilm, FiTv } from 'react-icons/fi';
 import { useStore } from '../../store';
 import XrelQualityBadge from '../../components/XrelQualityBadge';
+import { usePageScroll } from '../../hooks/usePageScroll';
 import './History.css';
 
 function formatRelativeTime(dateStr: string): string {
@@ -51,12 +52,10 @@ interface HistoryItem {
 }
 
 const History: React.FC = () => {
-  const [filter, setFilter] = useState<'all' | 'movies' | 'shows'>('all');
   const loadingRef = useRef(false);
-  const { continueWatching, watched, setSelectedMeta, historyScrollPosition, setHistoryScrollPosition, historyPage, setHistoryPage, view } = useStore();
+  const { continueWatching, watched, setSelectedMeta, historyScrollPosition, setHistoryScrollPosition, historyPage, setHistoryPage, historyFilter } = useStore();
+  const [filter, setFilter] = useState<'all' | 'movies' | 'shows'>(historyFilter);
   const [page, setPage] = useState(historyPage);
-  const restoreFrameRef = useRef<number | null>(null);
-  const restoreAttemptsRef = useRef(0);
 
   const allHistory = useMemo(() => {
     const items: HistoryItem[] = [];
@@ -134,6 +133,7 @@ const History: React.FC = () => {
     if (!hasMore || loadingRef.current) return;
 
     const checkScroll = () => {
+      if (loadingRef.current) return;
       const container = document.querySelector('.main-content');
       if (!container) return;
 
@@ -191,7 +191,9 @@ const History: React.FC = () => {
   };
 
   const handleFilterChange = (nextFilter: 'all' | 'movies' | 'shows') => {
+    if (nextFilter === filter) return;
     setFilter(nextFilter);
+    useStore.setState({ historyFilter: nextFilter });
     setPage(1);
     setHistoryPage(1);
     setHistoryScrollPosition(0);
@@ -211,46 +213,11 @@ const History: React.FC = () => {
     }
   }, [filteredItems.length, historyPage, page, setHistoryPage]);
 
-  useLayoutEffect(() => {
-    if (view !== 'history' || historyScrollPosition <= 0 || displayedItems.length === 0) {
-      return;
-    }
-
-    const container = document.querySelector('.main-content');
-    if (!container) {
-      return;
-    }
-
-    if (restoreFrameRef.current) {
-      window.cancelAnimationFrame(restoreFrameRef.current);
-      restoreFrameRef.current = null;
-    }
-
-    restoreAttemptsRef.current = 0;
-
-    const attemptRestore = () => {
-      const current = document.querySelector('.main-content');
-      if (!current) {
-        return;
-      }
-
-      current.scrollTo({ top: historyScrollPosition, behavior: 'auto' });
-
-      if (Math.abs(current.scrollTop - historyScrollPosition) > 2 && restoreAttemptsRef.current < 6) {
-        restoreAttemptsRef.current += 1;
-        restoreFrameRef.current = window.requestAnimationFrame(attemptRestore);
-      }
-    };
-
-    attemptRestore();
-
-    return () => {
-      if (restoreFrameRef.current) {
-        window.cancelAnimationFrame(restoreFrameRef.current);
-        restoreFrameRef.current = null;
-      }
-    };
-  }, [view, historyPage, historyScrollPosition, displayedItems.length]);
+  usePageScroll({
+    key: `history:${filter}`,
+    position: historyScrollPosition,
+    save: setHistoryScrollPosition,
+  });
 
   return (
     <div className="history">
