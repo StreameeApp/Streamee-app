@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 const DISCORD_CLIENT_ID: &str = "1522958528879263835";
 const LARGE_IMAGE_KEY: &str = "streamee";
+const LANDING_PAGE_URL: &str = "https://streameeapp.github.io/Streamee-landing/";
 
 static PRESENCE: Lazy<Mutex<DiscordPresenceState>> =
     Lazy::new(|| Mutex::new(DiscordPresenceState::default()));
@@ -150,16 +151,8 @@ fn build_activity(payload: &DiscordPresencePayload) -> Activity<'static> {
         .status_display_type(StatusDisplayType::Details)
         .details(title)
         .state(truncate_activity_text(&state_text, 128))
-        .assets(assets);
-
-    if let Some(imdb_url) = payload
-        .imdb_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| is_valid_imdb_title_url(value))
-    {
-        activity = activity.buttons(vec![Button::new("View on IMDb", imdb_url.to_string())]);
-    }
+        .assets(assets)
+        .buttons(vec![Button::new("Visit Streamee", LANDING_PAGE_URL)]);
 
     if !payload.paused {
         activity = activity.timestamps(build_timestamps(payload));
@@ -202,14 +195,6 @@ fn truncate_activity_text(value: &str, max_chars: usize) -> String {
         output.push_str("...");
     }
     output
-}
-
-fn is_valid_imdb_title_url(value: &str) -> bool {
-    value
-        .strip_prefix("https://www.imdb.com/title/tt")
-        .and_then(|rest| rest.strip_suffix('/'))
-        .map(|id| id.chars().all(|ch| ch.is_ascii_digit()))
-        .unwrap_or(false)
 }
 
 fn is_valid_external_image_url(value: &str) -> bool {
