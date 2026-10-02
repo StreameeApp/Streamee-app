@@ -56,7 +56,7 @@
                },
     "plugins":  {
                     "updater":  {
-                                    "pubkey":  "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlFM0EyOUE5QTQ4RkNDQTUKUldTbHpJK2txU2s2bnVGbHYzUmxrNUZmQU9zeDRmbEJmSXFEbW5uZU9ETmZKTDlUVTBIV0U3eWEK",
+                                    "pubkey":  "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZCQUFGOEJCMTlEQzM1NjgKUldSb05kd1p1L2lxYTBqRFpvdTVnek9JbEpwd250bHQ2bmRlRTVuKzduUmhObjFseVpUSEUycWUK",
                                     "endpoints":  [
                                                       "https://github.com/StreameeApp/Streamee-app/releases/latest/download/latest-{{bundle_type}}.json"
                                                   ],
