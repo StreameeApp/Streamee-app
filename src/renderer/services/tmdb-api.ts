@@ -131,7 +131,8 @@ function recordTmdbWorkerOutcome(config: object | undefined, failed: boolean): v
   if (bucket === tmdbRequestDiagnosticBucket) scheduleTmdbRequestDiagnosticFlush();
 }
 
-const configuredWorkerUrl = import.meta.env?.VITE_TMDB_WORKER_URL?.trim().replace(/\/+$/, '');
+const configuredWorkerUrl = import.meta.env?.VITE_TMDB_WORKER_URL?.trim().replace(/\/+$/, '')
+  || (import.meta.env?.DEV ? undefined : 'https://streamee-tmdb.streameeapp.workers.dev');
 const tmdbWorkerBaseUrl = configuredWorkerUrl
   ? `${configuredWorkerUrl}/v1/tmdb`
   : 'http://127.0.0.1:8787/v1/tmdb';
