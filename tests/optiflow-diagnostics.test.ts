@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 test('GPU profile rejects missing filters, fallback, wrong size and missing rendering',
-  { skip: process.platform !== 'win32' }, () => {
+  { skip: process.platform !== 'win32' || !existsSync(new URL('../mpv/mpv.com', import.meta.url)) }, () => {
     const path = (relative: string) => fileURLToPath(new URL(relative, import.meta.url));
     const result = spawnSync(path('../mpv/mpv.com'), ['--no-config', '--load-scripts=no',
       '--idle=yes', '--vo=null', '--ao=null', `--script=${path('optiflow-gpu-profile.lua')}`], {
@@ -16,7 +17,7 @@ test('GPU profile rejects missing filters, fallback, wrong size and missing rend
   });
 
 test('OptiFlow overlay distinguishes active, fallback, unknown, and disabled enhancements',
-  { skip: process.platform !== 'win32' }, () => {
+  { skip: process.platform !== 'win32' || !existsSync(new URL('../mpv/mpv.exe', import.meta.url)) }, () => {
     const path = (relative: string) => fileURLToPath(new URL(relative, import.meta.url));
     const result = spawnSync(path('../mpv/mpv.exe'), ['--no-config', '--load-scripts=no',
       '--idle=yes', '--vo=null', '--ao=null', '--terminal=yes',

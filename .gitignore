@@ -37,7 +37,6 @@ coverage/
 
 # Rust/Tauri
 src-tauri/target/
-src-tauri/Cargo.lock
 
 # Build outputs
 mpv/*

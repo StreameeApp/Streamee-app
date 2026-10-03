@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile, access } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -22,7 +23,7 @@ test('OptiFlow launch has no imported FRUC or software-adapter fallback', async 
 });
 
 test('OptiFlow enhanced playback gates HDR and P010 without changing preferences',
-  { skip: process.platform !== 'win32' }, () => {
+  { skip: process.platform !== 'win32' || !existsSync(new URL('../mpv/mpv.com', import.meta.url)) }, () => {
     const path = (s: string) => fileURLToPath(new URL(s, import.meta.url));
     const result = spawnSync(path('../mpv/mpv.com'), ['--no-config', '--load-scripts=no',
       '--idle=yes', '--vo=null', '--ao=null', `--script=${path('rtx-hdr-gating.lua')}`], {
