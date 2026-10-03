@@ -4,6 +4,10 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const dns = require('dns');
+
+// DHT uses an IPv4 UDP socket; prefer matching addresses for dual-stack routers.
+dns.setDefaultResultOrder('ipv4first');
 
 const STREAM_CACHE_ROOT = path.join(os.tmpdir(), 'Streamee', 'webtorrent-stream-cache');
 const PERSISTENT_CACHE_VERSION = 1;
@@ -85,6 +89,7 @@ const clientReady = Promise.all([
     parseTorrentSource = parseTorrentModule.default || parseTorrentModule;
     client = new WebTorrent({
       tracker: {
+        announce: ['udp://tracker.opentrackr.org:1337/announce'],
         rtcConfig: null,
         wrtc: false,
         getAnnounceOpts: () => ({
@@ -142,6 +147,7 @@ async function ensureClientReady() {
 let httpServer = null;
 let httpPort = null;
 let currentTorrent = null;
+let torrentSessionGeneration = 0;
 let fullCacheEnabled = false;
 let fullCacheFileIndex = null;
 let fullCacheGeneration = 0;
@@ -300,9 +306,24 @@ function requestTorrentSource(url) {
   });
 }
 
+function normalizeMagnetUri(source) {
+  if (typeof source !== 'string' || !source.startsWith('magnet:?')) return source;
+  return source.replace(/([?&]xt=)([^&]*)/gi, (match, prefix, value) => {
+    try {
+      const decoded = decodeURIComponent(value);
+      if (/^urn:btih:(?:[a-f0-9]{40}|[a-z2-7]{32})$/i.test(decoded)) {
+        return `${prefix}${decoded}`;
+      }
+    } catch {
+      // Keep invalid identifiers intact so the torrent parser reports the error.
+    }
+    return match;
+  });
+}
+
 async function resolveTorrentSource(source, redirectCount = 0) {
   if (!source || !/^https?:/i.test(source)) {
-    return source;
+    return normalizeMagnetUri(source);
   }
 
   if (redirectCount > 5) {
@@ -327,7 +348,7 @@ async function resolveTorrentSource(source, redirectCount = 0) {
     });
 
     if (resolvedLocation.startsWith('magnet:?')) {
-      return resolvedLocation;
+      return normalizeMagnetUri(resolvedLocation);
     }
 
     if (/^https?:/i.test(resolvedLocation)) {
@@ -1027,12 +1048,15 @@ function recordDownloadedBytes(bytes) {
 }
 
 async function startTorrent(magnetUri, cacheOptions = {}) {
+  const generation = ++torrentSessionGeneration;
   await ensureClientReady();
+  if (generation !== torrentSessionGeneration) return null;
 
   if (currentTorrent) {
     emitDownloadTransferProgress(true);
     await destroyCurrentTorrent();
     await waitForTick(250);
+    if (generation !== torrentSessionGeneration) return null;
     currentTorrentMetadataReady = false;
     resetDownloadTransferTelemetry();
     resetTrackerStats();
@@ -1040,6 +1064,7 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
 
   const resolvedTorrentSource = await resolveTorrentSource(magnetUri);
   const parsedTorrentSource = await parseTorrentSource(resolvedTorrentSource);
+  if (generation !== torrentSessionGeneration) return null;
   const infoHash = typeof parsedTorrentSource?.infoHash === 'string'
     ? parsedTorrentSource.infoHash.toLowerCase()
     : null;
@@ -1113,27 +1138,28 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
   fs.mkdirSync(activeStreamCacheDir, { recursive: true });
 
   return new Promise((resolve, reject) => {
+    let startupComplete = false;
     const addOptions = {
       path: activeStreamCacheDir,
       deselect: true,
       destroyStoreOnDestroy: !activeStreamCachePersistent,
     };
-    client.add(resolvedTorrentSource, addOptions, async (torrent) => {
-      currentTorrent = torrent;
-      resetDownloadTransferTelemetry();
-
-      // Report actual peer bytes, including retries, without treating cached pieces as transfers.
-      torrent.on('download', recordDownloadedBytes);
-
-      torrent.on('error', (err) => {
-        sendMessage({ type: 'error', message: err.message });
-      });
+    const torrent = client.add(resolvedTorrentSource, addOptions, async (torrent) => {
+      if (generation !== torrentSessionGeneration || currentTorrent !== torrent) {
+        resolve(null);
+        return;
+      }
 
       try {
         await markTorrentStoreSparse(torrent);
       } catch (err) {
-        await destroyCurrentTorrent();
         reject(err);
+        if (currentTorrent === torrent) await destroyCurrentTorrent();
+        return;
+      }
+
+      if (generation !== torrentSessionGeneration || currentTorrent !== torrent) {
+        resolve(null);
         return;
       }
 
@@ -1151,46 +1177,54 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
       // must also invalidate WebTorrent's bitfield and peer availability; an
       // earlier store-only LRU caused read failures after pieces were evicted.
 
-      // Check if metadata already available (for non-magnet torrents)
-      if (torrent.files && torrent.files.length > 0) {
-        writeLog('debug', 'torrent.files_immediately_available', 'Torrent files available immediately', {
-          file_count: torrent.files.length,
-        });
-        currentTorrentMetadataReady = true;
-        attachTrackerStats(torrent);
-        sendMessage({
-          type: 'ready', 
-          status: 'ready', 
-          fileCount: torrent.files.length,
-          files: torrent.files.map((f, i) => mapTorrentFile(f, i))
-        });
-        resolve({
-          name: torrent.name,
-          files: torrent.files.map((f, i) => mapTorrentFile(f, i)),
-        });
-        return;
-      }
+      // WebTorrent invokes the add callback after metadata and storage are ready.
+      currentTorrentMetadataReady = true;
+      startupComplete = true;
+      attachTrackerStats(torrent);
+      sendMessage({
+        type: 'ready',
+        status: 'ready',
+        fileCount: torrent.files.length,
+        files: torrent.files.map((f, i) => mapTorrentFile(f, i)),
+      });
+      resolve({
+        name: torrent.name,
+        files: torrent.files.map((f, i) => mapTorrentFile(f, i)),
+      });
+    });
 
-      // For magnets, wait for metadata event
-      writeLog('debug', 'torrent.metadata_waiting', 'Waiting for torrent metadata');
-      torrent.on('metadata', () => {
-        writeLog('info', 'torrent.metadata_received', 'Torrent metadata received', {
-          file_count: torrent.files.length,
-        });
-        currentTorrentMetadataReady = true;
-        attachTrackerStats(torrent);
-        sendMessage({
-          type: 'ready', 
-          status: 'ready', 
-          fileCount: torrent.files.length, 
-          files: torrent.files.map((f, i) => mapTorrentFile(f, i)) 
-        });
-        resolve({
-          name: torrent.name,
-          files: torrent.files.map((f, i) => mapTorrentFile(f, i)),
+    // Track the returned torrent immediately, including during metadata discovery.
+    currentTorrent = torrent;
+    currentTorrentMetadataReady = false;
+    resetDownloadTransferTelemetry();
+    torrent.on('download', recordDownloadedBytes);
+    torrent.on('error', (err) => {
+      if (startupComplete) sendMessage({ type: 'error', message: err.message });
+      else reject(err);
+    });
+    torrent.once('close', () => resolve(null));
+    torrent.once('infoHash', () => {
+      const attach = () => setImmediate(() => {
+        if (currentTorrent === torrent) attachTrackerStats(torrent);
+      });
+      if (client.listening) attach();
+      else client.once('listening', attach);
+      writeLog('info', 'torrent.metadata_waiting', 'Waiting for torrent metadata', {
+        tracker_count: torrent.announce.length,
+      });
+    });
+    torrent.once('metadata', () => {
+      writeLog('info', 'torrent.metadata_received', 'Torrent metadata received', {
+        file_count: torrent.files.length,
+      });
+    });
+    torrent.on('wire', (wire) => {
+      wire.ut_metadata?.on('warning', (err) => {
+        writeLog('warn', 'torrent.metadata_peer_warning', 'Peer could not provide torrent metadata', {
+          reason: err.message,
+          connected_peers: torrent.numPeers,
         });
       });
-
     });
 
     // Note: client.on('error') is handled globally at line 46 — no duplicate listener here
@@ -1198,6 +1232,7 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
 }
 
 async function stopTorrent() {
+  torrentSessionGeneration += 1;
   await clientReady.catch(() => {});
   if (currentTorrent) {
     emitDownloadTransferProgress(true);

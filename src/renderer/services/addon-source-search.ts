@@ -1,4 +1,5 @@
 import type { TorrentResult } from '../store';
+import { buildAddonMagnetUri } from './torrent-utils';
 import {
   fetchInstalledAddonStreams,
   getEnabledStreamAddons,
@@ -72,7 +73,7 @@ function toTorrentResult(addon: InstalledAddon, stream: InstalledAddonStream): T
   const infoHash = stream.infoHash?.trim() || '';
   const streamHandle = stream.streamHandle?.trim() || undefined;
   const magnetUri = infoHash
-    ? `magnet:?xt=urn:btih:${encodeURIComponent(infoHash)}`
+    ? buildAddonMagnetUri(infoHash, stream.sources)
     : streamHandle
       ? `streamee-addon://${streamHandle}`
       : '';

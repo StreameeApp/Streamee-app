@@ -1,3 +1,21 @@
+export function buildAddonMagnetUri(infoHash: string, sources: string[] = []): string {
+  let magnet = `magnet:?xt=urn:btih:${encodeURIComponent(infoHash)}`;
+  const trackers = new Set<string>();
+  for (const source of sources) {
+    if (!/^tracker:/i.test(source.trim())) continue;
+    try {
+      const tracker = new URL(source.trim().replace(/^tracker:/i, ''));
+      if (!['udp:', 'http:', 'https:'].includes(tracker.protocol)) continue;
+      if (!tracker.hostname || tracker.username || tracker.password || tracker.hash) continue;
+      trackers.add(tracker.href);
+    } catch {
+      // Ignore malformed discovery hints while retaining the playable info hash.
+    }
+  }
+  for (const tracker of trackers) magnet += `&tr=${encodeURIComponent(tracker)}`;
+  return magnet;
+}
+
 interface EpisodeNumber {
   season: number;
   episode: number;

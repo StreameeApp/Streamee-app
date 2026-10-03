@@ -64,6 +64,7 @@ export interface InstalledAddonStream {
   playbackKind: 'http' | 'torrent';
   streamHandle?: string;
   infoHash?: string;
+  sources?: string[];
   fileIndex?: number;
   filename?: string;
   size?: number;

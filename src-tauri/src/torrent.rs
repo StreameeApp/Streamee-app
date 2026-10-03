@@ -351,6 +351,13 @@ fn current_startup_session() -> StartupSessionState {
         .unwrap_or_default()
 }
 
+fn ensure_startup_session(session_id: u64) -> Result<(), String> {
+    if current_startup_session().session_id != session_id {
+        return Err("Startup session replaced".to_string());
+    }
+    Ok(())
+}
+
 pub fn emit_startup_state(
     session_id: u64,
     attempt: u32,
@@ -1002,25 +1009,35 @@ pub async fn start_download(
         });
     }
 
-    let result =
-        start_download_internal(magnet_uri, listen_port, expected_size, persistent_cache).await;
+    let session_id = begin_startup_session();
+    let result = start_download_internal(
+        session_id,
+        magnet_uri,
+        listen_port,
+        expected_size,
+        persistent_cache,
+    )
+    .await;
 
-    TORRENT_STARTING.store(false, Ordering::SeqCst);
+    if current_startup_session().session_id == session_id {
+        TORRENT_STARTING.store(false, Ordering::SeqCst);
+    }
 
     result
 }
 
 async fn start_download_internal(
+    session_id: u64,
     magnet_uri: String,
     listen_port: Option<u16>,
     expected_size: Option<u64>,
     persistent_cache: Option<(PathBuf, u64)>,
 ) -> Result<DownloadProgress, String> {
-    let session_id = begin_startup_session();
     let retry_backoffs_ms = [0_u64, 1_500, 4_000];
 
     for (index, retry_in_ms) in retry_backoffs_ms.iter().enumerate() {
         let attempt = (index + 1) as u32;
+        ensure_startup_session(session_id)?;
 
         if *retry_in_ms > 0 {
             emit_startup_state(
@@ -1038,6 +1055,8 @@ async fn start_download_internal(
             time::sleep(Duration::from_millis(*retry_in_ms)).await;
         }
 
+        ensure_startup_session(session_id)?;
+
         emit_startup_state(
             session_id,
             attempt,
@@ -1048,10 +1067,12 @@ async fn start_download_internal(
         );
         start_server(listen_port).await?;
         ensure_port().await?;
+        ensure_startup_session(session_id)?;
 
         if attempt > 1 {
             let _ = reset_torrent_session().await;
         }
+        ensure_startup_session(session_id)?;
 
         emit_startup_state(
             session_id,
@@ -1078,6 +1099,7 @@ async fn start_download_internal(
             5_000,
         )
         .await;
+        ensure_startup_session(session_id)?;
 
         match start_response {
             Ok(_) => {}
@@ -1101,9 +1123,11 @@ async fn start_download_internal(
             }
         }
 
-        match wait_for_metadata_ready(session_id, attempt, Duration::from_secs(20)).await {
+        // Allow discovery and WebTorrent's 25-second peer handshake to finish.
+        match wait_for_metadata_ready(session_id, attempt, Duration::from_secs(60)).await {
             Ok(progress) => return Ok(progress),
             Err(err) => {
+                ensure_startup_session(session_id)?;
                 warn!("Metadata wait failed on attempt {}: {}", attempt, err);
                 if attempt == retry_backoffs_ms.len() as u32 {
                     emit_startup_state(
@@ -1209,9 +1233,10 @@ pub async fn get_pieces() -> Result<PieceInfo, String> {
 }
 
 pub async fn stop_download() -> Result<(), String> {
+    let session_id = begin_startup_session();
     let _ = send_command_and_wait(&serde_json::json!({ "action": "stop" }), 3_000).await;
     shutdown_webtorrent_process().await;
-    emit_startup_state(0, 0, "idle", "Torrent stopped", None, None);
+    emit_startup_state(session_id, 0, "idle", "Torrent stopped", None, None);
     Ok(())
 }
 
@@ -1378,4 +1403,21 @@ pub async fn get_file_path_from_state(filename: &str) -> Result<Option<(String, 
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replaced_startup_sessions_cannot_pass_retry_ownership_checks() {
+        let first = begin_startup_session();
+        assert!(ensure_startup_session(first).is_ok());
+        let replacement = begin_startup_session();
+        assert_eq!(
+            ensure_startup_session(first).unwrap_err(),
+            "Startup session replaced"
+        );
+        assert!(ensure_startup_session(replacement).is_ok());
+    }
 }

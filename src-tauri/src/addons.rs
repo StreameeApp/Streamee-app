@@ -180,6 +180,7 @@ struct StremioStream {
     url: Option<String>,
     info_hash: Option<String>,
     file_idx: Option<u32>,
+    sources: Option<Vec<String>>,
     #[serde(default)]
     behavior_hints: StremioStreamBehaviorHints,
 }
@@ -242,6 +243,8 @@ pub struct AddonStreamResult {
     pub stream_handle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub info_hash: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_index: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -632,6 +635,7 @@ pub async fn fetch_addon_streams(
                 playback_kind: "http".to_string(),
                 stream_handle: Some(handle),
                 info_hash: stream.info_hash,
+                sources: stream.sources.unwrap_or_default(),
                 file_index: stream.file_idx,
                 filename,
                 size,
@@ -644,6 +648,7 @@ pub async fn fetch_addon_streams(
                 playback_kind: "torrent".to_string(),
                 stream_handle: None,
                 info_hash: Some(info_hash),
+                sources: stream.sources.unwrap_or_default(),
                 file_index: stream.file_idx,
                 filename,
                 size,
@@ -795,6 +800,37 @@ mod tests {
         assert_eq!(manifest.catalogs.len(), 2);
         assert_eq!(manifest.catalogs[0].media_type, "movie");
         assert_eq!(manifest.catalogs[1].media_type, "series");
+    }
+
+    #[test]
+    fn retains_addon_torrent_discovery_sources() {
+        let stream: StremioStream = serde_json::from_value(serde_json::json!({
+            "infoHash": "0123456789012345678901234567890123456789",
+            "sources": ["tracker:udp://tracker.example.com:1337/announce"]
+        }))
+        .unwrap();
+        let result = AddonStreamResult {
+            id: "example:0".to_string(),
+            title: "Example lawful stream".to_string(),
+            description: None,
+            playback_kind: "torrent".to_string(),
+            stream_handle: None,
+            info_hash: stream.info_hash,
+            sources: stream.sources.unwrap_or_default(),
+            file_index: None,
+            filename: None,
+            size: None,
+        };
+        let result = serde_json::to_value(result).unwrap();
+        assert_eq!(
+            result["sources"][0],
+            "tracker:udp://tracker.example.com:1337/announce"
+        );
+        let without_sources: StremioStream = serde_json::from_value(serde_json::json!({
+            "infoHash": "0123456789012345678901234567890123456789"
+        }))
+        .unwrap();
+        assert!(without_sources.sources.is_none());
     }
 
     #[test]
