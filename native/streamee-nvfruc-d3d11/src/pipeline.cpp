@@ -214,7 +214,9 @@ struct Pipeline::Impl {
         output=surface(c.width,c.height,DXGI_FORMAT(c.format),true,true);
         for(UINT w=c.width,h=c.height;;w=(w+1)/2,h=(h+1)/2) {
             pyramid.push_back(surface(w,h,DXGI_FORMAT_R32G32B32A32_FLOAT));
-            filled.push_back(surface(w,h,DXGI_FORMAT_R32G32B32A32_FLOAT));
+            // Packing resolves level zero directly from the warped image and
+            // filled level one, avoiding a redundant full-resolution surface.
+            filled.push_back(pyramid.size()==1 ? Surface{} : surface(w,h,DXGI_FORMAT_R32G32B32A32_FLOAT));
             if(w==1 && h==1) break;
         }
         const unsigned char *code[]={g_Analysis,g_Cut,g_Validate,g_Repair,g_Warp,g_Down,g_Up,g_Pack,g_Dense,g_Refine};
@@ -343,8 +345,8 @@ struct Pipeline::Impl {
                 dispatch(4,config.width,config.height,&pyramid[0]);
                 for(size_t i=1;i<pyramid.size();i++) {images(pyramid[i-1]);dispatch(5,pyramid[i].width,pyramid[i].height,&pyramid[i]);}
                 context->CopyResource(filled.back().texture.Get(),pyramid.back().texture.Get());
-                for(size_t i=pyramid.size()-1;i>0;i--) {images(pyramid[i-1],&filled[i]);dispatch(6,filled[i-1].width,filled[i-1].height,&filled[i-1]);}
-                bind_source(a,b);images(filled[0]);
+                for(size_t i=pyramid.size()-1;i>1;i--) {images(pyramid[i-1],&filled[i]);dispatch(6,filled[i-1].width,filled[i-1].height,&filled[i-1]);}
+                bind_source(a,b);images(pyramid[0],&filled[1]);
                 context->CSSetShaderResources(8,2,v);
                 dispatch(7,config.width,config.height,nullptr,nullptr,true);
                 statistics.synthesized++;
@@ -371,7 +373,13 @@ struct Pipeline::Impl {
             }
         }
         auto control=previous && allow?read_control():std::array<UINT,4>{};
-        bool cut=control[1] && double(control[0])/control[1]/4095.0>0.25 && double(control[2])/control[1]>0.65;
+        double difference=double(control[0])/std::max(1u,control[1])/4095.0;
+        double large_change=double(control[2])/std::max(1u,control[1]);
+        double coverage=double(control[3])/(params.gw*params.gh);
+        // A broad change with almost no bidirectionally reliable flow is also a
+        // cut, even when its encoded luma range misses the bright-cut thresholds.
+        bool cut=control[1] && ((difference>0.25 && large_change>0.65) ||
+            (difference>0.10 && large_change>0.30 && coverage<0.10));
         if(previous && allow && (cut || !control[3])) {
             // Read only scalar control data after the existing completion boundary.
             // A cut discards synthesis and resets hints for the following pair.

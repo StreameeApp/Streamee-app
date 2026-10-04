@@ -397,8 +397,7 @@ async fn run_fpcalc(
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW.0);
 
-    let mut child = command
-        .spawn()
+    let mut child = crate::process_lifecycle::spawn_tokio(&mut command)
         .map_err(|error| format!("Could not start Intro Skipper fingerprinting: {error}"))?;
     if is_http_stream {
         let client = reqwest::Client::builder()
@@ -721,10 +720,15 @@ async fn detect_visual_outro_diagnostic(
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW.0);
 
-    let output = timeout(audio_extraction_timeout(analysis_seconds), command.output())
-        .await
-        .map_err(|_| "Visual outro diagnostic timed out".to_string())?
+    let child = crate::process_lifecycle::spawn_tokio(&mut command)
         .map_err(|error| format!("Could not start visual outro diagnostic: {error}"))?;
+    let output = timeout(
+        audio_extraction_timeout(analysis_seconds),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| "Visual outro diagnostic timed out".to_string())?
+    .map_err(|error| format!("Could not start visual outro diagnostic: {error}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -881,7 +885,21 @@ async fn extract_selected_audio(
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW.0);
 
-    let output = match timeout(audio_extraction_timeout(analysis_seconds), command.output()).await {
+    let child = match crate::process_lifecycle::spawn_tokio(&mut command) {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = fs::remove_file(&output_path);
+            return Err(format!(
+                "Could not start Intro Skipper audio extraction: {error}"
+            ));
+        }
+    };
+    let output = match timeout(
+        audio_extraction_timeout(analysis_seconds),
+        child.wait_with_output(),
+    )
+    .await
+    {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
             let _ = fs::remove_file(&output_path);

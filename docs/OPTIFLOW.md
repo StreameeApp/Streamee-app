@@ -3,6 +3,138 @@
 OptiFlow is experimental. NVFRUC quality parity and the 16.7 ms 4K interpolation
 budget have **not** passed acceptance. Shader defaults remain provisional.
 
+## Occlusion follow-up (RTX 4090, 2026-10-03)
+
+The user reported broken/ghosted limb and pedal edges in the development build.
+The exact online sequence was unavailable, so this pass uses an analytic dark
+moving silhouette against a bright patterned background with thin rails, a
+public Blender teaser and two short extracts from authorized local media.
+The earlier quality/memory follow-up below is the baseline for these comparisons.
+
+Three reconstruction changes address boundary errors: distant repaired flow
+seeds must also fit the receiving pixel's motion; conflicting warped Y/UV
+surfaces choose the better endpoint match; and uncovered pixels identical in
+both endpoints retain their detail rather than a distant hole-fill average.
+The disagreement threshold remains conservative after tighter thresholds
+regressed footage. A second scene-cut condition combines broad encoded-luma
+change with less than 10% reliable flow coverage, catching moderate-range cuts
+that the earlier bright-cut thresholds missed. It uses the same four scalar
+GPU counters and adds no playback pixel readback.
+
+| Padded 1080p P010 moving silhouette | Earlier follow-up | This follow-up |
+| --- | ---: | ---: |
+| Full-frame luma MAE | 6.85157 | 0.34165 |
+| Changing-pixel luma MAE | 7.43709 | 4.19489 |
+| Changing pixels with error above 8% of encoded range | 23,912 | 13,761 |
+
+The severe-error count falls 42.5%; it does not reach zero. MAE uses native
+ten-bit code values. NV12 silhouette MAE is 0.08010 versus blending 0.92624.
+The saved `occlusion-comparison.png` shows the identical synthetic midpoint,
+reference and before/after reconstruction; it is not the user's online scene.
+
+Held-out decoded footage uses 59 consecutive frames, feeding even frames and
+comparing synthesis to the real odd frames. This doubles endpoint motion
+relative to ordinary playback and does not validate dynamic HDR metadata.
+The deliberately inserted metadata-hold pair is excluded from quality totals.
+
+| Extract | Earlier luma MAE | This luma MAE |
+| --- | ---: | ---: |
+| Public Blender teaser, 1280×720 NV12 | 0.69024 | 0.68694 |
+| Local 900-second extract, 1920×804 P010, continuous pairs | 1.34285 | 1.33795 |
+| Local 1800-second extract, 1920×804 P010 | 4.07743 | 3.96177 |
+
+The public fixture is from [Blender's demo archive](https://download.blender.org/demo/movies/elephantsdream_teaser.mp4.zip).
+Original local media remains unchanged. Pair 20 of the 900-second extract is a
+verified hard cut and is evaluated separately: the new guard holds the earlier
+source rather than inventing an intermediate scene. Its odd reference is already
+in the next shot, so including that hold in continuous-motion MAE is misleading.
+Large-error pixels fall from 6,391 to 5,044 on the public extract, but rise from
+390,421 to 397,747 (1.9%) on the 1800-second extract despite lower average error.
+These are modest, mixed footage gains; broad visual acceptance remains open.
+
+All eleven GPU quality cases and three native CPU CTests pass. Stationary
+NV12/P010 chroma stays exact and P010 packing has zero invalid low bits. The
+new moderate-range cut regression fails the earlier implementation and passes
+this one. Native 4K allocation remains 625,539,264 bytes. Preloaded 4K P010,
+100 warmed submissions: wall p50/p95/p99 changes from 31.521/32.121/32.500 ms
+to 31.401/32.574/46.641 ms; GPU-span p95 changes from 26.600 to 29.796 ms.
+Scheduling and the tail outlier prevent a speed-improvement claim; the 16.7 ms
+budget remains failed.
+
+Final isolated paced playback exits successfully, retains P010/BT.2020/PQ,
+and drains 360 inputs to 719 outputs with 359 synthesized, zero held/bypassed,
+zero decoder drops and three renderer drops. Pause/resume and all three exact
+seeks also complete with synthesis restored. These short checks do not prove
+sustained playback, panel HDR, audio sync or the exact reported scene.
+
+The development DLL is staged beside the unchanged ABI 3 player. The installed
+app is unchanged; a fresh playback process is needed to load the updated DLL.
+Bridge SHA-256: `46893143649CCA331D3529FBE33E4DBA9813876360A582BF3BB438E0AF3B78BE`.
+Local logs, raw extracts and captures: `%TEMP%/streamee-optiflow-occlusion-20261003`.
+
+## Earlier quality and memory follow-up (RTX 4090, 2026-10-03)
+
+The previous subpixel failure reproduced with the unchanged bridge. Its coarse
+short-motion search sometimes selected a neighbouring local minimum, and the
+single refinement could not recover the small motion. Refinement now also starts
+at zero when the coarse candidate differs from zero, then selects the better
+photometric match with the existing short-motion tie rule. The hardware quality
+preset and confidence/metadata policies remain unchanged.
+
+Ground-truth pixel probes compare the same input pair and analytic midpoint:
+
+| Padded 1080p P010 fixture | Previous MAE | Current MAE | Blending MAE |
+| --- | ---: | ---: | ---: |
+| Horizontal 1.5-pixel motion | 1.11995 | 0.29845 | 0.44756 |
+| Horizontal -1.5-pixel motion | 1.16018 | 0.29939 | 0.44768 |
+| Horizontal 2.5-pixel motion | 0.57521 | 0.29659 | 1.13415 |
+| Diagonal motion (1.5, 1 pixels) | 0.88162 | 0.38643 | 1.11654 |
+| Diagonal moving chroma | 0.51042 | 0.25558 | 0.26201 |
+
+These errors are native ten-bit code values, not perceptual scores. The moving
+occluder/thin-object full-frame MAE stayed effectively unchanged (0.48745 to
+0.48723); changing-pixel MAE changed slightly from 4.47835 to 4.48395. The
+0.5-pixel fixture still loses to blending (0.29830 versus 0.25038). Integer
+translations and borders, complex footage and broad visual acceptance remain
+separate from the improved subpixel cases.
+
+The final hole-fill upsample is fused into packing. It resolves the same fine
+pixel and coarse sample without allocating or writing another full-resolution
+RGBA32F texture. Captured subpixel and occlusion midpoint luma is byte-identical
+before/after this fusion. Stationary varying chroma remains exact at padded
+1080p NV12/P010 and native 4K P010, with zero invalid packing. Native 4K P010
+bridge allocation falls from 758,249,664 to 625,539,264 bytes, saving 126.6 MiB
+(17.5%) without lowering texture precision.
+
+Preloaded 4K P010 probes, 100 warmed submissions at automatic clocks: unchanged
+baseline wall p50/p95/p99 was 31.623/32.708/32.841 ms; final was
+31.366/32.295/32.865 ms. GPU-span p95 was 23.331 versus 28.406 ms. Scheduling
+varied, so this does **not** establish an end-to-end speed improvement. The
+16.7 ms stage budget remains failed. Pixel-probe timing includes readback and
+idle power transitions and must not be substituted for these preloaded probes.
+
+Three native CPU CTests and the nine-case explicit GPU quality suite passed.
+The suite adds reverse/subpixel/diagonal motion, moving chroma, stationary
+chroma, occlusion/thin-object and 4K checks. The new better-than-blending gate
+fails the original 1.5-pixel implementation and passes the current one. Optional
+16-bit PGM captures retain the generated midpoint and analytic ground truth.
+
+Isolated minimized `gpu-next` playback with the existing ABI 3 player and new
+bridge drained 240 NV12 inputs to 479 outputs and 360 P010 inputs to 719 outputs,
+with no held/bypassed midpoints or decoder drops. Pause/resume and three exact
+seeks completed with synthesis restored after each. A separately FFprobe-verified
+synthetic BT.2020/PQ ten-bit clip retained P010/BT.2020/PQ and also drained
+360 inputs to 719 outputs. These are short signal/lifecycle checks, with renderer
+drops; they are not sustained zero-drop, mastered HDR, panel or A/V proof.
+The older local fixture named `motion4k10.mp4` is actually eight-bit H.264;
+its run is NV12 evidence only. Classification uses decoded properties, not names.
+
+At this earlier checkpoint the development bridge was staged beside the
+unchanged ABI 3 player; the installed application retained its previous bridge. No app restart,
+installation, display/clock setting changes or Git delivery were performed.
+Earlier bridge SHA-256: `9139F547B26913A1642EF9AC7E90AC4A648C4C0D50F120CEA20EF056084360D6`.
+Local detailed logs/captures: `%TEMP%/streamee-optiflow-quality-20261003`.
+
 ## Runtime
 
 The custom MPV v0.41.0 filter borrows FFmpeg's D3D11 decoder device and lock.

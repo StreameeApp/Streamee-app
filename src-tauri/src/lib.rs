@@ -9,6 +9,7 @@ mod logging;
 mod mpv_ipc;
 mod optiflow_clocks;
 mod optiflow_runtime;
+mod process_lifecycle;
 mod remote_server;
 mod rife_runtime;
 mod torrent;
@@ -197,6 +198,10 @@ fn install_webview_process_recovery(window: &tauri::WebviewWindow) {
                     kind.0
                 ),
             }
+            if process_lifecycle::is_stopping() {
+                debug!("Ignoring WebView2 recovery while Streamee is shutting down");
+                return Ok(());
+            }
             if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
                 if std::env::var_os(WEBVIEW_RECOVERY_RESTART_ENV).is_none()
                     && WEBVIEW_RECOVERY_RESTART_REQUESTED
@@ -210,7 +215,9 @@ fn install_webview_process_recovery(window: &tauri::WebviewWindow) {
                     let app_handle = app_handle.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_secs(1));
-                        app_handle.request_restart();
+                        if !process_lifecycle::is_stopping() {
+                            app_handle.request_restart();
+                        }
                     });
                 } else {
                     warn!(
@@ -6155,6 +6162,42 @@ async fn stop_torrent() -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn prepare_update_shutdown(app: AppHandle) -> Result<(), String> {
+    process_lifecycle::begin_shutdown();
+    info!(
+        event = "update.shutdown_started",
+        "Closing playback helpers before installation"
+    );
+    // Give streaming and caption state a bounded opportunity to finish gracefully.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), torrent::stop_download()).await;
+    let state = app.state::<SharedWhisperLiveState>();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        whisperlive::stop_server(state.inner()),
+    )
+    .await;
+    let quit = tauri::async_runtime::spawn_blocking(mpv_ipc::stop_player_session);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), quit).await;
+    tauri::async_runtime::spawn_blocking(|| {
+        process_lifecycle::shutdown(std::time::Duration::from_secs(8))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    #[cfg(target_os = "windows")]
+    restore_auto_enabled_hdr_after_mpv_exit(&app);
+    info!(
+        event = "update.shutdown_completed",
+        "Playback helpers exited; installation may start"
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_update_shutdown() -> Result<(), String> {
+    process_lifecycle::resume()
+}
+
+#[tauri::command]
 async fn pause_torrent() -> Result<(), String> {
     info!("Pausing torrent");
     torrent::pause_download().await
@@ -6585,7 +6628,8 @@ async fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String>
                 info!("Found MPV at: {}, launching with: {}", mpv_path, url);
                 let mut command = std::process::Command::new(&mpv_path);
                 hide_console_std(&mut command);
-                let child = command.arg(&url).spawn().map_err(|e| e.to_string())?;
+                command.arg(&url);
+                let child = process_lifecycle::spawn_std(&mut command)?;
                 let pid = child.id();
                 if let Err(err) = attach_mpv_to_main_window(&app, pid).await {
                     warn!("Failed to attach MPV window to app owner: {}", err);
@@ -7189,7 +7233,7 @@ async fn launch_mpv_process(
             info!("OptiFlow is enabled; SVP was stopped and auto-start was suppressed");
         }
     }
-    let child = match cmd.spawn() {
+    let child = match process_lifecycle::spawn_std(&mut cmd) {
         Ok(child) => child,
         Err(err) => {
             restore_auto_enabled_hdr_after_mpv_exit(app);
@@ -8685,6 +8729,8 @@ pub fn run() {
             addons::remove_addon,
             start_torrent,
             stop_torrent,
+            prepare_update_shutdown,
+            cancel_update_shutdown,
             get_torrent_stats,
             get_torrent_files,
             get_file_progress,
@@ -8788,8 +8834,17 @@ pub fn run() {
             get_audio_normalizer_debug_info,
             save_audio_normalizer_custom_preset,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+                if let Err(error) = process_lifecycle::shutdown(std::time::Duration::from_secs(8)) {
+                    warn!(event = "app.helper_shutdown_failed", %error, "Could not finish helper shutdown");
+                }
+                #[cfg(target_os = "windows")]
+                restore_auto_enabled_hdr_after_mpv_exit(app);
+            }
+        });
 }
 
 #[cfg(test)]

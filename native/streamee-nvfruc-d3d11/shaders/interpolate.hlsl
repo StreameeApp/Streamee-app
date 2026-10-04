@@ -69,6 +69,17 @@ float matchError(float2 p,float2 flow,bool back) {
         err+=abs(guide(p+float2(x,y)*3,back)-guide(p+float2(x,y)*3+flow,!back));
     return err/9;
 }
+float2 refineCandidate(float2 p,float2 best,bool back) {
+    float error=matchError(p,best,back);
+    [loop] for(float step=2;step>=0.25;step*=0.5) {
+        float2 center=best;
+        [unroll] for(int y=-1;y<=1;y++) [unroll] for(int x=-1;x<=1;x++) {
+            float2 c=center+float2(x,y)*step;float e=matchError(p,c,back);
+            if(e<error-0.00001 || (e<=error+0.00001 && dot(c,c)<dot(best,best))) {best=c;error=e;}
+        }
+    }
+    return best;
+}
 float2 refine(float2 p,bool back) {
     float2 hardware=rawAt(p,back);
     float hardwareError=matchError(p,hardware,back);
@@ -82,11 +93,16 @@ float2 refine(float2 p,bool back) {
     // Refine the independent short-motion candidate to subpixel precision.
     // Starting this search at the hardware vector can trap repeated textures
     // in an equally plausible but distant match.
-    [loop] for(float step=2;step>=0.25;step*=0.5) {
-        float2 center=best;
-        [unroll] for(int y=-1;y<=1;y++) [unroll] for(int x=-1;x<=1;x++) {
-            float2 c=center+float2(x,y)*step;float e=matchError(p,c,back);
-            if(e<error-0.00001 || (e<=error+0.00001 && dot(c,c)<dot(best,best))) {best=c;error=e;}
+    bool needsLocal=any(best!=0);
+    best=refineCandidate(p,best,back);
+    error=matchError(p,best,back);
+    // A coarse winner on a neighbouring texture can trap the subpixel search.
+    // Also refine from zero so small motion retains its own local minimum.
+    if(needsLocal) {
+        float2 local=refineCandidate(p,0,back);
+        float localError=matchError(p,local,back);
+        if(localError<error-0.00001 || (localError<=error+0.00001 && dot(local,local)<dot(best,best))) {
+            best=local;error=localError;
         }
     }
     return error<0.003 || error<hardwareError-0.001 ||
@@ -127,13 +143,22 @@ void Validate(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex) {
 float4 nearestSeed(uint2 q, bool back) {
     float4 best = back ? fieldB.Load(int3(q,0)) : fieldA.Load(int3(q,0));
     float guidance = guide(min(float2(q*4+2),float2(extent-1)), back);
+    float stationaryError=-1;
     float score = best.z > 0 ? length(best.xy - q) + 80 * abs(best.w-guidance) : 1e10;
     [unroll] for(int y=-1;y<=1;y++) [unroll] for(int x=-1;x<=1;x++) {
         int2 n = int2(q) + int2(x,y)*int(stepSize);
         if (any(n<0) || any(n>=int2(gridExtent))) continue;
         float4 c = back ? fieldB.Load(int3(n,0)) : fieldA.Load(int3(n,0));
         float s = length(c.xy-q) + 80 * abs(c.w-guidance);
-        if(c.z>0 && abs(c.w-guidance)<0.12 && s<score) { best=c; score=s; }
+        // A distant seed must explain motion at this pixel too. Similar luma
+        // alone can copy a foreground vector onto an unrelated background.
+        if(c.z>0 && abs(c.w-guidance)<0.12 && s<score) {
+            float2 p=min(float2(q*4+2),float2(extent-1));
+            if(stationaryError<0) stationaryError=matchError(p,0,back);
+            if(length(c.xy-q)<=2 || matchError(p,rawAt(c.xy*4+2,back),back)<stationaryError+0.001) {
+                best=c;score=s;
+            }
+        }
     }
     return best;
 }
@@ -178,8 +203,21 @@ float4 reconstruct(float2 p) {
     float wa=inside(a) && length(a+fa.xy*0.5-p)<1.5 ? fa.z : 0;
     float wb=inside(b) && length(b+fb.xy*0.5-p)<1.5 ? fb.z : 0;
     float3 ca=colour(a,false),cb=colour(b,true);
-    if(wa>0 && wb>0 && abs(ca.x-cb.x)>0.12) { if(wa>=wb) wb=0; else wa=0; }
+    // Opposing warps must describe the same surface before they are blended.
+    // Near occlusion boundaries, prefer the source with the better endpoint
+    // match instead of averaging a foreground edge with uncovered background.
+    if(wa>0 && wb>0 && any(abs(ca-cb)>0.12)) {
+        float ea=matchError(a,fa.xy,false)+(1-wa)*0.005;
+        float eb=matchError(b,fb.xy,true)+(1-wb)*0.005;
+        if(ea<eb || (ea==eb && wa>=wb)) wb=0; else wa=0;
+    }
     float w=wa+wb;
+    if(w<=1e-6) {
+        float3 sa=colour(p,false),sb=colour(p,true);
+        // Preserve stable uncovered detail instead of filling it with a distant
+        // colour average from the hole pyramid.
+        if(all(abs(sa-sb)<0.0005)) return float4((sa+sb)*0.5,1);
+    }
     return w>1e-6 ? float4((ca*wa+cb*wb)/w,1) : 0;
 }
 [numthreads(8,8,1)]
@@ -212,6 +250,12 @@ uint packSignal(float v) {
 }
 float3 resolved(int2 p) {
     p=clamp(p,0,int2(extent)-1); float4 c=imageA.Load(int3(p,0));
+    // Fuse the final pyramid upsample with packing. Each lookup resolves the
+    // same fine pixel/coarse sample without another full-resolution texture.
+    if(c.w==0) {
+        c=imageB.SampleLevel(linearClamp,uv(float2(p)),0);
+        c.w*=0.5;
+    }
     return c.w>=0.0625 ? c.xyz : colour(float2(p),false);
 }
 [numthreads(8,8,1)]

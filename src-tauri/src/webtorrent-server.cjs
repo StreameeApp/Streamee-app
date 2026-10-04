@@ -79,6 +79,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 let client = null;
+let parentClosing = false;
 let parseTorrentSource = null;
 const clientReady = Promise.all([
   import('webtorrent'),
@@ -837,6 +838,7 @@ function getContentType(filename) {
 }
 
 function sendMessage(msg) {
+  if (parentClosing) return;
   process.stdout.write(JSON.stringify(msg) + '\n');
 }
 
@@ -1323,6 +1325,7 @@ async function main() {
 process.stdin.setEncoding('utf8');
 
 process.stdin.on('data', async (data) => {
+  if (parentClosing) return;
   const lines = data.trim().split('\n');
   
   for (const line of lines) {
@@ -1457,6 +1460,33 @@ process.stdin.on('data', async (data) => {
     }
   }
 });
+
+async function shutdownAfterParentClose() {
+  if (parentClosing) return;
+  parentClosing = true;
+  // Bound shutdown even if a socket or native client never acknowledges disposal.
+  const deadline = setTimeout(() => process.exit(0), 3_000);
+  try {
+    await stopTorrent();
+    if (httpServer) {
+      httpServer.closeAllConnections?.();
+      httpServer.close();
+    }
+    if (client) await new Promise(resolve => client.destroy(resolve));
+  } catch (err) {
+    writeLog('error', 'process.parent_shutdown_failed', 'Could not finish parent shutdown', {
+      error: err?.message || String(err),
+    });
+  } finally {
+    // Let native dependency finalizers drain instead of exiting inside their callback.
+    process.exitCode = 0;
+    deadline.unref();
+  }
+}
+
+process.stdin.once('end', shutdownAfterParentClose);
+process.stdin.once('close', shutdownAfterParentClose);
+process.stdout.on('error', shutdownAfterParentClose);
 
 main();
 

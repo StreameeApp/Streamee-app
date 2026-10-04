@@ -18,11 +18,35 @@ cmake --build "$env:TEMP/streamee-optiflow-v3" --config Release -j 4
 ctest --test-dir "$env:TEMP/streamee-optiflow-v3" -C Release --output-on-failure
 & "$env:TEMP/streamee-optiflow-v3/Release/optiflow_pixels.exe" --run-gpu-probe 1920 1080 10 12
 & "$env:TEMP/streamee-optiflow-v3/Release/optiflow_pixels.exe" --run-gpu-probe 3840 2160 10 100 --performance-only
+# Explicit quality regression suite; writes to a fresh evidence directory.
+& ./native/streamee-nvfruc-d3d11/tests/quality-probe.ps1 -BuildDirectory "$env:TEMP/streamee-optiflow-v3" -RunGpu
 ```
 
 GPU probes are explicit and should run without other playback. The quality
 probe reads pixels for verification; the performance probe preloads fixtures
 and excludes CPU pixel generation/readback from measured submissions.
+The eleven-case quality suite checks NV12/P010 identity, small/reverse/diagonal
+motion, moving chroma, occlusion/thin objects, moving silhouettes and 4K.
+Selected subpixel and silhouette fixtures must beat blending; moving chroma
+must beat repetition. Every quality run also checks metadata holds, bright
+cuts and moderate-range cuts with a small stable region. It captures the same
+generated midpoint and analytic truth as 16-bit PGM images. The standalone
+probe also accepts `--motion <x> --motion-y <y> --varying-chroma`,
+`--silhouette`, `--require-better-than-blend`, `--dump-prefix <absolute-prefix>`
+and `--dump-pair <input-pair-index>` after its dimensions/bit-depth/frame count.
+These synthetic checks do not replace visual review of varied footage, or
+paced playback/performance acceptance.
+
+For held-out footage diagnostics, `--input-raw <absolute-path>` reads exactly
+`2N-1` consecutive visible frames for `N` source submissions: tightly packed
+NV12 for eight bits or little-endian P010 for ten bits (signal in the high ten
+bits). Even frames are sources and odd frames are midpoint references. This
+doubles motion between input frames compared with normal playback. Per-pair
+`RAW_PAIR` output includes luma MAE, repetition/blending references, holds and
+the count of errors above 8% of encoded range. Review cuts separately: their
+temporal location is unknown from the two endpoints. Real-footage MAE is
+diagnostic rather than an analytic-motion acceptance gate. Work from extracted
+short segments; preserve the original media.
 
 ## Custom MPV
 

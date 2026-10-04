@@ -663,8 +663,7 @@ fn prepare_engine_blocking(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = command
-        .spawn()
+    let mut child = crate::process_lifecycle::spawn_std(&mut command)
         .map_err(|error| format!("Could not start RIFE engine preparation: {error}"))?;
     let started = Instant::now();
     let status = loop {

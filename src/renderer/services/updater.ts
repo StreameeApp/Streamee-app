@@ -1,4 +1,5 @@
 import { check, type Update } from '@tauri-apps/plugin-updater';
+import { invoke } from '@tauri-apps/api/core';
 
 export type UpdaterStatus =
   | 'idle'
@@ -51,7 +52,7 @@ export const checkForUpdates = async (manual = false) => {
     return checkPromise;
   }
 
-  if (snapshot.status === 'downloading' || snapshot.status === 'installing') {
+  if (snapshot.status === 'downloading' || snapshot.status === 'ready' || snapshot.status === 'installing') {
     return;
   }
 
@@ -116,8 +117,6 @@ export const downloadUpdate = async () => {
         publish({ totalBytes: event.data.contentLength ?? null });
       } else if (event.event === 'Progress') {
         publish({ downloadedBytes: snapshot.downloadedBytes + event.data.chunkLength });
-      } else if (event.event === 'Finished') {
-        publish({ status: 'ready' });
       }
     }, { timeout: 120_000 });
     publish({ status: 'ready' });
@@ -132,9 +131,14 @@ export const installUpdate = async () => {
   }
 
   publish({ status: 'installing', error: null });
+  const update = pendingUpdate;
   try {
-    await pendingUpdate.install();
+    await invoke('prepare_update_shutdown');
+    await update.install();
   } catch (error) {
+    await invoke('cancel_update_shutdown').catch((cleanupError) => {
+      console.error('[Updater] Could not resume playback after failed installation:', cleanupError);
+    });
     publish({ status: 'error', error: messageFromError(error) });
   }
 };

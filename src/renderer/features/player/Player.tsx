@@ -740,10 +740,6 @@ interface TorrentStats {
   }>;
 }
 
-const MPV_OFFSET_X = 317;
-const MPV_OFFSET_Y = 44;
-const MPV_WIDTH_TRIM = 332;
-const MPV_HEIGHT_TRIM = 58;
 const DEFAULT_SVP_EXECUTABLE_PATH = 'C:\\Program Files (x86)\\SVP 4\\SVPManager.exe';
 
 interface MpvDebugBounds {
@@ -767,18 +763,34 @@ interface MpvActualBounds {
 }
 
 const getMpvDebugBounds = async (appWin = getCurrentWindow()): Promise<MpvDebugBounds> => {
-  const pos = await appWin.outerPosition();
-  const size = await appWin.outerSize();
+  const [pos, size] = await Promise.all([appWin.innerPosition(), appWin.innerSize()]);
+  const player = document.querySelector<HTMLElement>('.player');
+  if (!player || window.innerWidth <= 0 || window.innerHeight <= 0 || size.width <= 0 || size.height <= 0) {
+    throw new Error('Player area is not available for MPV alignment');
+  }
+
+  // DOM bounds use CSS pixels; native window bounds use physical screen pixels.
+  // Measuring the viewport also accounts for WebView zoom and display scaling.
+  const rect = player.getBoundingClientRect();
+  const scaleX = size.width / window.innerWidth;
+  const scaleY = size.height / window.innerHeight;
+  const left = Math.round(Math.max(0, rect.left) * scaleX);
+  const top = Math.round(Math.max(0, rect.top) * scaleY);
+  const right = Math.round(Math.min(window.innerWidth, rect.right) * scaleX);
+  const bottom = Math.round(Math.min(window.innerHeight, rect.bottom) * scaleY);
+  if (right <= left || bottom <= top) {
+    throw new Error('Player area has no visible bounds for MPV alignment');
+  }
 
   return {
     appX: pos.x,
     appY: pos.y,
     appWidth: size.width,
     appHeight: size.height,
-    offsetX: MPV_OFFSET_X,
-    offsetY: MPV_OFFSET_Y,
-    width: size.width - MPV_WIDTH_TRIM,
-    height: size.height - MPV_HEIGHT_TRIM,
+    offsetX: left,
+    offsetY: top,
+    width: right - left,
+    height: bottom - top,
   };
 };
 
@@ -1324,56 +1336,99 @@ const Player: React.FC = () => {
   useEffect(() => {
     if (!mpvPid) return;
 
-    let unlistenMove: (() => void) | undefined;
-    let unlistenResize: (() => void) | undefined;
+    let disposed = false;
+    let frame: number | null = null;
+    let syncing = false;
+    let syncRequested = false;
+    let fullscreenRetry: number | null = null;
+    const unlisteners: Array<() => void> = [];
+    const appWin = getCurrentWindow();
 
-    const setupWindowTracking = async () => {
-      const appWin = getCurrentWindow();
-
-      unlistenMove = await appWin.onMoved(async ({ payload: newPos }) => {
-        if (mpvPid) {
-          const size = await appWin.outerSize();
-          const bounds = {
-            appX: newPos.x,
-            appY: newPos.y,
-            appWidth: size.width,
-            appHeight: size.height,
-            offsetX: MPV_OFFSET_X,
-            offsetY: MPV_OFFSET_Y,
-            width: size.width - MPV_WIDTH_TRIM,
-            height: size.height - MPV_HEIGHT_TRIM,
-          };
-          const mpvX = newPos.x + bounds.offsetX;
-          const mpvY = newPos.y + bounds.offsetY;
-          setMpvDebugBounds(bounds);
+    const syncWindow = async () => {
+      if (syncing || disposed) return;
+      syncing = true;
+      try {
+        while (syncRequested && !disposed) {
+          syncRequested = false;
           try {
-            await window.electronAPI.moveMpvWindow(mpvPid, mpvX, mpvY, bounds.width, bounds.height);
+            const playerInfo = await window.electronAPI.getPlayerInfo().catch(() => null);
+            if (disposed) return;
+            if (playerInfo?.fullscreen) {
+              // App geometry can change behind fullscreen MPV. Keep the alignment
+              // pending until MPV returns to windowed mode, including while paused.
+              if (fullscreenRetry == null) {
+                fullscreenRetry = window.setTimeout(() => {
+                  fullscreenRetry = null;
+                  scheduleSync();
+                }, 500);
+              }
+              continue;
+            }
+            const bounds = await getMpvDebugBounds(appWin);
+            if (disposed) return;
+            setMpvDebugBounds(bounds);
+            await window.electronAPI.moveMpvWindow(
+              mpvPid, bounds.appX + bounds.offsetX, bounds.appY + bounds.offsetY,
+              bounds.width, bounds.height,
+            );
           } catch (e) {
-            console.error('%c[Stream]%c Failed to move MPV window:', 'color: #4ade80; font-weight: bold', 'color: inherit', e);
+            console.error('%c[Stream]%c Failed to align MPV window:', 'color: #4ade80; font-weight: bold', 'color: inherit', e);
           }
         }
-      });
-
-      unlistenResize = await appWin.onResized(async ({ payload: _newSize }) => {
-        if (mpvPid) {
-          const bounds = await getMpvDebugBounds(appWin);
-          const mpvX = bounds.appX + bounds.offsetX;
-          const mpvY = bounds.appY + bounds.offsetY;
-          setMpvDebugBounds(bounds);
-          try {
-            await window.electronAPI.moveMpvWindow(mpvPid, mpvX, mpvY, bounds.width, bounds.height);
-          } catch (e) {
-            console.error('%c[Stream]%c Failed to move MPV window:', 'color: #4ade80; font-weight: bold', 'color: inherit', e);
-          }
-        }
-      });
+      } finally {
+        syncing = false;
+      }
     };
 
-    setupWindowTracking();
+    const scheduleSync = () => {
+      if (disposed) return;
+      if (fullscreenRetry != null) {
+        window.clearTimeout(fullscreenRetry);
+        fullscreenRetry = null;
+      }
+      syncRequested = true;
+      if (frame == null) {
+        frame = window.requestAnimationFrame(() => {
+          frame = null;
+          void syncWindow();
+        });
+      }
+    };
+
+    const setupWindowTracking = async () => {
+      for (const subscribe of [
+        () => appWin.onMoved(scheduleSync),
+        () => appWin.onResized(scheduleSync),
+        () => appWin.onScaleChanged(scheduleSync),
+      ]) {
+        const unlisten = await subscribe();
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        unlisteners.push(unlisten);
+      }
+      // Correct MPV's startup geometry after its native window is attached.
+      scheduleSync();
+    };
+
+    const player = containerRef.current;
+    const observer = new ResizeObserver(scheduleSync);
+    if (player) observer.observe(player);
+    player?.addEventListener('animationend', scheduleSync);
+    window.addEventListener('resize', scheduleSync);
+    void setupWindowTracking().catch((error) => {
+      console.error('[Stream] Failed to track player window bounds:', error);
+    });
 
     return () => {
-      unlistenMove?.();
-      unlistenResize?.();
+      disposed = true;
+      if (frame != null) window.cancelAnimationFrame(frame);
+      if (fullscreenRetry != null) window.clearTimeout(fullscreenRetry);
+      observer.disconnect();
+      player?.removeEventListener('animationend', scheduleSync);
+      window.removeEventListener('resize', scheduleSync);
+      unlisteners.forEach((unlisten) => unlisten());
     };
   }, [mpvPid]);
 
@@ -1656,6 +1711,7 @@ const Player: React.FC = () => {
     let prelaunchedMpvPid: number | null = null;
     let prelaunchMpvPromise: Promise<number | null> | null = null;
     let prelaunchedMpvLoaded = false;
+    let startupFailureHandled = false;
     let addonProxySessionId: string | null = null;
     let addonMpvPid: number | null = null;
     let addonLoadRequested = false;
@@ -1959,8 +2015,33 @@ const Player: React.FC = () => {
       setIsLoading(false);
     };
 
+    const handleStartupFailure = async (message: string) => {
+      if (disposed || playbackLaunchIdRef.current !== playbackLaunchId || startupFailureHandled) return;
+      startupFailureHandled = true;
+      initInProgress.current = false;
+      streamOpenedRef.current = false;
+      smartNextTransitionRef.current = false;
+      useStore.getState().setPlaybackTransitionActive(false);
+      setStartupError(message);
+      setIsLoading(false);
+
+      const failedPid = prelaunchedMpvPid ?? mpvPidRef.current;
+      prelaunchedMpvPid = null;
+      setMpvPid(null);
+      mpvPidRef.current = null;
+      if (failedPid != null) {
+        await window.electronAPI.stopMpvProcess(failedPid).catch((error) => {
+          console.warn('[Stream] Failed to close MPV after startup failure:', error);
+        });
+      }
+      // A pending prelaunch checks isCurrentPlaybackLaunch when it returns and
+      // closes its own process after startupFailureHandled becomes true.
+    };
+
     const startPlayback = async () => {
-      const isCurrentPlaybackLaunch = () => !disposed && playbackLaunchIdRef.current === playbackLaunchId;
+      const isCurrentPlaybackLaunch = () => !disposed
+        && !startupFailureHandled
+        && playbackLaunchIdRef.current === playbackLaunchId;
       const beginSmartNextPerformance = (
         reason: 'autoload' | 'manual',
         direction: SmartEpisodeDirection = 'next',
@@ -5122,7 +5203,12 @@ const Player: React.FC = () => {
         });
 
         startupStateUnlisten = await window.electronAPI.torrent.onStartupState((state) => {
-          if (disposed) return;
+          if (!isCurrentPlaybackLaunch()) return;
+          const activeSessionId = activeStartupSessionRef.current;
+          // An older MPV launch can finish after a replacement source starts.
+          // A terminal event must belong to the session already established here.
+          if (state.phase === 'failed' && state.session_id !== activeSessionId) return;
+          if (activeSessionId != null && state.session_id < activeSessionId) return;
           if (state.session_id !== 0) {
             activeStartupSessionRef.current = state.session_id;
           }
@@ -5130,6 +5216,9 @@ const Player: React.FC = () => {
           if (state.phase === 'failed') {
             setStartupError(state.message);
             setIsLoading(false);
+            if (!selectedStream.sourceType || selectedStream.sourceType === 'webtorrent') {
+              void handleStartupFailure(state.message);
+            }
           } else {
             setStartupError(null);
           }
@@ -6103,7 +6192,7 @@ const Player: React.FC = () => {
         }
 
         readyUnlisten = await window.electronAPI.torrent.onReady(async ({ session_id, files }) => {
-          if (disposed) return;
+          if (!isCurrentPlaybackLaunch()) return;
           if (activeStartupSessionRef.current && session_id !== activeStartupSessionRef.current) return;
           activeStartupSessionRef.current = session_id;
 
@@ -6493,9 +6582,7 @@ const Player: React.FC = () => {
             await restartSubtitlePipeline();
           } catch (e) {
             console.error('%c[Stream]%c Failed to prepare or launch stream:', 'color: #4ade80; font-weight: bold', 'color: inherit', e);
-            setStartupError(e instanceof Error ? e.message : String(e));
-            setIsLoading(false);
-            streamOpenedRef.current = false;
+            await handleStartupFailure(e instanceof Error ? e.message : String(e));
           }
         });
 
@@ -6641,20 +6728,11 @@ const Player: React.FC = () => {
           }
           await window.electronAPI.releaseAddonStream(failedSessionId).catch(() => {});
         }
-        if (prelaunchedMpvPid != null && !prelaunchedMpvLoaded) {
-          await window.electronAPI.stopMpvProcess(prelaunchedMpvPid).catch(() => {});
-          prelaunchedMpvPid = null;
-          setCurrentMpvPid(null);
-        } else if (prelaunchMpvPromise) {
-          void prelaunchMpvPromise.then(async (pid) => {
-            if (pid != null && !prelaunchedMpvLoaded) {
-              await window.electronAPI.stopMpvProcess(pid).catch(() => {});
-            }
-          });
-        }
         if (!isCurrentPlaybackLaunch()) {
           return;
         }
+        await handleStartupFailure(message);
+        if (disposed || playbackLaunchIdRef.current !== playbackLaunchId) return;
         if (selectedStream.sourceType === 'qbittorrent') {
           scheduleQbitRetry(message || 'Waiting for the external playback service to become ready.');
           return;
@@ -7001,7 +7079,7 @@ const Player: React.FC = () => {
                   </>
                 )}
                 <div className="debug-row">
-                  <span className="debug-label">App Window:</span>
+                  <span className="debug-label">App Content:</span>
                   <span className="debug-value">{mpvDebugBounds.appWidth} x {mpvDebugBounds.appHeight} @ {mpvDebugBounds.appX}, {mpvDebugBounds.appY}</span>
                 </div>
               </>

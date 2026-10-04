@@ -38,7 +38,7 @@ sevenz-rust = { version = "0.6.1", default-features = false }
 discord-rich-presence = "1.1.0"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Devices_Display", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Accessibility", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_IO", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Credentials", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Devices_Display", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Accessibility", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_IO", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Credentials", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints"] }
 webview2-com = "0.38.2"
 
 [features]

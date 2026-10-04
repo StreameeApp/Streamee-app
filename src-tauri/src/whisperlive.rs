@@ -480,13 +480,14 @@ fn local_python_core_paths(root: &Path) -> Vec<PathBuf> {
 fn python_probe_succeeds(program: &OsStr, args: &[&str]) -> bool {
     let mut probe = std::process::Command::new(program);
     hide_console_std(&mut probe);
-    match probe
+    probe
         .args(args)
         .arg("--version")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
+        .stderr(std::process::Stdio::null());
+    let status = crate::process_lifecycle::spawn_std(&mut probe)
+        .and_then(|mut child| child.wait().map_err(|e| e.to_string()));
+    match status {
         Ok(status) => {
             let success = status.success();
             debug!(
@@ -847,8 +848,7 @@ pub async fn ensure_server_running(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::process_lifecycle::spawn_tokio(&mut cmd)
         .map_err(|e| format!("Failed to start WhisperLive server: {}", e))?;
     let child_pid = child.id();
 
@@ -1106,8 +1106,7 @@ pub async fn run_client(
 
         stop_client_process(&state).await;
 
-        let mut child = cmd
-            .spawn()
+        let mut child = crate::process_lifecycle::spawn_tokio(&mut cmd)
             .map_err(|e| format!("Failed to start WhisperLive client: {}", e))?;
         let child_pid = child.id();
 

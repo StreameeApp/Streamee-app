@@ -545,8 +545,7 @@ pub async fn start_server(listen_port: Option<u16>) -> Result<(), String> {
         }
     }
 
-    let mut child = command
-        .spawn()
+    let mut child = crate::process_lifecycle::spawn_tokio(&mut command)
         .map_err(|e| format!("Failed to spawn Node process: {}", e))?;
 
     let stdin = child.stdin.take().ok_or("Failed to get stdin")?;

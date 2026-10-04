@@ -67,8 +67,8 @@ async function sidecar(platform = 'linux') {
     process: {
       platform, env: {}, pid: 1, on() {},
       stderr: { write() {} },
-      stdout: { write: (line: string) => messages.push(JSON.parse(line)) },
-      stdin: { setEncoding() {}, on() {} },
+      stdout: { on() {}, write: (line: string) => messages.push(JSON.parse(line)) },
+      stdin: { setEncoding() {}, on() {}, once() {} },
     },
     Buffer, URL, setImmediate, clearInterval, clearTimeout,
     setTimeout: (callback: () => void) => setTimeout(callback, 0),
