@@ -4,7 +4,7 @@ import test from 'node:test';
 import ts from 'typescript';
 
 // Execute the actual component helpers against independent native/DOM measurements.
-const source = readFileSync(new URL('../src/renderer/features/player/Player.tsx', import.meta.url), 'utf8');
+const source = readFileSync(new URL('../src/renderer/features/player/Player.tsx', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const helper = source.slice(source.indexOf('const getMpvDebugBounds ='), source.indexOf('const Player: React.FC'));
 const trackingStart = source.indexOf('  useEffect(() => {\n    if (!mpvPid) return;');
 const tracking = source.slice(trackingStart, source.indexOf('  }, [mpvPid]);', trackingStart) + '  }, [mpvPid]);'.length);
