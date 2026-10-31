@@ -89,6 +89,80 @@ test('crop equivalence tolerates quantized width and height jitter', () => {
   }
 });
 
+for (const runtimeCase of [
+  {
+    name: '1080p letterbox',
+    crop: '1920x800+0+140',
+    source: 'av://lavfi:color=c=black:s=1920x1080:r=24,drawbox=x=0:y=140:w=1920:h=800:color=red:t=fill',
+  },
+  {
+    name: '4K letterbox',
+    crop: '3840x1608+0+276',
+    source: 'av://lavfi:color=c=black:s=3840x2160:r=24,drawbox=x=0:y=276:w=3840:h=1608:color=red:t=fill',
+  },
+  {
+    name: 'ultrawide pillarbox',
+    crop: '1912x1080+324+0',
+    source: 'av://lavfi:color=c=black:s=2560x1080:r=24,drawbox=x=324:y=0:w=1912:h=1080:color=red:t=fill',
+  },
+]) {
+  test(
+    `MPV Efficient scans preserve native pixel boundaries for ${runtimeCase.name}`,
+    { skip: !existsSync(mpvPath), timeout: 20_000 },
+    () => {
+      const temporaryDirectory = mkdtempSync(join(tmpdir(), 'streamee-native-bars-'));
+      const checkerPath = join(temporaryDirectory, 'checker.lua');
+      const logPath = join(temporaryDirectory, 'mpv.log');
+      writeFileSync(
+        checkerPath,
+        `local mp = require "mp"
+local deadline = mp.get_time() + 8.0
+mp.add_periodic_timer(0.1, function()
+    local crop = mp.get_property("video-crop", "")
+    if crop == "${runtimeCase.crop}" then
+        io.stderr:write("NATIVE_BARS_PASS\\n")
+        mp.commandv("quit", 0)
+    elseif mp.get_time() >= deadline then
+        io.stderr:write("NATIVE_BARS_FAIL: crop=" .. crop .. "\\n")
+        mp.commandv("quit", 9)
+    end
+end)
+`,
+        'utf8',
+      );
+
+      try {
+        const result = spawnSync(
+          mpvPath,
+          [
+            '--no-config',
+            '--load-scripts=no',
+            '--vo=null',
+            '--ao=null',
+            '--no-audio',
+            '--force-window=no',
+            '--length=12',
+            `--script=${scriptPath}`,
+            `--script=${checkerPath}`,
+            '--script-opts=streamee_smart_ultrawide_fill-default_mode=efficient,streamee_smart_ultrawide_fill-lighting_enabled=no',
+            `--log-file=${logPath}`,
+            runtimeCase.source,
+          ],
+          { encoding: 'utf8', timeout: 15_000 },
+        );
+        const diagnostics = `${result.stdout ?? ''}\n${result.stderr ?? ''}\n${existsSync(logPath) ? readFileSync(logPath, 'utf8') : ''}`;
+        assert.equal(result.error, undefined, diagnostics);
+        assert.equal(result.status, 0, diagnostics);
+        assert.match(diagnostics, /NATIVE_BARS_PASS/);
+        assert.ok(diagnostics.includes(`efficient scan completed: crop=${runtimeCase.crop}`), diagnostics);
+        assert.doesNotMatch(diagnostics, /live detector fallback/);
+      } finally {
+        rmSync(temporaryDirectory, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
 type LightingCase = {
   name: string;
   marker: string;

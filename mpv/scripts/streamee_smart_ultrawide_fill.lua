@@ -401,11 +401,16 @@ local function start_lookahead(purpose)
         0,
         mp.get_property_number("time-pos", 0) + lead
     )
+    -- Periodic scans need native pixels for accurate edges. Dynamic mode
+    -- keeps its lightweight lookahead and full-resolution live detector.
+    local probe_width = purpose == "efficient"
+        and mp.get_property_number("video-params/w", opts.lookahead_probe_width)
+        or opts.lookahead_probe_width
     local script_opts = table.concat({
         "streamee_smart_ultrawide_fill_probe-result_path=" .. lookahead_result_path:gsub("\\", "/"),
         "streamee_smart_ultrawide_fill_probe-control_path=" .. lookahead_control_path:gsub("\\", "/"),
         "streamee_smart_ultrawide_fill_probe-generation=" .. generation,
-        "streamee_smart_ultrawide_fill_probe-probe_width=" .. tostring(opts.lookahead_probe_width),
+        "streamee_smart_ultrawide_fill_probe-probe_width=" .. tostring(probe_width),
         "streamee_smart_ultrawide_fill_probe-probe_fps=" .. tostring(opts.lookahead_probe_fps),
         "streamee_smart_ultrawide_fill_probe-limit=" .. tostring(opts.limit),
         "streamee_smart_ultrawide_fill_probe-round=" .. tostring(opts.round),
