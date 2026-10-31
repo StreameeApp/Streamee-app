@@ -3,7 +3,7 @@ local host = require "mp"
 local native_utils = require "mp.utils"
 local script = assert(os.getenv("STREAMEE_THUMBFAST_TEST_SCRIPT"))
 
-local function session(hdr)
+local function session(hdr, color)
     local messages, events, observers, timers, helpers, logs, seeks = {}, {}, {}, {}, {}, {}, {}
     local clock = 0
     local properties = {platform="windows", vid=1, path="http://127.0.0.1:1234/addon/local",
@@ -12,6 +12,11 @@ local function session(hdr)
         ["video-dec-params"]={w=3840,h=2160}, ["video-out-params"]={w=3840,h=2160},
         ["video-params"]={rotate=0}, vf={}, duration=120}
     if hdr then properties["video-params"].gamma="pq" end
+    if color then
+        for _, name in ipairs({"video-params", "video-dec-params", "video-out-params"}) do
+            for key, value in pairs(color) do properties[name][key]=value end
+        end
+    end
     local function timer(period, callback)
         local t = {period=period, callback=callback, enabled=true}
         function t:kill() self.enabled=false end
@@ -98,6 +103,33 @@ local function has_arg(helper, value)
 end
 
 local function tests()
+    for _, case in ipairs({
+        {hdr=false, color={primaries="bt.2020", gamma="bt.1886"}},
+        {hdr=false, color={primaries="bt.709", gamma="bt.1886"}},
+        {hdr=false, color={primaries="bt.2020"}},
+        {hdr=true, color={primaries="bt.2020", gamma="pq"}},
+        {hdr=true, color={primaries="bt.2020", gamma="hlg"}},
+        {hdr=true, color={gamma="smpte2084"}},
+        {hdr=true, color={transfer="arib-std-b67"}},
+        {hdr=true, color={gamma="bt.1886", ["dovi-profile"]=8}},
+        {hdr=true, color={gamma="bt.1886", hdr10plus=true}},
+    }) do
+        local preview=session(false, case.color)
+        preview.hover(10)
+        local filter
+        for _, arg in ipairs(preview.helpers[1].args) do
+            if arg:sub(1,5)=="--vf=" then filter=arg end
+        end
+        assert(filter, "thumbnail helper must have a filter chain")
+        if case.hdr then
+            assert(filter:find("eq=gamma=", 1, true), "HDR must retain preview conversion")
+        else
+            assert(not filter:find("eq=gamma=", 1, true)
+                and not filter:find("tonemap", 1, true)
+                and not filter:find("libplacebo", 1, true), "SDR must not receive HDR processing")
+        end
+        preview.cleanup()
+    end
     local s=session()
     s.hover(10); s.hover(20)
     s.helpers[1].callback(true, {status=1})

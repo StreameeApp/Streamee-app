@@ -757,8 +757,17 @@ fn response_for_download(client: &Client, asset: Asset, offset: u64) -> Result<R
     }
     request
         .send()
-        .and_then(Response::error_for_status)
         .map_err(|error| format!("Could not download {}: {error}", asset.name))
+}
+
+fn finalize_download(part_path: &Path, final_path: &Path) -> Result<PathBuf, String> {
+    if final_path.exists() {
+        fs::remove_file(final_path)
+            .map_err(|error| format!("Could not replace {}: {error}", final_path.display()))?;
+    }
+    fs::rename(part_path, final_path)
+        .map_err(|error| format!("Could not finalize {}: {error}", final_path.display()))?;
+    Ok(final_path.to_path_buf())
 }
 
 fn download_asset(
@@ -769,6 +778,31 @@ fn download_asset(
     completed_before: u64,
     total_bytes: u64,
 ) -> Result<PathBuf, String> {
+    download_asset_with_progress(client, asset, download_dir, |downloaded, cached| {
+        emit_progress(
+            app,
+            "downloading",
+            format!(
+                "{} {}",
+                if cached {
+                    "Verified cached"
+                } else {
+                    "Downloading"
+                },
+                asset.name
+            ),
+            completed_before + downloaded,
+            total_bytes,
+        );
+    })
+}
+
+fn download_asset_with_progress(
+    client: &Client,
+    asset: Asset,
+    download_dir: &Path,
+    mut progress: impl FnMut(u64, bool),
+) -> Result<PathBuf, String> {
     fs::create_dir_all(download_dir)
         .map_err(|error| format!("Could not create {}: {error}", download_dir.display()))?;
     let final_path = download_dir.join(asset.name);
@@ -776,25 +810,30 @@ fn download_asset(
         && final_path.metadata().map(|value| value.len()).unwrap_or(0) == asset.bytes
         && sha256_file(&final_path)?.eq_ignore_ascii_case(asset.sha256)
     {
-        emit_progress(
-            app,
-            "downloading",
-            format!("Verified cached {}", asset.name),
-            completed_before + asset.bytes,
-            total_bytes,
-        );
+        progress(asset.bytes, true);
         return Ok(final_path);
     }
 
     let part_path = download_dir.join(format!("{}.part", asset.name));
     let mut offset = part_path.metadata().map(|value| value.len()).unwrap_or(0);
-    if offset > asset.bytes {
+    if offset == asset.bytes && sha256_file(&part_path)?.eq_ignore_ascii_case(asset.sha256) {
+        progress(asset.bytes, true);
+        return finalize_download(&part_path, &final_path);
+    }
+    if offset >= asset.bytes {
         File::create(&part_path)
             .map_err(|error| format!("Could not reset {}: {error}", part_path.display()))?;
         offset = 0;
     }
 
     let mut response = response_for_download(client, asset, offset)?;
+    if offset > 0 && response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        offset = 0;
+        response = response_for_download(client, asset, 0)?;
+    }
+    let mut response = response
+        .error_for_status()
+        .map_err(|error| format!("Could not download {}: {error}", asset.name))?;
     let resumed = offset > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     if offset > 0 && !resumed {
         offset = 0;
@@ -822,17 +861,12 @@ fn download_asset(
             .write_all(&buffer[..read])
             .map_err(|error| format!("Could not write {}: {error}", part_path.display()))?;
         downloaded += read as u64;
-        emit_progress(
-            app,
-            "downloading",
-            format!("Downloading {}", asset.name),
-            completed_before + downloaded,
-            total_bytes,
-        );
+        progress(downloaded, false);
     }
     output
         .sync_all()
         .map_err(|error| format!("Could not finish {}: {error}", part_path.display()))?;
+    drop(output);
 
     if downloaded != asset.bytes {
         return Err(format!(
@@ -842,15 +876,12 @@ fn download_asset(
     }
     let actual_hash = sha256_file(&part_path)?;
     if !actual_hash.eq_ignore_ascii_case(asset.sha256) {
+        fs::remove_file(&part_path).map_err(|error| {
+            format!("Could not discard invalid {}: {error}", part_path.display())
+        })?;
         return Err(format!("SHA-256 verification failed for {}", asset.name));
     }
-    if final_path.exists() {
-        fs::remove_file(&final_path)
-            .map_err(|error| format!("Could not replace {}: {error}", final_path.display()))?;
-    }
-    fs::rename(&part_path, &final_path)
-        .map_err(|error| format!("Could not finalize {}: {error}", final_path.display()))?;
-    Ok(final_path)
+    finalize_download(&part_path, &final_path)
 }
 
 fn extract_archive(archive: &Path, destination: &Path) -> Result<(), String> {
@@ -920,7 +951,50 @@ fn write_runtime_notices(runtime_dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("Could not write RIFE third-party notices: {error}"))
 }
 
-fn install_blocking(app: AppHandle, selected_model: String) -> Result<RifeRuntimeInfo, String> {
+fn needs_full_runtime_install(runtime_dir: &Path, repair: bool) -> bool {
+    repair
+        || !required_runtime_paths(runtime_dir)
+            .into_iter()
+            .all(|path| path.is_file())
+}
+
+fn preserve_installed_models(
+    runtime_dir: &Path,
+    staging: &Path,
+    selected_model: &str,
+) -> Result<(), String> {
+    for model in MODEL_ASSETS
+        .iter()
+        .filter(|model| model.setting != selected_model)
+    {
+        let source = runtime_dir
+            .join("models")
+            .join("rife")
+            .join(model.installed_name);
+        if source
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == model.installed_bytes)
+        {
+            let destination = staging
+                .join("models")
+                .join("rife")
+                .join(model.installed_name);
+            fs::copy(&source, &destination).map_err(|error| {
+                format!(
+                    "Could not preserve RIFE {} during repair: {error}",
+                    model.setting
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn install_blocking(
+    app: AppHandle,
+    selected_model: String,
+    repair: bool,
+) -> Result<RifeRuntimeInfo, String> {
     let _guard = begin_runtime_operation(RIFE_OPERATION_INSTALLING, "install the RIFE Runtime")?;
     let _ = remove_invalid_cache_artifacts(&engine_cache_dir()?);
     let model = *model_asset(&selected_model)?;
@@ -932,9 +1006,7 @@ fn install_blocking(app: AppHandle, selected_model: String) -> Result<RifeRuntim
         .build()
         .map_err(|error| format!("Could not initialize the RIFE downloader: {error}"))?;
 
-    let base_ready = required_runtime_paths(&runtime_dir)
-        .into_iter()
-        .all(|path| path.is_file());
+    let base_ready = !needs_full_runtime_install(&runtime_dir, repair);
     ensure_install_prerequisites(&runtime_root, base_ready)?;
     if base_ready {
         let model_archive = download_asset(
@@ -1004,6 +1076,7 @@ fn install_blocking(app: AppHandle, selected_model: String) -> Result<RifeRuntim
     extract_archive(&paths[2], &staging)?;
     extract_archive(&paths[3], &staging)?;
     install_model_archive(&paths[4], &model, &staging)?;
+    preserve_installed_models(&runtime_dir, &staging, &selected_model)?;
     write_runtime_notices(&staging)?;
 
     let backup = runtime_root.join(format!("{RUNTIME_VERSION}.previous"));
@@ -1035,8 +1108,12 @@ fn install_blocking(app: AppHandle, selected_model: String) -> Result<RifeRuntim
     runtime_info(&selected_model)
 }
 
-pub async fn install(app: AppHandle, selected_model: String) -> Result<RifeRuntimeInfo, String> {
-    tauri::async_runtime::spawn_blocking(move || install_blocking(app, selected_model))
+pub async fn install(
+    app: AppHandle,
+    selected_model: String,
+    repair: bool,
+) -> Result<RifeRuntimeInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || install_blocking(app, selected_model, repair))
         .await
         .map_err(|error| format!("RIFE installer task failed: {error}"))?
 }
@@ -1044,6 +1121,193 @@ pub async fn install(app: AppHandle, selected_model: String) -> Result<RifeRunti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_repair_replaces_base_files_and_preserves_other_models() {
+        let directory = download_test_dir();
+        let runtime = directory.join("runtime");
+        let staging = directory.join("staging");
+        for path in required_runtime_paths(&runtime) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"broken component").unwrap();
+        }
+        assert!(!needs_full_runtime_install(&runtime, false));
+        assert!(needs_full_runtime_install(&runtime, true));
+        let source_models = runtime.join("models/rife");
+        let destination_models = staging.join("models/rife");
+        fs::create_dir_all(&source_models).unwrap();
+        fs::create_dir_all(&destination_models).unwrap();
+        let other = model_asset("4.9").unwrap();
+        let mut model = File::create(source_models.join(other.installed_name)).unwrap();
+        model.write_all(b"additional model").unwrap();
+        model.set_len(other.installed_bytes).unwrap();
+        drop(model);
+        fs::write(
+            destination_models.join("rife_v4.6.onnx"),
+            b"repaired selected model",
+        )
+        .unwrap();
+        fs::write(source_models.join("rife_v4.6.onnx"), b"old selected model").unwrap();
+        preserve_installed_models(&runtime, &staging, "4.6").unwrap();
+        assert_eq!(
+            destination_models
+                .join(other.installed_name)
+                .metadata()
+                .unwrap()
+                .len(),
+            other.installed_bytes
+        );
+        assert_eq!(
+            fs::read(destination_models.join("rife_v4.6.onnx")).unwrap(),
+            b"repaired selected model"
+        );
+        assert!(directory.starts_with(std::env::temp_dir()));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn download_test_dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "streamee-rife-download-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn sample_asset(url: String, body: &[u8]) -> Asset {
+        Asset {
+            name: "sample.bin",
+            url: Box::leak(url.into_boxed_str()),
+            bytes: body.len() as u64,
+            sha256: Box::leak(format!("{:x}", Sha256::digest(body)).into_boxed_str()),
+        }
+    }
+
+    fn download_server(
+        responses: Vec<(&'static str, &'static str, &'static [u8])>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/sample", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, extra_headers, body) in responses {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "download request did not arrive");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8192);
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n", body.len()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+            requests
+        });
+        (url, worker)
+    }
+
+    #[test]
+    fn completed_part_is_verified_and_finalized_without_a_range_request() {
+        let directory = download_test_dir();
+        let asset = sample_asset("http://127.0.0.1:9/unreachable".to_string(), b"abcdef");
+        fs::write(directory.join("sample.bin.part"), b"abcdef").unwrap();
+        let file =
+            download_asset_with_progress(&Client::new(), asset, &directory, |_, _| {}).unwrap();
+        assert_eq!(fs::read(file).unwrap(), b"abcdef");
+        assert!(!directory.join("sample.bin.part").exists());
+        assert!(directory.starts_with(std::env::temp_dir()));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn complete_invalid_part_is_replaced_by_a_fresh_download() {
+        let directory = download_test_dir();
+        let (url, server) = download_server(vec![("200 OK", "", b"abcdef")]);
+        let asset = sample_asset(url, b"abcdef");
+        fs::write(directory.join("sample.bin.part"), b"broken").unwrap();
+        let file =
+            download_asset_with_progress(&Client::new(), asset, &directory, |_, _| {}).unwrap();
+        assert_eq!(fs::read(file).unwrap(), b"abcdef");
+        assert!(!server.join().unwrap()[0].to_lowercase().contains("range:"));
+        assert!(directory.starts_with(std::env::temp_dir()));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unsatisfiable_resume_retries_without_range_and_partial_resume_still_works() {
+        for rejected in [true, false] {
+            let directory = download_test_dir();
+            let responses = if rejected {
+                vec![
+                    (
+                        "416 Range Not Satisfiable",
+                        "Content-Range: bytes */6\r\n",
+                        &b""[..],
+                    ),
+                    ("200 OK", "", &b"abcdef"[..]),
+                ]
+            } else {
+                vec![(
+                    "206 Partial Content",
+                    "Content-Range: bytes 3-5/6\r\n",
+                    &b"def"[..],
+                )]
+            };
+            let (url, server) = download_server(responses);
+            let asset = sample_asset(url, b"abcdef");
+            fs::write(directory.join("sample.bin.part"), b"abc").unwrap();
+            let file =
+                download_asset_with_progress(&Client::new(), asset, &directory, |_, _| {}).unwrap();
+            assert_eq!(fs::read(file).unwrap(), b"abcdef");
+            let requests = server.join().unwrap();
+            assert!(requests[0].to_lowercase().contains("range: bytes=3-"));
+            if rejected {
+                assert!(!requests[1].to_lowercase().contains("range:"));
+            }
+            assert!(directory.starts_with(std::env::temp_dir()));
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn hash_failure_discards_the_part_so_the_next_attempt_can_succeed() {
+        let directory = download_test_dir();
+        let (url, server) =
+            download_server(vec![("200 OK", "", b"broken"), ("200 OK", "", b"abcdef")]);
+        let asset = sample_asset(url, b"abcdef");
+        let client = Client::new();
+        assert!(
+            download_asset_with_progress(&client, asset, &directory, |_, _| {})
+                .unwrap_err()
+                .contains("SHA-256")
+        );
+        assert!(!directory.join("sample.bin.part").exists());
+        let file = download_asset_with_progress(&client, asset, &directory, |_, _| {}).unwrap();
+        assert_eq!(fs::read(file).unwrap(), b"abcdef");
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert!(directory.starts_with(std::env::temp_dir()));
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn every_exposed_model_has_a_pinned_asset() {

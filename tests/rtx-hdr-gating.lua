@@ -67,6 +67,25 @@ local function scenario(vsr_selected)
         ["hw-pixelformat"] = "p010"}
     observers["video-params"](); check(false)
     for _, filter in ipairs(props.vf) do assert(filter.label ~= "streamee-vsr") end
+    for _, format in ipairs({"yuv420p9", "yuv420p10le", "yuv444p12be", "yuv444p14",
+        "yuv444p16", "yuv444p16le", "p016", "p216le", "y416", "gbrp16be",
+        "gbrpf32le", "gray16", "grayf32", "rgb48le", "rgba64be", "x2rgb10le",
+        "yuv444pf", "yuva420pf", "rgb30", "xyz12be", "nv20be", "ya16", "yap16",
+        "ayuv64be", "xv30", "xv36be", "rgbaf16", "bayer_bggr16"}) do
+        props["video-params"] = {w = 1920, h = 1080, gamma = "bt.1886", pixelformat = format}
+        observers["video-params"](); check(false)
+        for _, filter in ipairs(props.vf) do
+            assert(filter.label ~= "streamee-vsr", format .. " must preserve its precision")
+        end
+    end
+    props["video-params"] = {w = 1920, h = 1080, gamma = "bt.1886", pixelformat = "d3d11",
+        ["hw-pixelformat"] = "p016"}
+    observers["video-params"](); check(false)
+    for _, filter in ipairs(props.vf) do assert(filter.label ~= "streamee-vsr") end
+    for _, format in ipairs({"yuv420p", "nv12", "rgb24", "rgba", "rgb565le", "gray"}) do
+        props["video-params"] = {w = 1920, h = 1080, gamma = "bt.1886", pixelformat = format}
+        observers["video-params"](); check(true)
+    end
     props["video-params"] = {w = 1920, h = 1080, gamma = "bt.1886", ["dovi-profile"] = 8}
     observers["video-params"](); check(false)
     for _, filter in ipairs(props.vf) do assert(filter.label ~= "streamee-vsr") end

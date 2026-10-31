@@ -52,6 +52,95 @@ const RIFE_HEALTH_FAILURE_DEADLINE: Duration = Duration::from_secs(15);
 #[cfg(target_os = "windows")]
 const RIFE_HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RifeTelemetry {
+    pid: u32,
+    updated_at: f64,
+    mode: String,
+    speed: f64,
+    source_fps: f64,
+    generated_fps: f64,
+    generated_frames: u64,
+    fallback_frames: u64,
+    #[serde(default)]
+    fallback_reason: Option<String>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn rife_state_path(pid: u32, kind: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("streamee-rife-{pid}-{kind}.json"))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn valid_rife_telemetry(telemetry: &RifeTelemetry, pid: u32, now: f64) -> bool {
+    let age = now - telemetry.updated_at;
+    telemetry.pid == pid
+        && (0.0..=3.0).contains(&age)
+        && matches!(
+            telemetry.mode.as_str(),
+            "interpolating" | "trial" | "fallback"
+        )
+        && (0.01..=100.0).contains(&telemetry.speed)
+        && telemetry.source_fps.is_finite()
+        && telemetry.source_fps >= 0.0
+        && telemetry.generated_fps.is_finite()
+        && telemetry.generated_fps >= 0.0
+}
+
+#[cfg(target_os = "windows")]
+fn read_rife_telemetry(pid: u32) -> Option<RifeTelemetry> {
+    let bytes = std::fs::read(rife_state_path(pid, "status")).ok()?;
+    let telemetry = serde_json::from_slice(&bytes).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    valid_rife_telemetry(&telemetry, pid, now).then_some(telemetry)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn rife_health_details(
+    telemetry: Option<&RifeTelemetry>,
+    paused: bool,
+) -> (&'static str, &'static str, String) {
+    if paused {
+        return ("pending", "paused", "RIFE playback is paused".to_string());
+    }
+    match telemetry {
+        Some(value) if value.mode == "fallback" && value.fallback_reason.as_deref() == Some("color-metadata") => (
+            "fallback", "color-metadata",
+            "RIFE is using source frames because this source lacks the color metadata needed for safe interpolation".to_string(),
+        ),
+        Some(value) if value.mode == "fallback" => (
+            "fallback",
+            "fallback",
+            "RIFE is temporarily using source frames while processing capacity is limited"
+                .to_string(),
+        ),
+        Some(value) if value.mode == "interpolating" => (
+            "active",
+            "interpolating",
+            format!(
+                "RIFE interpolation is active at {:.1} fps ({:.1} generated frames/s)",
+                value.source_fps + value.generated_fps,
+                value.generated_fps
+            ),
+        ),
+        Some(_) => (
+            "pending",
+            "trial",
+            "RIFE is checking available processing capacity".to_string(),
+        ),
+        None => (
+            "pending",
+            "unknown",
+            "RIFE filter is loaded; waiting for interpolation telemetry".to_string(),
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SmartEpisodeDirection {
@@ -316,11 +405,27 @@ fn emit_rife_playback_status(
     output_video: Option<serde_json::Value>,
     message: &str,
     show_osd: bool,
+    telemetry: Option<&RifeTelemetry>,
 ) {
     if show_osd {
         show_hdr_message(pipe, message);
     }
-    let sustaining = rife_sustaining(container_fps, output_fps, multiplier);
+    let effective_fps = telemetry
+        .as_ref()
+        .map(|value| value.source_fps + value.generated_fps);
+    let sustaining = telemetry.as_ref().and_then(|value| {
+        if value.mode == "fallback" {
+            Some(false)
+        } else if value.mode == "interpolating" {
+            rife_sustaining(
+                container_fps.map(|fps| fps * value.speed),
+                effective_fps,
+                multiplier,
+            )
+        } else {
+            None
+        }
+    });
     publish_rife_playback_status(
         app_handle,
         serde_json::json!({
@@ -329,8 +434,15 @@ fn emit_rife_playback_status(
             "multiplier": multiplier,
             "filename": filename,
             "containerFps": container_fps,
-            "outputFps": output_fps,
+            "outputFps": effective_fps.or(output_fps),
             "sustaining": sustaining,
+            "mode": telemetry.as_ref().map(|value| &value.mode),
+            "generatedFps": telemetry.as_ref().map(|value| value.generated_fps),
+            "sourceFps": telemetry.as_ref().map(|value| value.source_fps),
+            "generatedFrames": telemetry.as_ref().map(|value| value.generated_frames),
+            "fallbackFrames": telemetry.as_ref().map(|value| value.fallback_frames),
+            "fallbackReason": telemetry.as_ref().and_then(|value| value.fallback_reason.as_deref()),
+            "playbackSpeed": telemetry.as_ref().map(|value| value.speed),
             "inputVideo": &input_video,
             "outputVideo": &output_video,
             "message": message,
@@ -408,15 +520,69 @@ pub(crate) struct MpvResponse {
     pub(crate) name: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
-fn set_hdr_state_property(pipe: HANDLE, state: crate::windows_hdr::HdrState) {
-    let value = if !state.supported {
+#[cfg(any(target_os = "windows", test))]
+fn hdr_state_value(state: crate::windows_hdr::HdrState) -> &'static str {
+    if !state.supported {
         "unsupported"
     } else if state.enabled {
         "on"
     } else {
         "off"
-    };
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn sync_hdr_state(
+    last_published: &mut Option<&'static str>,
+    current: Result<crate::windows_hdr::HdrState, String>,
+    publish: impl FnOnce(crate::windows_hdr::HdrState) -> bool,
+) {
+    if let Ok(state) = current {
+        let value = hdr_state_value(state);
+        if *last_published != Some(value) {
+            *last_published = publish(state).then_some(value);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn hdr_sync_retries_startup_and_publish_failures_and_tracks_display_changes() {
+    use crate::windows_hdr::HdrState;
+    let mut last = None;
+    sync_hdr_state(&mut last, Err("window not ready".to_string()), |_| {
+        panic!("failed reads must not be published")
+    });
+    assert_eq!(last, None);
+    for (supported, enabled, succeeds, expected) in [
+        (true, false, false, None),
+        (true, false, true, Some("off")),
+        (true, true, false, None),
+        (true, false, true, Some("off")),
+        (true, true, true, Some("on")),
+        (false, false, true, Some("unsupported")),
+        (true, false, true, Some("off")),
+    ] {
+        sync_hdr_state(&mut last, Ok(HdrState { supported, enabled }), |_| succeeds);
+        assert_eq!(last, expected);
+    }
+    sync_hdr_state(&mut last, Err("display changing".to_string()), |_| {
+        panic!("transient reads must not clear the last known state")
+    });
+    sync_hdr_state(
+        &mut last,
+        Ok(HdrState {
+            supported: true,
+            enabled: false,
+        }),
+        |_| panic!("unchanged state must not be republished"),
+    );
+    assert_eq!(last, Some("off"));
+}
+
+#[cfg(target_os = "windows")]
+fn set_hdr_state_property(pipe: HANDLE, state: crate::windows_hdr::HdrState) -> bool {
+    let value = hdr_state_value(state);
     let command = MpvCommand {
         command: vec![
             serde_json::json!("set_property"),
@@ -425,7 +591,11 @@ fn set_hdr_state_property(pipe: HANDLE, state: crate::windows_hdr::HdrState) {
         ],
         request_id: None,
     };
-    let _ = send_command(pipe, &command);
+    if !send_command(pipe, &command)
+        .is_some_and(|response| response.error.as_deref() == Some("success"))
+    {
+        return false;
+    }
 
     let notify_osc = MpvCommand {
         command: vec![
@@ -436,7 +606,8 @@ fn set_hdr_state_property(pipe: HANDLE, state: crate::windows_hdr::HdrState) {
         ],
         request_id: None,
     };
-    let _ = send_command(pipe, &notify_osc);
+    send_command(pipe, &notify_osc)
+        .is_some_and(|response| response.error.as_deref() == Some("success"))
 }
 
 #[cfg(target_os = "windows")]
@@ -2346,10 +2517,13 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                 let _ = send_command(pipe, &cmd);
             }
 
+            let mut last_hdr_state = None;
             if mpv_pid != 0 {
-                if let Ok(state) = crate::get_mpv_monitor_hdr_state(mpv_pid) {
-                    set_hdr_state_property(pipe, state);
-                }
+                sync_hdr_state(
+                    &mut last_hdr_state,
+                    crate::get_mpv_monitor_hdr_state(mpv_pid),
+                    |state| set_hdr_state_property(pipe, state),
+                );
             }
             set_svp_enabled_property(
                 pipe,
@@ -2371,6 +2545,8 @@ pub fn start_player_watcher(app_handle: AppHandle) {
             let mut last_progress_poll = std::time::Instant::now();
             let mut last_pause_poll = std::time::Instant::now();
             let pause_poll_interval = std::time::Duration::from_millis(500);
+            let mut last_hdr_poll = std::time::Instant::now();
+            let hdr_poll_interval = std::time::Duration::from_secs(1);
             let mut last_pipe_health_check = std::time::Instant::now();
             let pipe_health_check_interval = std::time::Duration::from_secs(2);
             let mut last_audio_track_id: Option<i64> = None;
@@ -2416,9 +2592,34 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                     break;
                 }
 
+                // Re-read the current monitor after Windows HDR changes or window moves.
+                if mpv_pid != 0 && last_hdr_poll.elapsed() >= hdr_poll_interval {
+                    last_hdr_poll = std::time::Instant::now();
+                    sync_hdr_state(
+                        &mut last_hdr_state,
+                        crate::get_mpv_monitor_hdr_state(mpv_pid),
+                        |state| set_hdr_state_property(pipe, state),
+                    );
+                }
+
                 // Poll pause state every 500ms
                 if last_pause_poll.elapsed() >= pause_poll_interval {
                     last_pause_poll = std::time::Instant::now();
+                    if EXPECTED_RIFE_PID.load(Ordering::SeqCst) == mpv_pid {
+                        if let Some(speed) =
+                            get_property_value(pipe, "speed").and_then(|value| value.as_f64())
+                        {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs_f64();
+                            let control = serde_json::json!({"pid": mpv_pid, "speed": speed, "updatedAt": now});
+                            let _ = std::fs::write(
+                                rife_state_path(mpv_pid, "control"),
+                                control.to_string(),
+                            );
+                        }
+                    }
                     let _ = send_command(
                         pipe,
                         &MpvCommand {
@@ -2533,37 +2734,15 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                 Some(true) if elapsed >= RIFE_HEALTH_WARMUP => {
                                     let container_fps = get_property_value(pipe, "container-fps")
                                         .and_then(|value| value.as_f64());
-                                    let output_fps = get_property_value(pipe, "estimated-vf-fps")
-                                        .and_then(|value| value.as_f64());
-                                    if output_fps.is_some()
-                                        || elapsed >= RIFE_HEALTH_FAILURE_DEADLINE
+                                    let telemetry = read_rife_telemetry(mpv_pid);
+                                    let output_fps = telemetry
+                                        .as_ref()
+                                        .map(|value| value.source_fps + value.generated_fps);
+                                    let (status, state, message) = rife_health_details(
+                                        telemetry.as_ref(),
+                                        current_state.paused,
+                                    );
                                     {
-                                        let sustaining = rife_sustaining(
-                                            container_fps,
-                                            output_fps,
-                                            expected_multiplier,
-                                        )
-                                        .unwrap_or(false);
-                                        let state = if sustaining {
-                                            "active"
-                                        } else if output_fps.is_some() {
-                                            "degraded"
-                                        } else {
-                                            "unknown-rate"
-                                        };
-                                        let message = if sustaining {
-                                            format!(
-                                                "RIFE is active at {:.3} fps",
-                                                output_fps.unwrap_or_default()
-                                            )
-                                        } else if let Some(output) = output_fps {
-                                            format!(
-                                                "RIFE is active at {output:.3} fps but is below the requested {expected_multiplier}x rate"
-                                            )
-                                        } else {
-                                            "RIFE is active; output frame rate is not available yet"
-                                                .to_string()
-                                        };
                                         if rife_health_last_state != Some(state) || report_due {
                                             let input_video =
                                                 get_property_value(pipe, "video-params");
@@ -2572,7 +2751,7 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                             emit_rife_playback_status(
                                                 &app_handle,
                                                 pipe,
-                                                "active",
+                                                status,
                                                 mpv_pid,
                                                 expected_multiplier,
                                                 &current_state.filename,
@@ -2581,7 +2760,9 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                                 input_video,
                                                 output_video,
                                                 &message,
-                                                rife_health_last_state != Some(state),
+                                                !current_state.paused
+                                                    && rife_health_last_state != Some(state),
+                                                telemetry.as_ref(),
                                             );
                                             rife_health_last_state = Some(state);
                                             rife_health_last_report = Some(now);
@@ -2604,6 +2785,7 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                             None,
                                             "The RIFE filter is present but disabled",
                                             rife_health_last_state != Some(state),
+                                            None,
                                         );
                                         rife_health_last_state = Some(state);
                                         rife_health_last_report = Some(now);
@@ -2625,6 +2807,7 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                             None,
                                             "The RIFE filter did not initialize",
                                             rife_health_last_state != Some(state),
+                                            None,
                                         );
                                         rife_health_last_state = Some(state);
                                         rife_health_last_report = Some(now);
@@ -2668,7 +2851,9 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                             last_hdr_toggle_request = request;
                             match crate::toggle_mpv_monitor_hdr(mpv_pid) {
                                 Ok(state) => {
-                                    set_hdr_state_property(pipe, state);
+                                    sync_hdr_state(&mut last_hdr_state, Ok(state), |state| {
+                                        set_hdr_state_property(pipe, state)
+                                    });
                                     if state.supported {
                                         crate::suppress_auto_hdr_for_manual_restart();
                                         show_hdr_message(
@@ -3272,6 +3457,11 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                 EXPECTED_RIFE_MULTIPLIER.store(0, Ordering::SeqCst);
             }
             clear_rife_playback_status(mpv_pid);
+            for kind in ["status", "control"] {
+                let _ = std::fs::remove_file(rife_state_path(mpv_pid, kind));
+            }
+            let _ =
+                std::fs::remove_file(rife_state_path(mpv_pid, "status").with_extension("json.tmp"));
             clear_optiflow_expectation(mpv_pid);
             clear_pending_smart_next_request_for_pid(mpv_pid, "MPV session ended");
             std::thread::sleep(Duration::from_millis(500));
@@ -3312,6 +3502,52 @@ mod smart_next_tests {
         next_smart_next_request_id, rife_sustaining, should_request_smart_next,
         SmartEpisodeDirection, SmartNextPendingRequest,
     };
+
+    #[test]
+    fn rife_health_reports_fallback_instead_of_nominal_output_rate() {
+        let mut telemetry = super::RifeTelemetry {
+            pid: 123,
+            updated_at: 1000.0,
+            mode: "fallback".to_string(),
+            speed: 0.5,
+            source_fps: 12.0,
+            generated_fps: 0.0,
+            generated_frames: 100,
+            fallback_frames: 200,
+            fallback_reason: None,
+        };
+        assert!(super::valid_rife_telemetry(&telemetry, 123, 1001.0));
+        assert!(!super::valid_rife_telemetry(&telemetry, 456, 1001.0));
+        assert!(!super::valid_rife_telemetry(&telemetry, 123, 1004.0));
+        assert_eq!(
+            super::rife_health_details(Some(&telemetry), false).0,
+            "fallback"
+        );
+        telemetry.fallback_reason = Some("color-metadata".to_string());
+        assert_eq!(
+            super::rife_health_details(Some(&telemetry), false).1,
+            "color-metadata"
+        );
+        telemetry.fallback_reason = None;
+        telemetry.mode = "interpolating".to_string();
+        telemetry.generated_fps = 12.0;
+        assert_eq!(
+            super::rife_health_details(Some(&telemetry), false).0,
+            "active"
+        );
+        assert_eq!(
+            super::rife_health_details(Some(&telemetry), true).0,
+            "pending"
+        );
+        assert_eq!(super::rife_health_details(None, false).0, "pending");
+        telemetry.mode = "trial".to_string();
+        assert_eq!(
+            super::rife_health_details(Some(&telemetry), false).0,
+            "pending"
+        );
+        telemetry.generated_fps = f64::NAN;
+        assert!(!super::valid_rife_telemetry(&telemetry, 123, 1001.0));
+    }
 
     #[test]
     fn pending_request_belongs_only_to_its_mpv_session() {

@@ -1,12 +1,14 @@
 """RIFE frame generation using Streamee's optional managed runtime."""
 
 import os
+import json
 import re
 import shutil
 import sys
+import tempfile
 from fractions import Fraction
 from threading import Lock
-from time import monotonic
+from time import monotonic, time as wall_time
 
 import vapoursynth as vs
 
@@ -84,8 +86,7 @@ class RifePlaybackGuard:
         self.lock = Lock()
         self.pending = {}
         self.last_activity = None
-        self.frame = 0
-        self.deadline = 0.0
+        self.speed = 1.0
         self.recovering = False
         self.retry_at = 0.0
         self.retry_delay = 2.0
@@ -94,40 +95,73 @@ class RifePlaybackGuard:
         self.trial_started = None
         self.trial_media = 0.0
         self.trial_is_recovery = False
+        self.original_frames = 0
+        self.generated_frames = 0
+        self.fallback_frames = 0
+        self.color_bypass = False
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "mode": "fallback" if self.recovering or self.color_bypass else "trial" if self.trial else "interpolating",
+                "fallbackReason": "color-metadata" if self.color_bypass else "processing" if self.recovering else None,
+                "speed": self.speed,
+                "originalFrames": self.original_frames,
+                "generatedFrames": self.generated_frames,
+                "fallbackFrames": self.fallback_frames,
+            }
+
+    def set_speed(self, speed):
+        speed = max(0.01, min(100.0, float(speed)))
+        with self.lock:
+            if abs(speed - self.speed) < 0.0001:
+                return
+            self.speed = speed
+            self.recovering = False
+            self.trial = True
+            self.trial_started = None
+            self.trial_media = 0.0
+            self.trial_is_recovery = False
+            self.healthy_since = None
+
+    def _pipeline_overdue(self, now):
+        if not self.pending:
+            return False
+        # A queue's playback budget is the sum of its actual frame durations.
+        # Frame numbers cannot supply timestamps for variable-rate or reordered
+        # requests. Allow a small processing margin for the warmed pipeline.
+        budget = sum(item[2] for item in self.pending.values()) / self.speed
+        return now - min(item[0] for item in self.pending.values()) > max(0.2, budget + 0.1)
 
     def _overloaded(self, now):
         if not self.recovering:
             self.report("RIFE overloaded; temporarily using source frames")
         self.recovering = True
         self.trial = False
+        self.healthy_since = None
         self.retry_at = now + self.retry_delay
         self.retry_delay = min(15.0, self.retry_delay * 2)
 
-    def request(self, n, duration):
+    def request(self, n, duration, use_source=False):
         with self.lock:
             now = self.clock()
+            if use_source:
+                self.color_bypass = True
+                self.pending[n] = (now, None, duration, False)
+                self.last_activity = now
+                return False
+            if self.color_bypass:
+                self.color_bypass = False
+                self.recovering = False
+                self.trial = True
+                self.trial_started = None
+                self.trial_media = 0.0
             # MPV stops requesting once its queue fills, including during pause,
             # slow playback, or network buffering. Only charge time while this
             # graph has work to do. Seeks rebuild the script and its guard.
-            if self.last_activity is None:
-                self.frame, self.deadline = n, now + 0.1 + n * duration
-            else:
-                if not self.pending:
-                    idle = now - self.last_activity
-                    self.deadline += idle
-                    if self.trial_started is not None:
-                        self.trial_started += idle
-                    # Healthy idle periods must not accumulate unlimited credit
-                    # that could hide a later overload.
-                    self.deadline = min(
-                        self.deadline, now + 0.1 + max(0, self.frame - n) * duration,
-                    )
-                if n > self.frame:
-                    self.deadline += (n - self.frame) * duration
-                    self.frame = n
-            deadline = self.deadline - (self.frame - n) * duration
-            slack = max(0.08, 2 * duration * self.multiplier)
-            if not self.recovering and not self.trial and now > deadline + slack:
+            if self.last_activity is not None and not self.pending and self.trial_started is not None:
+                self.trial_started += now - self.last_activity
+            if not self.recovering and not self.trial and not self.color_bypass and self._pipeline_overdue(now):
                 self._overloaded(now)
 
             generated = n % self.multiplier != 0
@@ -143,19 +177,27 @@ class RifePlaybackGuard:
                     self.trial_media = 0.0
                     self.trial_is_recovery = True
                     use_rife = True
-            self.pending[n] = (now, deadline + slack, duration, generated and use_rife)
+            self.pending[n] = (now, None, duration, generated and use_rife)
             self.last_activity = now
             return use_rife
 
     def complete(self, n):
         with self.lock:
             now = self.clock()
+            if not self.recovering and not self.trial and not self.color_bypass and self._pipeline_overdue(now):
+                self._overloaded(now)
             item = self.pending.pop(n, None)
             self.last_activity = now
             if item is None:
                 return
-            started, deadline, duration, generated = item
-            if generated and not self.recovering and self.trial:
+            _, _, duration, generated = item
+            if n % self.multiplier == 0:
+                self.original_frames += 1
+            elif generated:
+                self.generated_frames += 1
+            else:
+                self.fallback_frames += 1
+            if generated and not self.recovering and not self.color_bypass:
                 # Ignore first-use initialization, then measure media produced
                 # over at least half a second of active processing. Frames can
                 # finish out of order; each generated slot counts once.
@@ -164,22 +206,74 @@ class RifePlaybackGuard:
                 else:
                     self.trial_media += duration * self.multiplier / (self.multiplier - 1)
                     elapsed = now - self.trial_started
-                    if elapsed >= 0.5:
-                        if self.trial_media < elapsed * 0.85:
+                    if elapsed >= 0.5 or self.trial_media >= 0.5 * self.speed:
+                        if self.trial_media < elapsed * self.speed * 0.85:
                             self._overloaded(now)
                         else:
+                            if self.trial:
+                                self.healthy_since = now
+                                if self.trial_is_recovery:
+                                    self.report("RIFE recovered; resuming interpolation")
                             self.trial = False
-                            self.healthy_since = now
-                            if self.trial_is_recovery:
-                                self.report("RIFE recovered; resuming interpolation")
-                # Start normal deadline checks from the warmed pipeline, rather
-                # than retaining lateness caused by loading or a cold retry.
-                self.deadline = now + 0.1 + max(0, self.frame - n) * duration
-            elif generated and not self.recovering:
-                if now > deadline:
-                    self._overloaded(now)
-                elif self.healthy_since is not None and now - self.healthy_since >= 5.0:
+                            self.trial_started = now
+                            self.trial_media = 0.0
+                if self.healthy_since is not None and now - self.healthy_since >= 5.0:
                     self.retry_delay = 2.0
+
+
+class RifePlaybackBridge:
+    """Exchange bounded playback telemetry with Streamee's MPV controller."""
+
+    def __init__(self, directory=None, pid=None, clock=monotonic, wall_clock=wall_time):
+        self.pid = pid or os.getpid()
+        self.directory = directory or os.environ.get("STREAMEE_RIFE_STATE_DIR", tempfile.gettempdir())
+        self.status_path = os.path.join(self.directory, f"streamee-rife-{self.pid}-status.json")
+        self.control_path = os.path.join(self.directory, f"streamee-rife-{self.pid}-control.json")
+        self.clock, self.wall_clock = clock, wall_clock
+        self.last_read = self.last_write = None
+        self.last_attempt = None
+        self.last_counts = (0, 0)
+        self.current_speed = 1.0
+        self.lock = Lock()
+
+    def speed(self):
+        with self.lock:
+            now = self.clock()
+            if self.last_read is None or now - self.last_read >= 0.25:
+                self.last_read = now
+                try:
+                    with open(self.control_path, encoding="utf-8") as source:
+                        control = json.load(source)
+                    speed = float(control["speed"])
+                    age = self.wall_clock() - float(control["updatedAt"])
+                    if control.get("pid") == self.pid and 0 <= age <= 5 and 0.01 <= speed <= 100:
+                        self.current_speed = speed
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
+            return self.current_speed
+
+    def publish(self, guard):
+        with self.lock:
+            now = self.clock()
+            if self.last_attempt is not None and now - self.last_attempt < 0.5:
+                return
+            self.last_attempt = now
+            status = guard.snapshot()
+            counts = (status["originalFrames"], status["generatedFrames"])
+            elapsed = now - self.last_write if self.last_write is not None else 0
+            status.update({
+                "pid": self.pid, "updatedAt": self.wall_clock(),
+                "sourceFps": (counts[0] - self.last_counts[0]) / elapsed if elapsed > 0 else 0,
+                "generatedFps": (counts[1] - self.last_counts[1]) / elapsed if elapsed > 0 else 0,
+            })
+            temporary = self.status_path + ".tmp"
+            try:
+                with open(temporary, "w", encoding="utf-8") as output:
+                    json.dump(status, output, allow_nan=False)
+                os.replace(temporary, self.status_path)
+                self.last_write, self.last_counts = now, counts
+            except (OSError, ValueError):
+                pass
 
 
 def guard_playback(source, interpolated, multiplier, gpu_streams):
@@ -192,13 +286,19 @@ def guard_playback(source, interpolated, multiplier, gpu_streams):
         gpu_streams,
         report=lambda message: core.log_message(vs.MESSAGE_TYPE_INFORMATION, message),
     )
+    bridge = globals().get("playback_bridge")
+    if bridge:
+        bridge.publish(guard)
 
     def choose(n, f):
+        if bridge:
+            guard.set_speed(bridge.speed())
+        use_source = not color_conversion_supported(f.props)
         numerator = f.props.get("_DurationNum", 0)
         denominator = f.props.get("_DurationDen", 0)
         if numerator <= 0 or denominator <= 0:
-            return interpolated
-        return interpolated if guard.request(n, numerator / denominator) else fallback
+            return fallback if use_source else interpolated
+        return interpolated if guard.request(n, numerator / denominator, use_source=use_source) else fallback
 
     selected = core.std.FrameEval(
         fallback, eval=choose, prop_src=fallback, clip_src=[fallback, interpolated],
@@ -206,11 +306,14 @@ def guard_playback(source, interpolated, multiplier, gpu_streams):
 
     def completed(n, f):
         guard.complete(n)
+        if bridge:
+            bridge.publish(guard)
         return f
 
     return core.std.ModifyFrame(selected, clips=selected, selector=completed)
 
 
+playback_bridge = RifePlaybackBridge() if os.environ.get("STREAMEE_RIFE_REALTIME") == "1" else None
 clip = video_in.std.Trim(length=5_000_000)
 source = clip
 source_format = clip.format.id
@@ -280,6 +383,36 @@ def range_name(range_id: int) -> str:
     return "limited" if range_id == int(vs.RANGE_LIMITED) else "full"
 
 
+def frame_color_properties(props):
+    # MPV's bridge uses _ColorSpace; native VapourSynth sources use _Matrix.
+    matrix_id = next(
+        (int(props[key]) for key in ("_Matrix", "_ColorSpace")
+         if key in props and int(props[key]) in matrix_names),
+        int(vs.MATRIX_BT709),
+    )
+    if props.get("_Range") in (0, 1):
+        range_id = 1 - int(props["_Range"])
+    else:
+        range_id = int(props.get("_ColorRange", int(vs.RANGE_LIMITED)))
+    if range_id not in (int(vs.RANGE_FULL), int(vs.RANGE_LIMITED)):
+        range_id = int(vs.RANGE_LIMITED)
+    return matrix_id, range_id
+
+
+def color_conversion_supported(props):
+    matrix_id, _ = frame_color_properties(props)
+    transfer = int(props.get("_Transfer", 2))
+    primaries = int(props.get("_Primaries", 2))
+    if matrix_id == 10:
+        return transfer in (14, 15)
+    if matrix_id in (12, 13):
+        known_primaries = primaries in (1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 22)
+        return known_primaries and (matrix_id == 12 or transfer in (1, 4, 5, 6, 7, 8, 13, 14, 15, 16, 18))
+    if matrix_id == 14:
+        return primaries == 9 and transfer in (16, 18)
+    return True
+
+
 rgb_conversions = {
     (matrix_id, range_id): clip.resize.Bicubic(
         format=vs.RGBH,
@@ -294,8 +427,7 @@ default_rgb = rgb_conversions[(int(vs.MATRIX_BT709), int(vs.RANGE_LIMITED))]
 
 def select_rgb_conversion(n: int, f: vs.VideoFrame) -> vs.VideoNode:
     del n
-    matrix_id = int(f.props.get("_Matrix", int(vs.MATRIX_BT709)))
-    range_id = int(f.props.get("_ColorRange", int(vs.RANGE_LIMITED)))
+    matrix_id, range_id = frame_color_properties(f.props)
     return rgb_conversions.get((matrix_id, range_id), default_rgb)
 
 
@@ -345,8 +477,7 @@ property_clip = core.std.Interleave([clip] * multiplier)
 
 def select_color_conversion(n: int, f: vs.VideoFrame) -> vs.VideoNode:
     del n
-    matrix_id = int(f.props.get("_Matrix", int(vs.MATRIX_BT709)))
-    range_id = int(f.props.get("_ColorRange", int(vs.RANGE_LIMITED)))
+    matrix_id, range_id = frame_color_properties(f.props)
     return converted.get((matrix_id, range_id), default_output)
 
 

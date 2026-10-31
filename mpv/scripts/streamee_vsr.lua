@@ -62,6 +62,23 @@ local function bm3dcuda_enabled()
     return mp.get_property_number("user-data/streamee-bm3dcuda-enabled", 0) == 1
 end
 
+local high_precision_packed_formats = {
+    rgb30 = true, rgb48 = true, bgr48 = true,
+    rgba64 = true, bgra64 = true, argb64 = true, abgr64 = true,
+    x2rgb10 = true, x2bgr10 = true, xyz12 = true,
+    nv20 = true, ya16 = true, ayuv64 = true, xv30 = true, xv36 = true,
+}
+
+local function high_precision_format(format)
+    format = tostring(format or ""):lower():gsub("[bl]e$", "")
+    local depth = tonumber(format:match("^[py][024](%d%d)$")
+        or format:match("^[yg].-p(%d+)$") or format:match("^gray(%d+)$")
+        or format:match("f(%d+)$")) or 8
+    return depth > 8 or format:match("pf$") ~= nil
+        or format:match("^bayer_.-16$") ~= nil
+        or high_precision_packed_formats[format] == true
+end
+
 local function source_video_params()
     local params = mp.get_property_native("video-params")
     if type(params) ~= "table" then
@@ -69,13 +86,12 @@ local function source_video_params()
     end
 
     local transfer = tostring(params.gamma or params.transfer or ""):lower()
-    local format = (tostring(params.pixelformat or "") .. " " ..
-        tostring(params["hw-pixelformat"] or "")):lower()
     local depth = tonumber(params["component-bits"]) or 8
     local native_hdr = transfer == "pq" or transfer == "hlg"
         or (tonumber(params["dovi-profile"]) or 0) > 0 or params["hdr10plus"] == true
-    local preserve_precision = native_hdr or depth > 8 or format:find("p010", 1, true)
-        or format:find("10", 1, true) or format:find("12", 1, true)
+    local preserve_precision = native_hdr or depth > 8
+        or high_precision_format(params.pixelformat)
+        or high_precision_format(params["hw-pixelformat"])
     return tonumber(params.w), tonumber(params.h), preserve_precision
 end
 

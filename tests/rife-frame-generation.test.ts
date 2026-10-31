@@ -74,6 +74,13 @@ test('RIFE TensorRT engines can be prepared from Settings before playback', () =
   assert.match(backend, /cancel_rife_engine_preparation/);
 });
 
+test('RIFE repair requests replace the complete runtime while preserving other installed models', () => {
+  assert.match(settings, /handleInstallRife\(true\)/);
+  assert.match(tauri, /'install_rife_runtime', \{ model, repair \}/);
+  assert.match(runtime, /needs_full_runtime_install\(&runtime_dir, repair\)/);
+  assert.match(runtime, /preserve_installed_models\(&runtime_dir, &staging, &selected_model\)/);
+});
+
 test('RIFE playback is verified and cannot run alongside SVP', () => {
   assert.match(backend, /register_rife_expectation/);
   assert.match(backend, /ensure_svp_allowed/);
@@ -89,7 +96,9 @@ test('RIFE playback is verified and cannot run alongside SVP', () => {
   assert.match(mpvIpc, /RIFE_HEALTH_REPORT_INTERVAL/);
   assert.match(mpvIpc, /rife\.session_ready/);
   assert.match(mpvIpc, /rife\.session_failed/);
-  assert.match(mpvIpc, /estimated-vf-fps/);
+  assert.match(mpvIpc, /read_rife_telemetry/);
+  assert.match(mpvIpc, /rife_health_details/);
+  assert.match(backend, /STREAMEE_RIFE_REALTIME/);
   assert.match(mpvIpc, /video-out-params/);
 });
 

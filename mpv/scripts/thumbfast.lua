@@ -388,10 +388,10 @@ end
 
 local function params_are_hdr(color)
     color = color or {}
-    local primaries = string.lower(tostring(color["primaries"] or ""))
     local transfer = string.lower(tostring(color["gamma"] or color["transfer"] or ""))
-    return primaries == "bt.2020" or transfer == "pq" or
-        transfer == "smpte2084" or transfer == "hlg" or transfer == "arib-std-b67"
+    return transfer == "pq" or transfer == "smpte2084" or
+        transfer == "hlg" or transfer == "arib-std-b67" or
+        (tonumber(color["dovi-profile"]) or 0) > 0 or color["hdr10plus"] == true
 end
 
 local function source_is_hdr()

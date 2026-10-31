@@ -1398,18 +1398,20 @@ const Settings: React.FC = () => {
     };
   }, []);
 
-  const handleInstallRife = async () => {
+  const handleInstallRife = async (repair = false) => {
     setRifeInstallStatus('installing');
     setRifeInstallPhase('downloading');
     setRifeInstallProgress(0);
     setRifeInstallMessage(
-      rifeRuntimeInfo?.installed
+      repair
+        ? 'Repairing the complete RIFE Runtime...'
+        : rifeRuntimeInfo?.installed
         ? `Installing RIFE ${mpvRifeModel} model...`
         : 'Preparing RIFE Runtime download...',
     );
 
     try {
-      const runtime = await window.electronAPI.rife.install(mpvRifeModel);
+      const runtime = await window.electronAPI.rife.install(mpvRifeModel, repair);
       setRifeRuntimeInfo(runtime);
       setRifeInstallProgress(100);
       setRifeInstallStatus('success');
@@ -3132,7 +3134,7 @@ const Settings: React.FC = () => {
               {!rifeRuntimeInfo?.ready && (
               <button
                 className="settings-btn settings-btn-test"
-                onClick={handleInstallRife}
+                onClick={() => void handleInstallRife(false)}
                 disabled={rifeInstallStatus === 'installing' || rifePreparationStatus === 'preparing'}
                 type="button"
               >
@@ -3363,7 +3365,7 @@ const Settings: React.FC = () => {
               <div className="settings-actions rife-runtime-maintenance">
                 <button
                   className="settings-btn settings-btn-test"
-                  onClick={handleInstallRife}
+                  onClick={() => void handleInstallRife(true)}
                   disabled={rifeInstallStatus === 'installing' || rifePreparationStatus === 'preparing'}
                   type="button"
                 >

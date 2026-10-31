@@ -6362,6 +6362,7 @@ fn clear_rife_cache() -> Result<rife_runtime::RifeCacheInfo, String> {
 async fn install_rife_runtime(
     app: AppHandle,
     model: Option<String>,
+    repair: Option<bool>,
 ) -> Result<rife_runtime::RifeRuntimeInfo, String> {
     let active_pid = mpv_ipc::active_player_pid();
     if active_pid != 0 {
@@ -6369,7 +6370,12 @@ async fn install_rife_runtime(
             "Stop playback before installing or repairing RIFE (MPV process {active_pid} is active)"
         ));
     }
-    rife_runtime::install(app, model.unwrap_or_else(|| "4.6".to_string())).await
+    rife_runtime::install(
+        app,
+        model.unwrap_or_else(|| "4.6".to_string()),
+        repair.unwrap_or(false),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -7212,7 +7218,9 @@ async fn launch_mpv_process(
             .env("STREAMEE_RIFE_MULTIPLIER", rife_multiplier.to_string())
             .env("STREAMEE_RIFE_GPU_STREAMS", rife_gpu_streams.to_string())
             .env("STREAMEE_RIFE_PROCESSING_MODE", rife_processing_mode)
-            .env("STREAMEE_RIFE_SCALE", rife_scale);
+            .env("STREAMEE_RIFE_SCALE", rife_scale)
+            .env("STREAMEE_RIFE_REALTIME", "1")
+            .env("STREAMEE_RIFE_STATE_DIR", std::env::temp_dir());
     }
     if optiflow_enabled {
         if let Some((_, bridge)) = native_optiflow_assets.as_ref() {

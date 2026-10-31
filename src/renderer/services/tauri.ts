@@ -482,13 +482,20 @@ export interface RifeCacheInfo {
 }
 
 export interface RifePlaybackStatus {
-  status: 'pending' | 'active' | 'failed';
+  status: 'pending' | 'active' | 'fallback' | 'failed';
   pid: number;
   multiplier: number;
   filename?: string;
   containerFps?: number | null;
   outputFps?: number | null;
   sustaining?: boolean | null;
+  mode?: 'interpolating' | 'fallback' | 'trial' | null;
+  generatedFps?: number | null;
+  sourceFps?: number | null;
+  generatedFrames?: number | null;
+  fallbackFrames?: number | null;
+  fallbackReason?: 'processing' | 'color-metadata' | null;
+  playbackSpeed?: number | null;
   inputVideo?: Record<string, unknown> | null;
   outputVideo?: Record<string, unknown> | null;
   message: string;
@@ -1355,8 +1362,8 @@ const tauriAPI = {
     clearCache: async () => {
       return await invoke<RifeCacheInfo>('clear_rife_cache');
     },
-    install: async (model: string) => {
-      return await invoke<RifeRuntimeInfo>('install_rife_runtime', { model });
+    install: async (model: string, repair = false) => {
+      return await invoke<RifeRuntimeInfo>('install_rife_runtime', { model, repair });
     },
     prepareEngine: async (request: RifeEnginePreparationRequest) => {
       return await invoke<RifeEnginePreparationResult>('prepare_rife_engine', { request });
