@@ -2,7 +2,16 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+mod bundle_runtime;
+
 fn main() {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let media_source = manifest_dir.join("../mpv");
+    let media_destination = manifest_dir.join("target/mpv-runtime");
+    println!("cargo:rerun-if-changed={}", media_source.display());
+    let copied = bundle_runtime::stage_media_runtime(&media_source, &media_destination)
+        .expect("Failed to prepare installer media runtime");
+    println!("cargo:warning=Prepared {copied} media runtime files for bundling");
     bundle_node_runtime();
     tauri_build::build()
 }
