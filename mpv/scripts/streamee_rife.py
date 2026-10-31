@@ -5,6 +5,8 @@ import re
 import shutil
 import sys
 from fractions import Fraction
+from threading import Lock
+from time import monotonic
 
 import vapoursynth as vs
 
@@ -71,7 +73,146 @@ def model_number(name: str) -> int:
     return number
 
 
+class RifePlaybackGuard:
+    """Shed interpolation work when the output queue misses playback deadlines."""
+
+    def __init__(self, multiplier, gpu_streams, clock=monotonic, report=None):
+        self.multiplier = multiplier
+        self.gpu_streams = gpu_streams
+        self.clock = clock
+        self.report = report or (lambda message: None)
+        self.lock = Lock()
+        self.pending = {}
+        self.last_activity = None
+        self.frame = 0
+        self.deadline = 0.0
+        self.recovering = False
+        self.retry_at = 0.0
+        self.retry_delay = 2.0
+        self.healthy_since = None
+        self.trial = True
+        self.trial_started = None
+        self.trial_media = 0.0
+        self.trial_is_recovery = False
+
+    def _overloaded(self, now):
+        if not self.recovering:
+            self.report("RIFE overloaded; temporarily using source frames")
+        self.recovering = True
+        self.trial = False
+        self.retry_at = now + self.retry_delay
+        self.retry_delay = min(15.0, self.retry_delay * 2)
+
+    def request(self, n, duration):
+        with self.lock:
+            now = self.clock()
+            # MPV stops requesting once its queue fills, including during pause,
+            # slow playback, or network buffering. Only charge time while this
+            # graph has work to do. Seeks rebuild the script and its guard.
+            if self.last_activity is None:
+                self.frame, self.deadline = n, now + 0.1 + n * duration
+            else:
+                if not self.pending:
+                    idle = now - self.last_activity
+                    self.deadline += idle
+                    if self.trial_started is not None:
+                        self.trial_started += idle
+                    # Healthy idle periods must not accumulate unlimited credit
+                    # that could hide a later overload.
+                    self.deadline = min(
+                        self.deadline, now + 0.1 + max(0, self.frame - n) * duration,
+                    )
+                if n > self.frame:
+                    self.deadline += (n - self.frame) * duration
+                    self.frame = n
+            deadline = self.deadline - (self.frame - n) * duration
+            slack = max(0.08, 2 * duration * self.multiplier)
+            if not self.recovering and not self.trial and now > deadline + slack:
+                self._overloaded(now)
+
+            generated = n % self.multiplier != 0
+            use_rife = not self.recovering
+            if self.recovering and generated and now >= self.retry_at:
+                # Cold single-frame latency includes conversions and GPU wakeup;
+                # it does not measure the capacity of a parallel RIFE pipeline.
+                # Drain old work, then test the configured bounded queue.
+                if not any(item[3] for item in self.pending.values()):
+                    self.recovering = False
+                    self.trial = True
+                    self.trial_started = None
+                    self.trial_media = 0.0
+                    self.trial_is_recovery = True
+                    use_rife = True
+            self.pending[n] = (now, deadline + slack, duration, generated and use_rife)
+            self.last_activity = now
+            return use_rife
+
+    def complete(self, n):
+        with self.lock:
+            now = self.clock()
+            item = self.pending.pop(n, None)
+            self.last_activity = now
+            if item is None:
+                return
+            started, deadline, duration, generated = item
+            if generated and not self.recovering and self.trial:
+                # Ignore first-use initialization, then measure media produced
+                # over at least half a second of active processing. Frames can
+                # finish out of order; each generated slot counts once.
+                if self.trial_started is None:
+                    self.trial_started = now
+                else:
+                    self.trial_media += duration * self.multiplier / (self.multiplier - 1)
+                    elapsed = now - self.trial_started
+                    if elapsed >= 0.5:
+                        if self.trial_media < elapsed * 0.85:
+                            self._overloaded(now)
+                        else:
+                            self.trial = False
+                            self.healthy_since = now
+                            if self.trial_is_recovery:
+                                self.report("RIFE recovered; resuming interpolation")
+                # Start normal deadline checks from the warmed pipeline, rather
+                # than retaining lateness caused by loading or a cold retry.
+                self.deadline = now + 0.1 + max(0, self.frame - n) * duration
+            elif generated and not self.recovering:
+                if now > deadline:
+                    self._overloaded(now)
+                elif self.healthy_since is not None and now - self.healthy_since >= 5.0:
+                    self.retry_delay = 2.0
+
+
+def guard_playback(source, interpolated, multiplier, gpu_streams):
+    # Interleave divides each source frame's duration by the multiplier. Both
+    # branches therefore have identical timestamps, including variable-rate
+    # input. The fallback retains the original pixels and color properties.
+    fallback = core.std.Interleave([source] * multiplier)
+    guard = RifePlaybackGuard(
+        multiplier,
+        gpu_streams,
+        report=lambda message: core.log_message(vs.MESSAGE_TYPE_INFORMATION, message),
+    )
+
+    def choose(n, f):
+        numerator = f.props.get("_DurationNum", 0)
+        denominator = f.props.get("_DurationDen", 0)
+        if numerator <= 0 or denominator <= 0:
+            return interpolated
+        return interpolated if guard.request(n, numerator / denominator) else fallback
+
+    selected = core.std.FrameEval(
+        fallback, eval=choose, prop_src=fallback, clip_src=[fallback, interpolated],
+    )
+
+    def completed(n, f):
+        guard.complete(n)
+        return f
+
+    return core.std.ModifyFrame(selected, clips=selected, selector=completed)
+
+
 clip = video_in.std.Trim(length=5_000_000)
+source = clip
 source_format = clip.format.id
 source_width = clip.width
 source_height = clip.height
@@ -221,4 +362,4 @@ if pad_right or pad_bottom:
 if processing_width != source_width or processing_height != source_height:
     smooth = smooth.resize.Spline36(width=source_width, height=source_height)
 
-smooth.set_output()
+guard_playback(source, smooth, multiplier, gpu_streams).set_output()

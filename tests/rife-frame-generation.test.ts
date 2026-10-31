@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const settings = readFileSync('src/renderer/features/settings/Settings.tsx', 'utf8');
@@ -10,6 +11,20 @@ const runtime = readFileSync('src-tauri/src/rife_runtime.rs', 'utf8');
 const mpvIpc = readFileSync('src-tauri/src/mpv_ipc.rs', 'utf8');
 const rife = readFileSync('mpv/scripts/streamee_rife.py', 'utf8');
 const vsr = readFileSync('mpv/scripts/streamee_vsr.lua', 'utf8');
+
+test('RIFE sheds overdue interpolation and preserves the source timeline', (t) => {
+  const python = process.platform === 'win32'
+    ? existsSync('mpv/python.exe') ? 'mpv/python.exe' : 'python'
+    : 'python3';
+  const result = spawnSync(python, ['tests/rife-playback-guard.py'], {
+    encoding: 'utf8', timeout: 30000, windowsHide: true,
+  });
+  if (result.error?.code === 'ENOENT') {
+    t.skip('Python is unavailable; use the bundled MPV runtime for playback guard tests');
+    return;
+  }
+  assert.equal(result.status, 0, result.error?.message ?? result.stdout + result.stderr);
+});
 
 test('RIFE controls persist playback choices and use the managed runtime installer', () => {
   for (const key of [
