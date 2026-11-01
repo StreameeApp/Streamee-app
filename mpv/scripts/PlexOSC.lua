@@ -2348,6 +2348,8 @@ function osc_init()
             local last = math.min(#menu_items, state.track_menu_first + track_menu_max_visible - 1)
 
             ne = new_element('track_menu_bg', 'box')
+            -- Absorb clicks on the header and padding above the seekbar.
+            ne.eventresponder['mbtn_left_down'] = function () end
             ne.eventresponder['wheel_up_press'] = function () scroll_track_menu(-1) end
             ne.eventresponder['wheel_down_press'] = function () scroll_track_menu(1) end
 
@@ -3160,12 +3162,14 @@ function process_event(source, what)
         end
         if not inside_track_menu then
             close_track_menu()
+            return
         end
     end
 
     if what == 'down' or what == 'press' then
 
-        for n = 1, #elements do
+        -- Elements are sorted by drawing layer; only the topmost target owns the event.
+        for n = #elements, 1, -1 do
 
             if mouse_hit(elements[n]) and
                 elements[n].eventresponder and
@@ -3180,7 +3184,7 @@ function process_event(source, what)
                 if element_has_action(elements[n], action) then
                     elements[n].eventresponder[action](elements[n])
                 end
-
+                break
             end
         end
 
