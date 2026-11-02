@@ -4,6 +4,7 @@ import { useStore, MetaPreview } from '../../store';
 import { getContinueWatchingProgress } from '../../services/progress';
 import { pushWatchlistToTrakt } from '../../services/trakt-sync';
 import XrelQualityBadge from '../../components/XrelQualityBadge';
+import RatingBadge from '../../components/RatingBadge';
 import { usePageScroll } from '../../hooks/usePageScroll';
 import './Watchlist.css';
 
@@ -29,10 +30,12 @@ function formatRelativeTime(dateStr: string): string {
 }
 
 const Watchlist: React.FC = () => {
-  const { watchlist, removeFromWatchlist, setSelectedMeta, continueWatching, watchlistScrollPosition, setWatchlistScrollPosition, watchlistPage, setWatchlistPage, watchlistFilter, traktConnected } = useStore();
+  const { watchlist, watched, setWatchlist, removeFromWatchlist, setSelectedMeta, continueWatching, watchlistScrollPosition, setWatchlistScrollPosition, watchlistPage, setWatchlistPage, watchlistFilter, traktConnected } = useStore();
   const [page, setPage] = useState(watchlistPage);
   const [filter, setFilter] = useState<'all' | 'movies' | 'shows'>(watchlistFilter);
   const loadingRef = useRef(false);
+  const watchedIds = useMemo(() => new Set(watched.map(item => item.id)), [watched]);
+  const watchedItems = useMemo(() => watchlist.filter(item => watchedIds.has(item.id)), [watchlist, watchedIds]);
 
   // Sort by listedAt (most recent first), then filter
   const sortedWatchlist = useMemo(() => {
@@ -66,6 +69,8 @@ const Watchlist: React.FC = () => {
       poster: item.poster,
       year: item.year,
       rating: item.rating,
+      ratingSource: item.ratingSource,
+      imdbId: item.imdbId,
       metadataSource: item.metadataSource,
       addonInstallationId: item.addonInstallationId
     }, 'watchlist');
@@ -75,6 +80,15 @@ const Watchlist: React.FC = () => {
     removeFromWatchlist(item.id);
     if (traktConnected) {
       pushWatchlistToTrakt(item, 'remove').catch(console.error);
+    }
+  };
+
+  const handleRemoveWatched = () => {
+    setWatchlist(watchlist.filter(item => !watchedIds.has(item.id)));
+    if (traktConnected) {
+      watchedItems.forEach(item => {
+        pushWatchlistToTrakt(item, 'remove').catch(console.error);
+      });
     }
   };
 
@@ -157,6 +171,14 @@ const Watchlist: React.FC = () => {
           <h1>Watchlist</h1>
           <span className="watchlist-count">{filteredItems.length} Items</span>
         </div>
+        <button
+          className="watchlist-remove-watched"
+          onClick={handleRemoveWatched}
+          disabled={watchedItems.length === 0}
+          title="Remove all watched titles from your watchlist"
+        >
+          <FiTrash2 /> Remove all watched ({watchedItems.length})
+        </button>
       </header>
 
       <div className="watchlist-filter">
@@ -188,16 +210,14 @@ const Watchlist: React.FC = () => {
         <div className="watchlist-grid">
           {displayedItems.map((item) => (
             <div key={item.id} className="watchlist-item">
-              <div className="watchlist-poster" onClick={() => handlePlay(item)}>
+              <div className={`watchlist-poster ${watchedIds.has(item.id) ? 'watched' : ''}`} onClick={() => handlePlay(item)}>
                 {item.poster ? (
                   <img src={item.poster} alt={item.name} />
                 ) : (
                   <div className="watchlist-poster-placeholder" />
                 )}
                 <XrelQualityBadge item={item} queuePriority="library" />
-                {item.rating !== undefined && item.rating > 0 && (
-                  <div className="poster-rating-badge">★ {item.rating.toFixed(1)}</div>
-                )}
+                <RatingBadge item={item} />
                 {getContinueWatchingProgress(continueWatching, item.id) !== null && (
                   <div
                     className="poster-progress"

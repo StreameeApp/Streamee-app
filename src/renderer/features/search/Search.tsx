@@ -2,6 +2,8 @@ import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react'
 import { FiHeart, FiEye, FiEyeOff, FiFilm, FiTv, FiSearch, FiRefreshCw, FiArrowUp, FiUser, FiList } from 'react-icons/fi';
 import { useStore, MetaPreview } from '../../store';
 import XrelQualityBadge from '../../components/XrelQualityBadge';
+import RatingBadge from '../../components/RatingBadge';
+import { getTmdbRating, isTmdbRatingInRange } from '../../services/rating-policy';
 import { getContinueWatchingProgress } from '../../services/progress';
 import {
   getTmdbSearch,
@@ -219,9 +221,7 @@ const Discover: React.FC = () => {
       if (listGenre !== null && !item.genreIds?.includes(listGenre)) return false;
       if (listYear !== null && Number(item.year) !== listYear) return false;
       if (listLanguage !== null && item.originalLanguage !== listLanguage) return false;
-      if ((listMinRating > 0 || listMaxRating < 10) && (
-        item.rating === undefined || item.rating < listMinRating || item.rating > listMaxRating
-      )) return false;
+      if ((listMinRating > 0 || listMaxRating < 10) && !isTmdbRatingInRange(item, listMinRating, listMaxRating)) return false;
       const isWatched = watchedIds.has(item.id);
       if (listWatchFilter === 'watched' && !isWatched) return false;
       if (listWatchFilter === 'unwatched' && isWatched) return false;
@@ -230,7 +230,7 @@ const Discover: React.FC = () => {
 
     if (listSort === 'list') return filtered;
     return [...filtered].sort((a, b) => {
-      if (listSort === 'rating') return (b.rating ?? -1) - (a.rating ?? -1);
+      if (listSort === 'rating') return (getTmdbRating(b) ?? -1) - (getTmdbRating(a) ?? -1);
       if (listSort === 'title') return a.name.localeCompare(b.name);
       return (Date.parse(b.releaseDate || '') || 0) - (Date.parse(a.releaseDate || '') || 0);
     });
@@ -276,7 +276,7 @@ const Discover: React.FC = () => {
     }
 
     if (minRating > 0 || maxRating < 10) {
-      chips.push(`Score ${minRating}-${maxRating}`);
+      chips.push(`TMDB Score ${minRating}-${maxRating}`);
     }
 
     return chips;
@@ -489,11 +489,7 @@ const Discover: React.FC = () => {
         let filteredData = data;
         
         if (mode === 'browse') {
-          filteredData = data.filter(item => {
-            if (item.rating === undefined) return false;
-            const rating = Math.round(item.rating);
-            return rating >= minRating && rating <= maxRating;
-          });
+          filteredData = data.filter((item) => isTmdbRatingInRange(item, minRating, maxRating));
         }
         
         setItems(prev => {
@@ -727,7 +723,10 @@ const Discover: React.FC = () => {
       background: item.background,
       year: item.year,
       imdbId: item.imdbId,
-      rating: item.rating
+      rating: item.rating,
+      ratingSource: item.ratingSource,
+      metadataSource: item.metadataSource,
+      addonInstallationId: item.addonInstallationId,
     }, 'search');
   };
 
@@ -993,13 +992,13 @@ const Discover: React.FC = () => {
         onChange={(event) => setListSort(event.target.value as ListSort)}
       >
         <option value="list">List Order</option>
-        <option value="rating">Highest Rated</option>
+        <option value="rating">Highest Rated (TMDB)</option>
         <option value="title">Title A–Z</option>
         <option value="release">Newest Release</option>
       </select>
       <div className="rating-filter contextual-rating-filter">
         <div className="rating-header">
-          <span className="rating-label">User Score</span>
+          <span className="rating-label">TMDB Score</span>
           <span className="rating-value">{listMinRating} - {listMaxRating}</span>
         </div>
         <div className="rating-slider">
@@ -1013,7 +1012,7 @@ const Discover: React.FC = () => {
               max="10"
               step="1"
               value={listMinRating}
-              aria-label="Minimum list user score"
+              aria-label="Minimum list TMDB score"
               onChange={(event) => {
                 const value = Number(event.target.value);
                 setListMinRating(value);
@@ -1026,7 +1025,7 @@ const Discover: React.FC = () => {
               max="10"
               step="1"
               value={listMaxRating}
-              aria-label="Maximum list user score"
+              aria-label="Maximum list TMDB score"
               onChange={(event) => {
                 const value = Number(event.target.value);
                 setListMaxRating(value);
@@ -1257,7 +1256,7 @@ const Discover: React.FC = () => {
 
           <div className={`rating-filter ${searchOnlyMode ? 'disabled' : ''}`}>
             <div className="rating-header">
-              <span className="rating-label">User Score</span>
+              <span className="rating-label">TMDB Score</span>
               <span className="rating-value">{minRating} - {maxRating}</span>
             </div>
             <div className="rating-slider">
@@ -1271,7 +1270,7 @@ const Discover: React.FC = () => {
                   max="10"
                   step="1"
                   value={minRating}
-                  aria-label="Minimum user score"
+                  aria-label="Minimum TMDB score"
                   disabled={searchOnlyMode}
                   onChange={(e) => {
                     const val = Number(e.target.value);
@@ -1290,7 +1289,7 @@ const Discover: React.FC = () => {
                   max="10"
                   step="1"
                   value={maxRating}
-                  aria-label="Maximum user score"
+                  aria-label="Maximum TMDB score"
                   disabled={searchOnlyMode}
                   onChange={(e) => {
                     const val = Number(e.target.value);
@@ -1485,9 +1484,7 @@ const Discover: React.FC = () => {
                                     <div className="catalog-item-placeholder" />
                                   )}
                                   <XrelQualityBadge item={item} />
-                                  {item.rating !== undefined && item.rating > 0 && (
-                                    <div className="poster-rating-badge">★ {item.rating.toFixed(1)}</div>
-                                  )}
+                                  <RatingBadge item={item} />
                                   {continueProgress !== null && (
                                     <div className="poster-progress" style={{ width: `${continueProgress}%` }} />
                                   )}
@@ -1683,9 +1680,7 @@ const Discover: React.FC = () => {
                                 <div className="catalog-item-placeholder" />
                               )}
                               <XrelQualityBadge item={credit} />
-                              {credit.rating !== undefined && credit.rating > 0 && (
-                                <div className="poster-rating-badge">&#9733; {credit.rating.toFixed(1)}</div>
-                              )}
+                              <RatingBadge item={credit} />
                             </div>
                             <span className="catalog-item-title">{credit.name}</span>
                             <span className="catalog-item-year">
@@ -1771,9 +1766,7 @@ const Discover: React.FC = () => {
                           <div className="catalog-item-placeholder" />
                         )}
                         <XrelQualityBadge item={item} />
-                        {item.rating !== undefined && item.rating > 0 && (
-                          <div className="poster-rating-badge">★ {item.rating.toFixed(1)}</div>
-                        )}
+                        <RatingBadge item={item} />
                         {continueProgress !== null && (
                           <div
                             className="poster-progress"

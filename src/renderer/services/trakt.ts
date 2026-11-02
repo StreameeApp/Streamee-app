@@ -350,7 +350,8 @@ function mapTraktListItemsToPreviews(items: TraktListItemResponse[]): MetaPrevie
       year: media.year ? String(media.year) : undefined,
       releaseDate: releaseDate || undefined,
       imdbId: media.ids.imdb || undefined,
-      rating: media.rating ?? undefined
+      rating: media.rating ?? undefined,
+      ratingSource: 'trakt',
     } satisfies MetaPreview];
   });
 }
@@ -386,7 +387,8 @@ async function enrichTraktListPreviews(items: TraktListItemResponse[]): Promise<
       ? {
           ...item,
           ...enriched,
-          rating: item.rating ?? enriched.rating
+          rating: enriched.rating ?? item.rating,
+          ratingSource: enriched.rating !== undefined ? 'tmdb' : 'trakt',
         }
       : item;
   });

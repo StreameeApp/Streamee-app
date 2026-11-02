@@ -1,0 +1,21 @@
+.settings-api-block.imdb-dataset-settings > .settings-field .settings-hint {
+  display: block;
+}
+
+.imdb-dataset-settings .settings-toggle {
+  width: 100%;
+  padding: 0;
+  gap: 12px;
+}
+
+.imdb-dataset-settings .settings-toggle-info {
+  min-width: 0;
+}
+
+.imdb-dataset-settings .toggle-btn {
+  flex-shrink: 0;
+}
+
+.imdb-dataset-settings .settings-field > .settings-btn {
+  align-self: flex-start;
+}

@@ -16,6 +16,7 @@ import AudioNormalizer from './features/audio-normalizer/AudioNormalizer';
 import Sidebar from './components/Sidebar';
 import { checkTraktConnection, pushEpisodeWatchedToTrakt, pushWatchedToTrakt, autoSyncOnStart } from './services/trakt-sync';
 import { extractEpisodeNumber } from './services/torrent-utils';
+import { pickMetadataRating } from './services/rating-policy';
 import {
   endPlaybackSession,
   flushStatistics,
@@ -503,7 +504,9 @@ const upsertContinueWatchingProgress = (
   const isWatched = store.watched.some(w => w.id === metaId);
   const existingWatched = store.watched.find(w => w.id === metaId);
   const existingWatchlist = store.watchlist.find(w => w.id === metaId);
-  const rating = existingItem?.rating ?? activeMeta?.rating ?? activeMeta?.tmdbRating ?? existingWatched?.rating ?? existingWatchlist?.rating;
+  const ratingInfo = pickMetadataRating(existingItem, activeMeta, existingWatched, existingWatchlist);
+  const rating = ratingInfo?.rating;
+  const imdbId = currentPlayingMeta.imdbId ?? existingItem?.imdbId ?? activeMeta?.imdbId ?? existingWatched?.imdbId ?? existingWatchlist?.imdbId;
   const activeEpisodeInfo = episodeInfo !== undefined ? episodeInfo : getActiveEpisodeInfo(store);
   syncCurrentPlayingEpisode(activeEpisodeInfo);
 
@@ -556,6 +559,9 @@ const upsertContinueWatchingProgress = (
       : undefined;
   const sourceFilename = event?.filename || activeEpisodeInfo?.title;
   const snapshotDetails = {
+    rating,
+    ratingSource: ratingInfo?.source,
+    imdbId,
     ...(activeEpisodeInfo ? {
       season: activeEpisodeInfo.season,
       episode: activeEpisodeInfo.episode,
@@ -591,6 +597,8 @@ const upsertContinueWatchingProgress = (
       poster,
       progress,
       rating,
+      ratingSource: ratingInfo?.source,
+      imdbId,
       pausedAt: new Date().toISOString(),
       playbackTime,
       duration,
@@ -846,7 +854,8 @@ const App: React.FC = () => {
           const activeMeta = store.selectedMeta;
           const existingWatched = store.watched.find(w => w.id === metaId);
           const existingWatchlist = store.watchlist.find(w => w.id === metaId);
-          const rating = activeMeta?.rating ?? activeMeta?.tmdbRating ?? existingWatched?.rating ?? existingWatchlist?.rating;
+          const ratingInfo = pickMetadataRating(activeMeta, existingWatched, existingWatchlist);
+          const rating = ratingInfo?.rating;
           const year = activeMeta?.year ?? existingWatched?.year ?? existingWatchlist?.year;
 
           if (!currentProgressBaseline || currentProgressBaseline.key !== episodeKey) {
@@ -897,6 +906,8 @@ const App: React.FC = () => {
                 poster,
                 year,
                 rating,
+                ratingSource: ratingInfo?.source,
+                imdbId: currentPlayingMeta.imdbId ?? activeMeta?.imdbId,
                 watchedAt,
                 metadataSource: currentPlayingMeta.metadataSource,
                 addonInstallationId: currentPlayingMeta.addonInstallationId,

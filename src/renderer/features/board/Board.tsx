@@ -22,6 +22,7 @@ import {
   type DiscoverySourcePage,
 } from '../../services/discovery-content';
 import XrelQualityBadge from '../../components/XrelQualityBadge';
+import RatingBadge from '../../components/RatingBadge';
 import { scheduleAddonReleaseQualityProbes } from '../../services/addon-release-probes';
 import { getXrelQualitySnapshot, subscribeXrelQualitySnapshot } from '../../services/xrel';
 import { getUpNextNoResultCachePolicy, UP_NEXT_RESOLVED_RESULT_CACHE_TTL_MS } from '../../services/tmdb-request-policy';
@@ -78,6 +79,8 @@ interface FeaturedItem {
   background?: string;
   type: 'movie' | 'series';
   rating?: number;
+  ratingSource?: MetaPreview['ratingSource'];
+  imdbId?: string;
   progress: number | null;
   detail: string;
   source: 'continue' | 'catalog';
@@ -511,6 +514,7 @@ const Board: React.FC = () => {
       year: item.year,
       imdbId: item.imdbId,
       rating: item.rating,
+      ratingSource: item.ratingSource,
       metadataSource: item.metadataSource,
       addonInstallationId: item.addonInstallationId,
     }, 'board');
@@ -530,6 +534,8 @@ const Board: React.FC = () => {
         duration: item.duration,
         sourceFilename: item.sourceFilename,
         rating: item.rating,
+        ratingSource: item.ratingSource,
+        imdbId: item.imdbId,
         pausedAt: item.pausedAt,
         episodeId: item.episodeId,
         season: item.season,
@@ -543,6 +549,8 @@ const Board: React.FC = () => {
       name: item.title,
       poster: item.poster,
       rating: item.rating,
+      ratingSource: item.ratingSource,
+      imdbId: item.imdbId,
       metadataSource: item.metadataSource,
       addonInstallationId: item.addonInstallationId
     });
@@ -566,6 +574,8 @@ const Board: React.FC = () => {
       name: item.title,
       poster: item.poster,
       rating: item.rating,
+      ratingSource: item.ratingSource,
+      imdbId: item.imdbId,
       metadataSource: item.metadataSource,
       addonInstallationId: item.addonInstallationId,
       continueSource: item.source,
@@ -1182,6 +1192,10 @@ const Board: React.FC = () => {
       type: item.type,
       rating: item.rating,
       progress: item.source === 'resume' ? Math.round(item.progress) : null,
+      ratingSource: item.ratingSource,
+      imdbId: item.imdbId,
+      metadataSource: item.metadataSource,
+      addonInstallationId: item.addonInstallationId,
       detail: item.source === 'up-next'
         ? `${formatEpisodeLabel(item)} ready`
         : item.pausedAt ? `Paused ${formatRelativeTime(item.pausedAt)}` : 'Continue watching',
@@ -1197,6 +1211,8 @@ const Board: React.FC = () => {
         type: item.type,
         rating: item.rating,
         progress: null as number | null,
+        ratingSource: item.ratingSource,
+        imdbId: item.imdbId,
         detail: item.releaseDate
           ? formatReleaseDate(item.releaseDate)
           : item.metadataSource === 'addon' ? 'From your catalog add-on' : 'Fresh from TMDB',
@@ -1315,6 +1331,8 @@ const Board: React.FC = () => {
                     poster: activeFeatured.poster,
                     background: activeFeatured.background,
                     rating: activeFeatured.rating,
+                    ratingSource: activeFeatured.ratingSource,
+                    imdbId: activeFeatured.imdbId,
                     metadataSource: activeFeatured.metadataSource,
                     addonInstallationId: activeFeatured.addonInstallationId,
                   })}
@@ -1357,11 +1375,14 @@ const Board: React.FC = () => {
                   poster: activeFeatured.poster,
                   background: activeFeatured.background,
                   rating: activeFeatured.rating,
+                  ratingSource: activeFeatured.ratingSource,
+                  imdbId: activeFeatured.imdbId,
                   metadataSource: activeFeatured.metadataSource,
                   addonInstallationId: activeFeatured.addonInstallationId,
                 })}
               >
                 <img src={activeFeatured.poster} alt={activeFeatured.name} decoding="async" />
+                <RatingBadge item={activeFeatured} />
                 {activeFeatured.progress !== null && (
                   <div className="board-hero-progress">
                     <div style={{ width: `${activeFeatured.progress}%` }} />
@@ -1405,6 +1426,7 @@ const Board: React.FC = () => {
                     item={{ id: item.metaId, type: item.type, name: item.title }}
                     queuePriority="library"
                   />
+                  <RatingBadge item={{ ...item, id: item.metaId }} />
                   {item.source === 'resume' && (
                     <>
                       <div className="poster-progress" style={{ width: `${item.progress}%` }} />
@@ -1499,7 +1521,7 @@ const Board: React.FC = () => {
                           if (traktConnected) pushWatchlistToTrakt(item, 'remove').catch(console.error);
                         } else {
                           console.log('[UI] Adding to watchlist...');
-                          const wlMeta = { id: item.id, type: item.type, name: item.name, poster: item.poster, background: item.background, year: item.year, imdbId: item.imdbId, rating: item.rating };
+                          const wlMeta = { id: item.id, type: item.type, name: item.name, poster: item.poster, background: item.background, year: item.year, imdbId: item.imdbId, rating: item.rating, ratingSource: item.ratingSource, metadataSource: item.metadataSource, addonInstallationId: item.addonInstallationId };
                           addToWatchlist(wlMeta);
                           if (traktConnected) pushWatchlistToTrakt(wlMeta, 'add').catch(console.error);
                         }
@@ -1519,7 +1541,7 @@ const Board: React.FC = () => {
                               await pushUnwatchedToTrakt(item);
                             }
                           } else {
-                            const watchedMeta = { id: item.id, type: item.type, name: item.name, poster: item.poster, background: item.background, year: item.year, imdbId: item.imdbId, rating: item.rating, watchedAt: new Date().toISOString() };
+                            const watchedMeta = { id: item.id, type: item.type, name: item.name, poster: item.poster, background: item.background, year: item.year, imdbId: item.imdbId, rating: item.rating, ratingSource: item.ratingSource, metadataSource: item.metadataSource, addonInstallationId: item.addonInstallationId, watchedAt: new Date().toISOString() };
                             addToWatched(watchedMeta);
                             if (useStore.getState().traktConnected) {
                               await pushWatchedToTrakt(watchedMeta);
@@ -1532,9 +1554,7 @@ const Board: React.FC = () => {
                       </button>
                     )}
                   </div>
-                  {item.rating !== undefined && item.rating > 0 && (
-                    <div className="poster-rating-badge">★ {item.rating.toFixed(1)}</div>
-                  )}
+                  <RatingBadge item={item} />
                 </div>
                 <span className="board-item-title">{item.name}</span>
                 {item.releaseDate && <span className="board-item-year">{formatReleaseDate(item.releaseDate)}</span>}

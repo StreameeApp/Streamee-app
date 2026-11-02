@@ -921,6 +921,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -3910,6 +3911,7 @@ dependencies = [
  "base64 0.22.1",
  "dirs 5.0.1",
  "discord-rich-presence",
+ "flate2",
  "once_cell",
  "parking_lot",
  "raw-window-handle",
@@ -3932,6 +3934,7 @@ dependencies = [
  "uuid 1.22.0",
  "webview2-com",
  "windows",
+ "zip",
 ]
 
 [[package]]
@@ -6150,9 +6153,16 @@ checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
 dependencies = [
  "arbitrary",
  "crc32fast",
+ "flate2",
  "indexmap 2.13.0",
  "memchr",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
 
 [[package]]
 name = "zmij"

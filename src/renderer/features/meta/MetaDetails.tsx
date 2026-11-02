@@ -1,8 +1,10 @@
-import React, { useEffect, useLayoutEffect, useState, useMemo, useRef, useCallback } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useMemo, useRef, useCallback, useSyncExternalStore } from 'react';
 import { FiPlay, FiHeart, FiCheck, FiArrowLeft, FiDownload, FiExternalLink, FiArrowUp, FiArrowDown, FiFilm, FiTv, FiCircle, FiRefreshCw, FiFolder, FiFile, FiThumbsUp, FiThumbsDown, FiChevronRight, FiMoreHorizontal } from 'react-icons/fi';
 import { CastMember, MetaDetails as MetaDetailsType, MetaPreview, useStore, TorrentResult, LocalVideoFile } from '../../store';
 import { getTmdbTitleBundle, getTrailerSources, getTmdbSeasons, getTmdbEpisodes, getTmdbPersonCredits, getTmdbWatchRegion, Season, EpisodeDetail, type TmdbPersonCreditPreview, type TmdbWatchProvider, type TrailerSource } from '../../services/tmdb';
-import { getOmdbRating } from '../../services/omdb';
+import { getImdbRatingDetails } from '../../services/imdb-ratings';
+import { getImdbDatasetSnapshot, subscribeImdbDataset } from '../../services/imdb-dataset';
+import { formatRatingVotes } from '../../services/rating-policy';
 import {
   selectAddonResumeResult,
   shouldResolveAddonResumeSource,
@@ -17,6 +19,7 @@ import { sortEpisodes } from '../../services/torrent-utils';
 import { createPerformanceTrace } from '../../services/performance';
 import { ensureXrelQualityForItem } from '../../services/xrel';
 import XrelQualityBadge from '../../components/XrelQualityBadge';
+import RatingBadge from '../../components/RatingBadge';
 import { useCachedPageScroll } from '../../hooks/usePageScroll';
 import './MetaDetails.css';
 
@@ -154,6 +157,8 @@ interface Props {
 
 const MetaDetails: React.FC<Props> = ({ meta }) => {
   const [details, setDetails] = useState<MetaDetailsType | null>(meta);
+  const [ratingIdentity, setRatingIdentity] = useState<{ metaId: string; imdbId: string } | null>(null);
+  const imdbDataset = useSyncExternalStore(subscribeImdbDataset, getImdbDatasetSnapshot);
   const [trailerSources, setTrailerSources] = useState<TrailerSource[]>([]);
   const [activeTrailerIndex, setActiveTrailerIndex] = useState(0);
   const [trailerError, setTrailerError] = useState<string | null>(null);
@@ -843,9 +848,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
                       <FiHeart />
                     </button>
                   </div>
-                  {item.rating !== undefined && item.rating > 0 && (
-                    <div className="poster-rating-badge">★ {item.rating.toFixed(1)}</div>
-                  )}
+                  <RatingBadge item={item} />
                 </div>
                 <span className="meta-recommendation-title board-item-title">{item.name}</span>
                 {item.releaseDate && (
@@ -937,6 +940,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
     const fetchDetails = async () => {
       const shouldLoadWatchProviders = availableSearchAddons.length === 0;
       setDetails(meta);
+      setRatingIdentity(meta.imdbId ? { metaId: meta.id, imdbId: meta.imdbId } : null);
       setSecondaryMetadataReady(false);
       setTrailerSources([]);
       setActiveTrailerIndex(0);
@@ -983,6 +987,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
           if (!isCurrentRequest()) return;
           const nextDetails = { ...meta, ...addonDetails, id: meta.id, type: meta.type };
           setDetails(nextDetails);
+          setRatingIdentity(nextDetails.imdbId ? { metaId: meta.id, imdbId: nextDetails.imdbId } : null);
           useStore.setState((state) => ({
             selectedMeta: state.selectedMeta?.id === meta.id
               ? { ...state.selectedMeta, ...nextDetails }
@@ -1055,11 +1060,15 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
             type: meta.type,
           });
           if (!isCurrentRequest()) return;
-          const resolvedMeta = resolvedImdbId
-            ? { ...data.meta, imdbId: resolvedImdbId }
-            : data.meta;
+          const resolvedMeta: MetaDetailsType = {
+            ...data.meta,
+            imdbId: resolvedImdbId || data.meta.imdbId,
+            rating: data.meta.tmdbRating ?? meta.rating,
+            ratingSource: data.meta.tmdbRating !== undefined ? 'tmdb' : meta.ratingSource,
+          };
           setWatchProviders(data.watchProviders);
           setDetails({ ...meta, ...resolvedMeta, id: meta.id, type: meta.type });
+          setRatingIdentity(resolvedMeta.imdbId ? { metaId: meta.id, imdbId: resolvedMeta.imdbId } : null);
           useStore.setState((state) => ({
             selectedMeta: state.selectedMeta?.id === meta.id
               ? {
@@ -1072,14 +1081,6 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
 
           setLogoUrl(data.logoUrl);
           setTrailerSources(data.tmdbTrailerSources);
-
-          if (resolvedMeta.imdbId) {
-            secondaryTasks.push(getOmdbRating(resolvedMeta.imdbId).then((imdbRating) => {
-              if (isCurrentRequest() && imdbRating) {
-                setDetails(prev => prev ? { ...prev, imdbRating } : null);
-              }
-            }));
-          }
 
           secondaryTasks.push(getTrailerSources(type, tmdbIdNum, data.tmdbTrailerSources).then((nextTrailerSources) => {
             if (isCurrentRequest()) setTrailerSources(nextTrailerSources);
@@ -1129,6 +1130,21 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
   // derived value out of this dependency list prevents the title reset above
   // from clearing the selected episode and immediately selecting it again.
   }, [isAddonMetadata, meta.addonInstallationId, meta.id, meta.type, tmdbId, watchRegion]);
+
+  useEffect(() => {
+    if (!ratingIdentity || ratingIdentity.metaId !== meta.id) return;
+    let cancelled = false;
+    void getImdbRatingDetails(ratingIdentity.imdbId).then((rating) => {
+      if (!cancelled) {
+        setDetails((previous) => previous?.id === ratingIdentity.metaId ? {
+          ...previous,
+          imdbRating: rating?.rating ?? (isAddonMetadata ? previous.rating : undefined),
+          imdbVotes: rating?.votes,
+        } : previous);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [ratingIdentity, meta.id, isAddonMetadata, imdbDataset.enabled, imdbDataset.downloadedAt]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1991,7 +2007,8 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
         background: details?.background || meta.background,
         year: details?.year || meta.year,
         imdbId: details?.imdbId || meta.imdbId,
-        rating: details?.tmdbRating ?? meta.rating,
+        rating: details?.tmdbRating ?? details?.rating ?? meta.rating,
+        ratingSource: details?.ratingSource ?? meta.ratingSource,
         metadataSource: meta.metadataSource,
         addonInstallationId: meta.addonInstallationId,
       };
@@ -2011,7 +2028,8 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       background: details?.background || meta.background,
       year: details?.year || meta.year,
       imdbId: details?.imdbId || meta.imdbId,
-      rating: details?.tmdbRating ?? meta.rating,
+      rating: details?.tmdbRating ?? details?.rating ?? meta.rating,
+      ratingSource: details?.ratingSource ?? meta.ratingSource,
       metadataSource: meta.metadataSource,
       addonInstallationId: meta.addonInstallationId,
       watchedAt: new Date().toISOString()
@@ -2040,7 +2058,10 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       background: item.background,
       year: item.year,
       imdbId: item.imdbId,
-      rating: item.rating
+      rating: item.rating,
+      ratingSource: item.ratingSource,
+      metadataSource: item.metadataSource,
+      addonInstallationId: item.addonInstallationId,
     });
   };
 
@@ -2062,7 +2083,10 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
       background: item.background,
       year: item.year,
       imdbId: item.imdbId,
-      rating: item.rating
+      rating: item.rating,
+      ratingSource: item.ratingSource,
+      metadataSource: item.metadataSource,
+      addonInstallationId: item.addonInstallationId,
     };
     addToWatchlist(watchlistMeta);
     if (traktConnected) {
@@ -2204,6 +2228,20 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
 
                   {(details?.tmdbRating !== undefined || details?.imdbId) && (
                     <div className="meta-ratings">
+                      {details?.imdbId && (
+                        <div
+                          className="rating-badge imdb"
+                          onClick={() => window.electronAPI.openExternal(`https://www.imdb.com/title/${details.imdbId}/`)}
+                          style={{ cursor: 'pointer' }}
+                          title={details.imdbVotes !== undefined ? `${details.imdbVotes.toLocaleString('en-US')} IMDb votes` : 'View on IMDb'}
+                        >
+                          <img src={new URL('../../assets/imdb-logo.svg', import.meta.url).href} alt="IMDb" className="rating-logo imdb-logo" />
+                          <span className="rating-value">{details.imdbRating ? details.imdbRating.toFixed(1) : 'Open'}</span>
+                          {details.imdbVotes !== undefined && (
+                            <span className="media-rating-votes">{formatRatingVotes(details.imdbVotes)} votes</span>
+                          )}
+                        </div>
+                      )}
                       {details?.tmdbRating !== undefined && (
                         <div
                           className="rating-badge tmdb"
@@ -2212,12 +2250,6 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
                         >
                           <img src={new URL('../../assets/tmdb-logo.svg', import.meta.url).href} alt="TMDB" className="rating-logo" />
                           <span className="rating-value">{Math.round(details.tmdbRating * 10)}%</span>
-                        </div>
-                      )}
-                      {details?.imdbId && (
-                        <div className="rating-badge imdb" onClick={() => window.electronAPI.openExternal(`https://www.imdb.com/title/${details.imdbId}/`)} style={{ cursor: 'pointer' }}>
-                          <img src={new URL('../../assets/imdb-logo.svg', import.meta.url).href} alt="IMDb" className="rating-logo imdb-logo" />
-                          <span className="rating-value">{details.imdbRating ? `${details.imdbRating.toFixed(1)}` : 'Open'}</span>
                         </div>
                       )}
                     </div>
@@ -2504,9 +2536,7 @@ const MetaDetails: React.FC<Props> = ({ meta }) => {
                       ) : (
                         <div className="meta-actor-credit-placeholder" />
                       )}
-                      {credit.rating !== undefined && credit.rating > 0 && (
-                        <div className="poster-rating-badge">&#9733; {credit.rating.toFixed(1)}</div>
-                      )}
+                      <RatingBadge item={credit} />
                     </div>
                     <span className="meta-actor-credit-title">{credit.name}</span>
                     <span className="meta-actor-credit-meta">

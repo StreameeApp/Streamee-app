@@ -1,7 +1,8 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { FiClock, FiFilm, FiTv } from 'react-icons/fi';
-import { useStore } from '../../store';
+import { useStore, type MetaPreview } from '../../store';
 import XrelQualityBadge from '../../components/XrelQualityBadge';
+import RatingBadge from '../../components/RatingBadge';
 import { usePageScroll } from '../../hooks/usePageScroll';
 import './History.css';
 
@@ -45,6 +46,7 @@ interface HistoryItem {
   episode?: number;
   progress?: number;
   rating?: number;
+  ratingSource?: MetaPreview['ratingSource'];
   imdbId?: string;
   metadataSource?: 'tmdb' | 'addon';
   addonInstallationId?: string;
@@ -70,6 +72,7 @@ const History: React.FC = () => {
         year: w.year,
         date: w.watchedAt || '',
         rating: w.rating,
+        ratingSource: w.ratingSource,
         imdbId: w.imdbId,
         metadataSource: w.metadataSource,
         addonInstallationId: w.addonInstallationId,
@@ -88,7 +91,11 @@ const History: React.FC = () => {
         existing.isContinueWatching = true;
         existing.metadataSource = c.metadataSource || existing.metadataSource;
         existing.addonInstallationId = c.addonInstallationId || existing.addonInstallationId;
-        if (c.rating) existing.rating = c.rating;
+        if (c.rating) {
+          existing.rating = c.rating;
+          existing.ratingSource = c.ratingSource;
+        }
+        existing.imdbId = c.imdbId || existing.imdbId;
       } else {
         items.push({
           id: c.metaId,
@@ -100,6 +107,8 @@ const History: React.FC = () => {
           episode: c.episode,
           progress: c.progress,
           rating: c.rating,
+          ratingSource: c.ratingSource,
+          imdbId: c.imdbId,
           metadataSource: c.metadataSource,
           addonInstallationId: c.addonInstallationId,
           isContinueWatching: true
@@ -185,6 +194,8 @@ const History: React.FC = () => {
       poster: item.poster,
       year: item.year,
       rating: item.rating,
+      ratingSource: item.ratingSource,
+      imdbId: item.imdbId,
       metadataSource: item.metadataSource,
       addonInstallationId: item.addonInstallationId
     }, 'history');
@@ -280,9 +291,7 @@ const History: React.FC = () => {
                     }}
                     queuePriority="library"
                   />
-                  {item.rating !== undefined && item.rating > 0 && (
-                    <div className="poster-rating-badge">★ {item.rating.toFixed(1)}</div>
-                  )}
+                  <RatingBadge item={item} />
                   {item.progress !== undefined && item.progress > 0 && (
                     <div className="history-progress" style={{ width: `${item.progress}%` }} />
                   )}

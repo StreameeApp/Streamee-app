@@ -5,6 +5,7 @@ import './styles/global.css';
 import { initializeSharedRendererStorage } from './services/shared-storage';
 import { initializeSharedRequestCache } from './services/request-cache';
 import { migrateLegacyApiKeys } from './services/api-keys';
+import { initializeImdbDataset } from './services/imdb-dataset';
 
 import { Buffer } from 'buffer';
 if (typeof window !== 'undefined') {
@@ -22,6 +23,7 @@ const bootstrap = async () => {
   await initializeSharedRendererStorage();
   if (!isAudioNormalizerWindow) {
     await initializeSharedRequestCache();
+    void initializeImdbDataset();
   }
   const container = document.getElementById('root');
 

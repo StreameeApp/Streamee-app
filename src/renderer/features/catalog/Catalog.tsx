@@ -13,6 +13,7 @@ import {
   type DiscoverySourcePage,
 } from '../../services/discovery-content';
 import XrelQualityBadge from '../../components/XrelQualityBadge';
+import RatingBadge from '../../components/RatingBadge';
 import { fetchAddonCatalogBatch, type AddonCatalogPage } from '../../services/addon-catalogs';
 import { getSupportedCatalogs, loadInstalledAddons } from '../../services/installed-addons';
 import { usePageScroll } from '../../hooks/usePageScroll';
@@ -596,6 +597,8 @@ const Catalog: React.FC = () => {
         poster: item.poster || '',
         progress: item.continueProgress ?? 0,
         rating: item.rating,
+        ratingSource: item.ratingSource,
+        imdbId: item.imdbId,
         pausedAt: item.continuePausedAt,
         episodeId: item.continueEpisodeId,
         season: item.continueSeason,
@@ -612,6 +615,7 @@ const Catalog: React.FC = () => {
       year: item.year,
       imdbId: item.imdbId,
       rating: item.rating,
+      ratingSource: item.ratingSource,
       metadataSource: item.metadataSource,
       addonInstallationId: item.addonInstallationId,
     }, scrollPosition);
@@ -682,9 +686,7 @@ const Catalog: React.FC = () => {
                     <div className="catalog-item-placeholder" />
                   )}
                   <XrelQualityBadge item={item} />
-                  {item.rating !== undefined && item.rating > 0 && (
-                    <div className="poster-rating-badge">★ {item.rating.toFixed(1)}</div>
-                  )}
+                  <RatingBadge item={item} />
                   {!isContinueCatalog && continueProgress !== null && (
                     <div
                       className="poster-progress"
@@ -706,7 +708,7 @@ const Catalog: React.FC = () => {
                           removeFromWatchlist(item.id);
                           if (traktConnected) pushWatchlistToTrakt(item, 'remove').catch(console.error);
                         } else {
-                          const wlMeta = { id: item.id, type: item.type, name: item.name, poster: item.poster, background: item.background, year: item.year, imdbId: item.imdbId, rating: item.rating };
+                          const wlMeta = { id: item.id, type: item.type, name: item.name, poster: item.poster, background: item.background, year: item.year, imdbId: item.imdbId, rating: item.rating, ratingSource: item.ratingSource, metadataSource: item.metadataSource, addonInstallationId: item.addonInstallationId };
                           addToWatchlist(wlMeta);
                           if (traktConnected) pushWatchlistToTrakt(wlMeta, 'add').catch(console.error);
                         }
@@ -726,7 +728,7 @@ const Catalog: React.FC = () => {
                               await pushUnwatchedToTrakt(item);
                             }
                           } else {
-                            const watchedMeta = { id: item.id, type: item.type, name: item.name, poster: item.poster, background: item.background, year: item.year, imdbId: item.imdbId, rating: item.rating, watchedAt: new Date().toISOString() };
+                            const watchedMeta = { id: item.id, type: item.type, name: item.name, poster: item.poster, background: item.background, year: item.year, imdbId: item.imdbId, rating: item.rating, ratingSource: item.ratingSource, metadataSource: item.metadataSource, addonInstallationId: item.addonInstallationId, watchedAt: new Date().toISOString() };
                             addToWatched(watchedMeta);
                             if (useStore.getState().traktConnected) {
                               await pushWatchedToTrakt(watchedMeta);

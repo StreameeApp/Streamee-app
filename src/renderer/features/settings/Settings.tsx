@@ -39,6 +39,8 @@ import { useStore } from '../../store';
 import { useCachedPageScroll } from '../../hooks/usePageScroll';
 import TraktConnect from '../trakt/TraktConnect';
 import AddonSettings from './AddonSettings';
+import ImdbDatasetSettings from './ImdbDatasetSettings';
+import { clearImdbDataset, getImdbDatasetSnapshot, initializeImdbDataset } from '../../services/imdb-dataset';
 import OptiflowClockSettings from './OptiflowClockSettings';
 import LegalDocuments from './LegalDocuments';
 import { openAudioNormalizerWindow } from '../../services/audio-normalizer-window';
@@ -1016,6 +1018,8 @@ const Settings: React.FC = () => {
       clearSyncState();
       removeLocalStorageKeys((key) => key.startsWith('streamee-'));
       await clearApiKeys();
+      await initializeImdbDataset();
+      if (getImdbDatasetSnapshot().available) await clearImdbDataset();
       await Promise.all(loadInstalledAddons().map((addon) => uninstallAddon(addon.installationId)));
       await resetNativeSettings();
       useStore.setState({
@@ -1860,11 +1864,15 @@ const Settings: React.FC = () => {
 
           <div className="settings-api-separator" />
 
+          <ImdbDatasetSettings onOpenExternal={openExternalLink} />
+
+          <div className="settings-api-separator" />
+
           <div className="settings-api-block">
             <div className="settings-api-copy">
               <h3>OMDb</h3>
               <p>
-                Fills in IMDb ratings and extra metadata details that complement TMDB results in Meta Details.
+                Supplies IMDb scores and vote counts when the local IMDb dataset is disabled or has no matching title. OMDb results are cached locally for 24 hours; metadata scores remain available as labeled fallbacks.
               </p>
             </div>
 

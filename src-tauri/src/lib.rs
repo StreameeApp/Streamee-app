@@ -3,6 +3,7 @@ mod api_keys;
 mod audio_normalizer;
 mod credential_vault;
 mod discord_presence;
+mod imdb_dataset;
 mod intro_skipper;
 mod introdb;
 mod logging;
@@ -8608,6 +8609,9 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             info!("Tauri app setup complete");
+            if let Err(error) = imdb_dataset::initialize(app.handle()) {
+                warn!("Local IMDb ratings are unavailable: {error}");
+            }
             cleanup_persistent_stream_cache_on_startup(app.handle());
             cleanup_addon_proxy_cache();
 
@@ -8809,6 +8813,11 @@ pub fn run() {
             clear_xrel_release_cache,
             read_request_cache,
             write_request_cache,
+            imdb_dataset::get_imdb_dataset_status,
+            imdb_dataset::set_imdb_dataset_enabled,
+            imdb_dataset::refresh_imdb_dataset,
+            imdb_dataset::clear_imdb_dataset,
+            imdb_dataset::lookup_imdb_dataset_ratings,
             configure_remote_control,
             get_remote_control_info,
             restart_svp,

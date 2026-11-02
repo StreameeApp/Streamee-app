@@ -35,6 +35,7 @@ export interface MetaPreview {
   watchedAt?: string;
   listedAt?: string;
   rating?: number;
+  ratingSource?: 'tmdb' | 'imdb' | 'trakt';
   genreIds?: number[];
   originalLanguage?: string;
   metadataSource?: 'tmdb' | 'addon';
@@ -93,6 +94,7 @@ export interface MetaDetails extends MetaPreview {
   episodes?: Episode[];
   tmdbRating?: number;
   imdbRating?: number;
+  imdbVotes?: number;
   imdbId?: string;
   releaseDate?: string;
 }
@@ -153,6 +155,8 @@ interface Stream {
 }
 
 export interface ContinueWatchingItem {
+  imdbId?: string;
+  ratingSource?: MetaPreview['ratingSource'];
   metaId: string;
   type: 'movie' | 'series';
   metadataSource?: 'tmdb' | 'addon';
@@ -402,7 +406,7 @@ interface AppState {
     details?: Partial<
       Pick<
         ContinueWatchingItem,
-        'season' | 'episode' | 'episodeId' | 'title' | 'poster' | 'type' | 'rating' | 'playbackTime' | 'duration' | 'sourceFilename'
+        'season' | 'episode' | 'episodeId' | 'title' | 'poster' | 'type' | 'rating' | 'ratingSource' | 'imdbId' | 'playbackTime' | 'duration' | 'sourceFilename'
       >
     >
   ) => void;

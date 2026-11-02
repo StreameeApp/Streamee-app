@@ -112,6 +112,7 @@ function toPreview(meta: StremioMeta, installationId: string): MetaPreview {
     year: metaYear(meta),
     imdbId: /^tt\d+$/i.test(meta.id) ? meta.id : undefined,
     rating: metaRating(meta),
+    ratingSource: 'imdb',
     metadataSource: 'addon',
     addonInstallationId: installationId,
   };

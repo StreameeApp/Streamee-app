@@ -357,6 +357,7 @@ function mapTmdbItemToPreview(
     watchedAt: overrides?.watchedAt,
     listedAt: overrides?.listedAt,
     rating: overrides?.rating ?? item.vote_average,
+    ratingSource: overrides?.ratingSource ?? 'tmdb',
     genreIds: overrides?.genreIds ?? item.genre_ids ?? item.genres?.map((genre) => genre.id),
     originalLanguage: overrides?.originalLanguage ?? item.original_language
   };

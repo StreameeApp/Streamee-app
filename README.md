@@ -276,6 +276,8 @@ An `.msi` installer is also provided under Assets for users or administrators wh
 
 ## Development
 
+Use Node.js 24.22.2 or a newer stable 24.x release. The desktop build also accepts Node.js 22.23.4+ and 26.12.1+ within those major versions. Older runtimes and prereleases are rejected to keep the bundled stream sidecar on patched releases. Packaging uses `node.exe` from `PATH`, or the executable specified by `STREAMEE_NODE_EXE`.
+
 ```bash
 npm install
 npm run dev          # Frontend-only Vite server

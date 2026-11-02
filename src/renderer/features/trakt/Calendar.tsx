@@ -5,6 +5,7 @@ import { enrichTmdbItemsById } from '../../services/tmdb';
 import { useStore } from '../../store';
 import { getContinueWatchingProgressForTmdb } from '../../services/progress';
 import { usePageScroll } from '../../hooks/usePageScroll';
+import RatingBadge from '../../components/RatingBadge';
 import './Calendar.css';
 
 type CalendarFilter = 'all' | 'shows' | 'movies' | 'finales';
@@ -16,6 +17,8 @@ interface CalendarItem {
   title: string;
   poster?: string;
   rating?: number;
+  ratingSource?: 'tmdb' | 'trakt';
+  imdbId?: string;
   date: string;
   season?: number;
   episode?: number;
@@ -128,6 +131,8 @@ const Calendar: React.FC = () => {
             title: item.show.title,
             poster: item.show.poster,
             rating: item.show.rating,
+            ratingSource: 'trakt',
+            imdbId: item.show.ids.imdb,
             date: item.first_aired,
             season: item.episode.season,
             episode: item.episode.number,
@@ -147,6 +152,8 @@ const Calendar: React.FC = () => {
             title: item.movie.title,
             poster: item.movie.poster,
             rating: item.movie.rating,
+            ratingSource: 'trakt',
+            imdbId: item.movie.ids.imdb,
             date: item.released,
             overview: item.overview,
             tmdbId: item.movie.ids.tmdb
@@ -174,7 +181,11 @@ const Calendar: React.FC = () => {
         const metadata = enrichedById.get(metadataId);
         if (!metadata) continue;
         item.poster ||= metadata.poster;
-        item.rating ??= metadata.rating;
+        if (item.rating === undefined) {
+          item.rating = metadata.rating;
+          item.ratingSource = 'tmdb';
+        }
+        item.imdbId ||= metadata.imdbId;
       }
 
       if (isCurrentRequest()) {
@@ -229,11 +240,11 @@ const Calendar: React.FC = () => {
     if (item.type === 'show') {
       const parts = item.id.split(':');
       const tmdbId = parseInt(parts[1], 10);
-      setSelectedMeta({ id: `tv:${tmdbId}`, type: 'series', name: item.title, poster: item.poster, rating: item.rating }, 'calendar');
+      setSelectedMeta({ id: `tv:${tmdbId}`, type: 'series', name: item.title, poster: item.poster, rating: item.rating, ratingSource: item.ratingSource, imdbId: item.imdbId }, 'calendar');
     } else {
       const parts = item.id.split(':');
       const tmdbId = parseInt(parts[1], 10);
-      setSelectedMeta({ id: `movie:${tmdbId}`, type: 'movie', name: item.title, poster: item.poster, rating: item.rating }, 'calendar');
+      setSelectedMeta({ id: `movie:${tmdbId}`, type: 'movie', name: item.title, poster: item.poster, rating: item.rating, ratingSource: item.ratingSource, imdbId: item.imdbId }, 'calendar');
     }
   };
 
@@ -403,9 +414,13 @@ const Calendar: React.FC = () => {
                             style={{ width: `${continueProgress}%` }}
                           />
                         )}
-                        {item.rating !== undefined && item.rating > 0 && (
-                          <div className="poster-rating-badge">★ {item.rating.toFixed(1)}</div>
-                        )}
+                        <RatingBadge item={{
+                          id: `${item.type === 'show' ? 'tv' : 'movie'}:${item.tmdbId}`,
+                          type: item.type === 'show' ? 'series' : 'movie',
+                          rating: item.rating,
+                          ratingSource: item.ratingSource,
+                          imdbId: item.imdbId,
+                        }} />
                       </div>
 
                       <div className="item-content">
