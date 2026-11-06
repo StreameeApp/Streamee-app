@@ -25,8 +25,9 @@ test('advanced clock control is explicit, opt-in and playback scoped', async () 
 });
 
 test('clock guard lifecycle predicates and reset retries', { skip: process.platform !== 'win32' }, () => {
+  // Allow cold helper startup on hosted Windows runners.
   const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File',
     fileURLToPath(new URL('optiflow-clock-guard.tests.ps1', import.meta.url))],
-  { encoding: 'utf8', timeout: 15000, windowsHide: true });
-  assert.equal(result.status, 0, result.stdout + result.stderr);
+  { encoding: 'utf8', timeout: 60000, windowsHide: true });
+  assert.equal(result.status, 0, result.error?.message ?? result.stdout + result.stderr);
 });

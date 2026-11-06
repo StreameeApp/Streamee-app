@@ -16,8 +16,9 @@ test('RIFE sheds overdue interpolation and preserves the source timeline', (t) =
   const python = process.platform === 'win32'
     ? existsSync('mpv/python.exe') ? 'mpv/python.exe' : 'python'
     : 'python3';
+  // Allow cold helper startup on hosted Windows runners.
   const result = spawnSync(python, ['tests/rife-playback-guard.py'], {
-    encoding: 'utf8', timeout: 30000, windowsHide: true,
+    encoding: 'utf8', timeout: 60000, windowsHide: true,
   });
   if (result.error?.code === 'ENOENT') {
     t.skip('Python is unavailable; use the bundled MPV runtime for playback guard tests');
