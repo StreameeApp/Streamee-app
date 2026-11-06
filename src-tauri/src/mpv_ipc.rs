@@ -1,5 +1,5 @@
 #[cfg(target_os = "windows")]
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 #[cfg(target_os = "windows")]
 use std::sync::Mutex;
 #[cfg(target_os = "windows")]
@@ -33,6 +33,10 @@ static WATCHER_RUNNING: AtomicBool = AtomicBool::new(false);
 static WATCHED_MPV_PID: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_os = "windows")]
 static SPAWNED_MPV_PID: AtomicU32 = AtomicU32::new(0);
+/// A player that announced shutdown. MPV keeps accepting IPC connections while
+/// it closes, so the watcher must not attach to it again as if it were new.
+#[cfg(target_os = "windows")]
+static ENDED_MPV_PID: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_os = "windows")]
 static EXPECTED_RIFE_PID: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_os = "windows")]
@@ -518,6 +522,11 @@ pub(crate) struct MpvResponse {
     pub(crate) id: Option<i32>,
     #[serde(rename = "name")]
     pub(crate) name: Option<String>,
+    #[serde(rename = "request_id")]
+    pub(crate) request_id: Option<i64>,
+    /// Why a file ended, on `end-file` events (eof, stop, quit, error, redirect).
+    #[serde(rename = "reason")]
+    pub(crate) reason: Option<String>,
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -866,12 +875,15 @@ struct PlaybackSessionState {
     closed_emitted: bool,
     seek_guard_until: Option<std::time::Instant>,
     last_progress_at: std::time::Instant,
+    /// The player this session watches; sent with close and EOF events.
+    mpv_pid: u32,
 }
 
 #[cfg(target_os = "windows")]
 impl PlaybackSessionState {
     fn new() -> Self {
         Self {
+            mpv_pid: 0,
             paused: true,
             percent_pos: 0.0,
             playback_time: 0.0,
@@ -977,6 +989,7 @@ fn emit_eof_once(app_handle: &AppHandle, state: &mut PlaybackSessionState, reaso
             "duration": state.duration,
             "filename": state.filename,
             "playlist_pos": state.playlist_pos,
+            "mpv_pid": state.mpv_pid,
         }),
     );
     let _ = app_handle.emit(
@@ -987,6 +1000,8 @@ fn emit_eof_once(app_handle: &AppHandle, state: &mut PlaybackSessionState, reaso
             "duration": state.duration,
             "filename": state.filename,
             "playlist_pos": state.playlist_pos,
+            "mpv_pid": state.mpv_pid,
+            "reason": reason,
         }),
     );
     true
@@ -1013,6 +1028,7 @@ fn emit_closed_once(
             "duration": state.duration,
             "filename": state.filename,
             "playlist_pos": state.playlist_pos,
+            "mpv_pid": state.mpv_pid,
         }),
     );
     let _ = app_handle.emit(
@@ -1023,28 +1039,52 @@ fn emit_closed_once(
             "duration": state.duration,
             "filename": state.filename,
             "playlist_pos": state.playlist_pos,
+            "mpv_pid": state.mpv_pid,
+            "reason": reason,
         }),
     );
     true
 }
 
+/// How a session that ended (player exited or announced shutdown) is reported.
 #[cfg(target_os = "windows")]
-fn classify_disconnect(state: &PlaybackSessionState) -> Option<&'static str> {
-    if state.seek_guard_active() {
-        return None;
-    }
-
+fn classify_disconnect(state: &PlaybackSessionState) -> &'static str {
     if state.natural_end_confirmed() {
-        Some("eof")
+        "eof"
+    } else if state.seek_guard_active() {
+        // Right after a seek the last known position is not evidence of the end.
+        "closed"
     } else if state.recent_progress()
         && ((state.duration > 0.0
             && (state.percent_pos >= 99.0 || state.playback_time >= state.duration - 1.0))
             || state.percent_pos >= 99.5)
     {
-        Some("likely-eof")
+        "likely-eof"
     } else {
-        Some("closed")
+        "closed"
     }
+}
+
+/// Emits the end of a session once: EOF when playback reached the end, else closed.
+#[cfg(target_os = "windows")]
+fn emit_session_end(app_handle: &AppHandle, state: &mut PlaybackSessionState, via: &str) {
+    match classify_disconnect(state) {
+        "closed" => {
+            let _ = emit_closed_once(app_handle, state, via);
+        }
+        classification => {
+            let _ = emit_eof_once(app_handle, state, classification);
+        }
+    }
+}
+
+/// An `end-file` with reason "eof" also follows a stream that ended early, so it
+/// only counts as the natural end when playback was close to the end.
+#[cfg(target_os = "windows")]
+fn ended_near_end(state: &PlaybackSessionState) -> bool {
+    let tail_seconds = (state.duration * 0.05).min(60.0);
+    state.percent_pos >= 95.0
+        || (state.duration > 0.0 && state.playback_time >= state.duration - tail_seconds)
 }
 
 #[cfg(target_os = "windows")]
@@ -1069,7 +1109,7 @@ fn connect_to_mpv_pipe_with_retry() -> Option<HANDLE> {
 }
 
 #[cfg(target_os = "windows")]
-fn connect_to_mpv_pipe_with_logging(log_success: bool) -> Option<HANDLE> {
+pub(crate) fn connect_to_mpv_pipe_with_logging(log_success: bool) -> Option<HANDLE> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Pipes::WaitNamedPipeW;
 
@@ -1103,48 +1143,95 @@ fn connect_to_mpv_pipe_with_logging(log_success: bool) -> Option<HANDLE> {
     }
 }
 
+/// How long a command waits for MPV's reply. MPV answers from its core thread,
+/// so a busy or hung player must not block the caller indefinitely.
+#[cfg(target_os = "windows")]
+const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Request ids for commands sent without one; kept clear of the observer ids.
+#[cfg(target_os = "windows")]
+static NEXT_COMMAND_REQUEST_ID: AtomicI32 = AtomicI32::new(1_000_000);
+
+#[cfg(target_os = "windows")]
+fn next_command_request_id() -> i32 {
+    let id = NEXT_COMMAND_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    if id >= i32::MAX - 1 {
+        NEXT_COMMAND_REQUEST_ID.store(1_000_000, Ordering::Relaxed);
+    }
+    id
+}
+
+/// Waits until the pipe has data to read. False on timeout or a broken pipe.
+#[cfg(target_os = "windows")]
+fn wait_for_pipe_data(pipe: HANDLE, deadline: std::time::Instant) -> bool {
+    use windows::Win32::System::Pipes::PeekNamedPipe;
+    loop {
+        let mut available = 0u32;
+        if unsafe { PeekNamedPipe(pipe, None, 0, None, Some(&mut available), None) }.is_err() {
+            return false;
+        }
+        if available > 0 {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// True once MPV has closed the pipe or its process has exited.
+#[cfg(target_os = "windows")]
+fn pipe_connection_lost(pipe: HANDLE, mpv_pid: u32) -> bool {
+    use windows::Win32::System::Pipes::PeekNamedPipe;
+    let mut available = 0u32;
+    let broken = unsafe { PeekNamedPipe(pipe, None, 0, None, Some(&mut available), None) }.is_err();
+    broken || (mpv_pid != 0 && !process_is_running(mpv_pid))
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn send_command(pipe: HANDLE, command: &MpvCommand) -> Option<MpvResponse> {
-    let json = serde_json::to_string(command).ok()?;
-    let mut message = json.clone().into_bytes();
+    // Tag every command so a late reply to an earlier command is never taken
+    // for this one's.
+    let request_id = command.request_id.unwrap_or_else(next_command_request_id);
+    let tagged = MpvCommand {
+        command: command.command.clone(),
+        request_id: Some(request_id),
+    };
+    let mut message = serde_json::to_vec(&tagged).ok()?;
     message.push(b'\n');
 
     unsafe {
         let mut written = 0u32;
-        if WriteFile(pipe, Some(&message), Some(&mut written), None).is_ok() {
-            // MPV sends newline-delimited JSON. The buffer may contain multiple
-            // lines (command responses + unsolicited event notifications).
-            // Try each line until we find a valid command response.
-            let mut accumulated = Vec::new();
-            for _attempt in 0..5 {
-                let mut buffer = vec![0u8; 8192];
-                let mut read = 0u32;
-                if ReadFile(pipe, Some(&mut buffer), Some(&mut read as *mut u32), None).is_err()
-                    || read == 0
-                {
-                    break;
-                }
-                accumulated.extend_from_slice(&buffer[..read as usize]);
+        if WriteFile(pipe, Some(&message), Some(&mut written), None).is_err() {
+            return None;
+        }
+    }
 
-                // Parse each newline-delimited JSON line
-                let text = String::from_utf8_lossy(&accumulated);
-                for line in text.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if let Ok(resp) = serde_json::from_str::<MpvResponse>(trimmed) {
-                        // Only return actual command responses (they have an "error" field),
-                        // skip event notifications (they have an "event" field instead).
-                        if resp.error.is_some() {
-                            return Some(resp);
-                        }
-                    }
-                }
+    // MPV sends newline-delimited JSON: replies to commands interleaved with
+    // event notifications. Read until this command's reply or the deadline.
+    let deadline = std::time::Instant::now() + COMMAND_REPLY_TIMEOUT;
+    let mut pending = Vec::new();
+    while wait_for_pipe_data(pipe, deadline) {
+        let mut buffer = vec![0u8; 8192];
+        let mut read = 0u32;
+        let result =
+            unsafe { ReadFile(pipe, Some(&mut buffer), Some(&mut read as *mut u32), None) };
+        if result.is_err() || read == 0 {
+            return None;
+        }
+        pending.extend_from_slice(&buffer[..read as usize]);
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=newline).collect();
+            let Ok(resp) = serde_json::from_slice::<MpvResponse>(&line) else {
+                continue;
+            };
+            if resp.error.is_some() && resp.request_id == Some(i64::from(request_id)) {
+                return Some(resp);
             }
         }
-        None
     }
+    None
 }
 
 #[cfg(target_os = "windows")]
@@ -1998,7 +2085,12 @@ pub fn set_player_track(track_type: &str, track_id: i32) -> Result<(), String> {
         let property = match track_type {
             "audio" => "aid",
             "sub" => "sid",
-            other => return Err(format!("Unsupported track type: {}", other)),
+            other => {
+                unsafe {
+                    let _ = CloseHandle(pipe);
+                }
+                return Err(format!("Unsupported track type: {}", other));
+            }
         };
 
         let value = if track_id < 0 {
@@ -2489,14 +2581,33 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                 }
             };
 
-            info!("Connected to MPV IPC pipe");
-            let _ = app_handle.emit("player://reconnected", serde_json::json!({}));
-
             let mut mpv_pid = 0u32;
             unsafe {
                 use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
                 let _ = GetNamedPipeServerProcessId(pipe, &mut mpv_pid);
             }
+            let ended_pid = ENDED_MPV_PID.load(Ordering::SeqCst);
+            if ended_pid != 0 {
+                if ended_pid == mpv_pid && process_is_running(mpv_pid) {
+                    // Still closing after its shutdown was reported; not a new player.
+                    unsafe {
+                        let _ = CloseHandle(pipe);
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+                if !process_is_running(ended_pid) {
+                    let _ = ENDED_MPV_PID.compare_exchange(
+                        ended_pid,
+                        0,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                }
+            }
+
+            info!("Connected to MPV IPC pipe");
+            let _ = app_handle.emit("player://reconnected", serde_json::json!({}));
             WATCHED_MPV_PID.store(mpv_pid, Ordering::SeqCst);
 
             for (id, property) in [
@@ -2535,6 +2646,8 @@ pub fn start_player_watcher(app_handle: AppHandle) {
 
             let mut current_state = PlaybackSessionState::new();
             current_state.reset_for_reconnect();
+            current_state.mpv_pid = mpv_pid;
+            let mut shutdown_announced = false;
             let mut was_paused = true;
             let mut last_playlist_pos: i64 = -1;
             let mut last_playlist_filename = String::new();
@@ -3231,11 +3344,17 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                         _ => {}
                                     }
                                 }
-                                "eof-reached" => {
-                                    if current_state.seek_guard_active()
-                                        && !current_state.natural_end_confirmed()
-                                    {
-                                        debug!("[MPV IPC] Ignoring eof-reached during seek grace");
+                                "end-file" => {
+                                    let reason = resp.reason.as_deref().unwrap_or("");
+                                    if reason != "eof" {
+                                        debug!("[MPV IPC] File ended: {}", reason);
+                                        continue;
+                                    }
+                                    if !ended_near_end(&current_state) {
+                                        warn!(
+                                            "[MPV IPC] Stream ended early at {}%; not treating it as the end",
+                                            current_state.percent_pos
+                                        );
                                         continue;
                                     }
                                     info!(
@@ -3243,11 +3362,8 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                         current_state.percent_pos
                                     );
                                     current_state.mark_end_observed();
-                                    let _ = emit_eof_once(
-                                        &app_handle,
-                                        &mut current_state,
-                                        "eof-reached",
-                                    );
+                                    let _ =
+                                        emit_eof_once(&app_handle, &mut current_state, "end-file");
                                     let _ = app_handle.emit(
                                         "player://stop",
                                         serde_json::json!({
@@ -3258,32 +3374,6 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                             "playlist_pos": current_state.playlist_pos,
                                         }),
                                     );
-                                }
-                                "playback-start" => {
-                                    info!("[MPV IPC] Playback started");
-                                    current_state.paused = false;
-                                    was_paused = false;
-                                    let _ = app_handle.emit(
-                                        "player://play",
-                                        serde_json::json!({
-                                            "percent_pos": current_state.percent_pos,
-                                            "playback_time": current_state.playback_time,
-                                            "duration": current_state.duration,
-                                            "filename": current_state.filename,
-                                            "playlist_pos": current_state.playlist_pos,
-                                        }),
-                                    );
-                                    let _ = app_handle.emit(
-                                        "player://progress",
-                                        serde_json::json!({
-                                            "percent_pos": current_state.percent_pos,
-                                            "playback_time": current_state.playback_time,
-                                            "duration": current_state.duration,
-                                            "filename": current_state.filename,
-                                            "playlist_pos": current_state.playlist_pos,
-                                        }),
-                                    );
-                                    last_progress_emit = std::time::Instant::now();
                                 }
                                 "seek" => {
                                     info!("[MPV IPC] Seek detected");
@@ -3337,59 +3427,33 @@ pub fn start_player_watcher(app_handle: AppHandle) {
                                         }),
                                     );
                                 }
-                                "quit" => {
-                                    if current_state.seek_guard_active()
-                                        && !current_state.eof_emitted
-                                    {
-                                        debug!("[MPV IPC] Ignoring quit during seek grace");
-                                        continue;
-                                    }
-                                    if current_state.natural_end_confirmed() {
-                                        let _ =
-                                            emit_eof_once(&app_handle, &mut current_state, "quit");
-                                    } else if current_state.eof_emitted {
-                                        debug!("[MPV IPC] Quit after confirmed EOF");
-                                    } else {
-                                        let _ = emit_closed_once(
-                                            &app_handle,
-                                            &mut current_state,
-                                            "quit",
-                                        );
-                                    }
+                                "shutdown" => {
+                                    // MPV is closing (user quit, Streamee stopped it, or the
+                                    // playlist ended) and closes this pipe right after.
+                                    info!("[MPV IPC] Player announced shutdown");
+                                    shutdown_announced = true;
+                                    emit_session_end(&app_handle, &mut current_state, "shutdown");
                                 }
                                 _ => {}
                             }
                         }
                     }
+                    if shutdown_announced {
+                        pipe_disconnected = true;
+                        ENDED_MPV_PID.store(mpv_pid, Ordering::SeqCst);
+                        unsafe {
+                            let _ = CloseHandle(pipe);
+                        }
+                        break;
+                    }
                 } else {
+                    // Detect the end from the pipe and the process rather than a probe
+                    // command, which a busy player can miss and which consumes events.
                     if last_pipe_health_check.elapsed() >= pipe_health_check_interval {
                         last_pipe_health_check = std::time::Instant::now();
-                        let test_cmd = MpvCommand {
-                            command: vec![
-                                serde_json::json!("get_property"),
-                                serde_json::json!("pause"),
-                            ],
-                            request_id: None,
-                        };
-                        if send_command(pipe, &test_cmd).is_none() {
+                        if pipe_connection_lost(pipe, mpv_pid) {
                             pipe_disconnected = true;
-                            if let Some(classification) = classify_disconnect(&current_state) {
-                                if classification == "eof" || classification == "likely-eof" {
-                                    let _ = emit_eof_once(
-                                        &app_handle,
-                                        &mut current_state,
-                                        classification,
-                                    );
-                                } else {
-                                    let _ = emit_closed_once(
-                                        &app_handle,
-                                        &mut current_state,
-                                        "pipe-disconnect",
-                                    );
-                                }
-                            } else {
-                                debug!("[MPV IPC] Suppressing pipe-disconnect during seek grace");
-                            }
+                            emit_session_end(&app_handle, &mut current_state, "pipe-disconnect");
                             unsafe {
                                 let _ = CloseHandle(pipe);
                             }
@@ -4073,4 +4137,148 @@ pub async fn stop_player_observing() -> Result<String, String> {
 #[tauri::command]
 pub async fn get_player_info() -> Result<serde_json::Value, String> {
     Err("Not implemented for this platform".to_string())
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod session_end_tests {
+    use super::*;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_TYPE_BYTE};
+
+    #[test]
+    fn a_close_right_after_a_seek_is_still_reported() {
+        let mut state = PlaybackSessionState::new();
+        state.duration = 3600.0;
+        state.playback_time = 600.0;
+        state.percent_pos = 16.0;
+        state.mark_seek_started();
+        assert_eq!(classify_disconnect(&state), "closed");
+        state.mark_end_observed();
+        assert_eq!(classify_disconnect(&state), "eof");
+    }
+
+    #[test]
+    fn an_early_stream_end_is_not_the_natural_end() {
+        let mut state = PlaybackSessionState::new();
+        state.duration = 3600.0;
+        state.playback_time = 1440.0;
+        state.percent_pos = 40.0;
+        assert!(!ended_near_end(&state));
+        state.percent_pos = 96.0;
+        assert!(ended_near_end(&state));
+        state.percent_pos = 0.0;
+        state.playback_time = 3550.0;
+        assert!(ended_near_end(&state));
+
+        state.duration = 100.0;
+        state.playback_time = 90.0;
+        assert!(!ended_near_end(&state));
+    }
+
+    /// Serves one command on a private pipe, answering with `reply(request_id)`.
+    fn serve_once(reply: fn(i64) -> Option<String>) -> (String, std::thread::JoinHandle<()>) {
+        let name = format!(r"\\.\pipe\streamee-ipc-test-{}", uuid::Uuid::new_v4());
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let server = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(wide.as_ptr()),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE,
+                1,
+                4096,
+                4096,
+                0,
+                None,
+            )
+        };
+        assert!(
+            !server.is_invalid(),
+            "{name}: {}",
+            windows::core::Error::from_win32()
+        );
+        let raw = server.0 as usize;
+        let thread = std::thread::spawn(move || {
+            let server = HANDLE(raw as *mut std::ffi::c_void);
+            unsafe {
+                let _ = ConnectNamedPipe(server, None);
+                let mut buffer = [0u8; 1024];
+                let mut read = 0u32;
+                ReadFile(server, Some(&mut buffer), Some(&mut read), None).unwrap();
+                let command: serde_json::Value =
+                    serde_json::from_slice(&buffer[..read as usize]).unwrap();
+                let request_id = command["request_id"].as_i64().unwrap();
+                if let Some(text) = reply(request_id) {
+                    let mut written = 0u32;
+                    WriteFile(server, Some(text.as_bytes()), Some(&mut written), None).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(2_500));
+                let _ = CloseHandle(server);
+            }
+        });
+        (name, thread)
+    }
+
+    fn connect(name: &str) -> HANDLE {
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                0xC0000000u32,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            )
+        }
+        .unwrap()
+    }
+
+    fn get_pause() -> MpvCommand {
+        MpvCommand {
+            command: vec![
+                serde_json::json!("get_property"),
+                serde_json::json!("pause"),
+            ],
+            request_id: None,
+        }
+    }
+
+    #[test]
+    fn a_reply_is_matched_to_its_own_request() {
+        let (name, server) = serve_once(|id| {
+            Some(format!(
+                "{{\"request_id\":{},\"error\":\"success\",\"data\":\"stale\"}}\n\
+                 {{\"event\":\"seek\"}}\n\
+                 {{\"request_id\":{id},\"error\":\"success\",\"data\":\"fresh\"}}\n",
+                id - 1
+            ))
+        });
+        let pipe = connect(&name);
+        let reply = send_command(pipe, &get_pause()).expect("reply");
+        assert_eq!(reply.data, Some(serde_json::json!("fresh")));
+        unsafe {
+            let _ = CloseHandle(pipe);
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_player_that_never_replies_does_not_block_the_caller() {
+        let (name, server) = serve_once(|_| None);
+        let pipe = connect(&name);
+        let started = std::time::Instant::now();
+        assert!(send_command(pipe, &get_pause()).is_none());
+        let waited = started.elapsed();
+        assert!(waited >= COMMAND_REPLY_TIMEOUT, "{waited:?}");
+        assert!(
+            waited < COMMAND_REPLY_TIMEOUT + Duration::from_secs(1),
+            "{waited:?}"
+        );
+        unsafe {
+            let _ = CloseHandle(pipe);
+        }
+        server.join().unwrap();
+    }
 }

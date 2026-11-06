@@ -870,6 +870,9 @@ const Player: React.FC = () => {
   const smartNextWindowRestoreRef = useRef<{
     fullscreen: boolean | null;
     previousMpvPid: number;
+    // The player already restored. An add-on startup failure can replace it
+    // with a backup player, which must be restored too.
+    restoredMpvPid: number | null;
     attempts: number;
   } | null>(null);
   const smartNextWindowRestoreInFlightRef = useRef(false);
@@ -1151,7 +1154,16 @@ const Player: React.FC = () => {
     const initialProgress = fileIndex != null
       ? await window.electronAPI.torrent.getFileProgress(fileIndex).catch(() => null)
       : null;
-    const preferredSource = localPath || streamUrl;
+    // A streamed source's cache file is sparse until it is complete: ranges not
+    // fetched yet read back as zeros. Read it directly only once complete (the
+    // retry below switches to it then); until then use the stream URL, which
+    // waits for missing data.
+    const cacheFileComplete = !!initialProgress
+      && initialProgress.total > 0
+      && initialProgress.downloaded >= initialProgress.total;
+    const preferredSource = localPath && (videoFile.localPath || cacheFileComplete)
+      ? localPath
+      : streamUrl;
     if (!preferredSource) {
       throw new Error('No transcription source available');
     }
@@ -1683,7 +1695,28 @@ const Player: React.FC = () => {
     };
   }, []);
 
+  // Playback restarts only when the selected title changes, not when its
+  // details finish loading (MetaDetails can replace selectedMeta after the
+  // player opened). The launch effect works on a private copy of the metadata
+  // and merges later details for the same title into it.
+  const selectedMetaIdentity = selectedMeta ? `${selectedMeta.type}:${selectedMeta.id}` : null;
+  const latestSelectedMetaRef = useRef(selectedMeta);
+  latestSelectedMetaRef.current = selectedMeta;
+  const mergeSelectedMetaDetailsRef = useRef<((next: typeof selectedMeta) => void) | null>(null);
   useEffect(() => {
+    mergeSelectedMetaDetailsRef.current?.(selectedMeta);
+  }, [selectedMeta]);
+
+  useEffect(() => {
+    const selectedMeta = latestSelectedMetaRef.current
+      ? { ...latestSelectedMetaRef.current }
+      : latestSelectedMetaRef.current;
+    const mergeSelectedMetaDetails = (next: typeof selectedMeta) => {
+      if (selectedMeta && next && next.type === selectedMeta.type && next.id === selectedMeta.id) {
+        Object.assign(selectedMeta, next);
+      }
+    };
+    mergeSelectedMetaDetailsRef.current = mergeSelectedMetaDetails;
     let interval: ReturnType<typeof setInterval>;
     let startupStateUnlisten: (() => void) | null = null;
     let readyUnlisten: (() => void) | null = null;
@@ -1708,6 +1741,15 @@ const Player: React.FC = () => {
     let restartSubtitlePipeline: (() => Promise<void>) | null = null;
     let disposed = false;
     const disposedRef = { current: false };
+    // A listener whose registration finishes after cleanup ran would never be
+    // removed; release it at once instead.
+    const keepListener = (unlisten: () => void): (() => void) | null => {
+      if (disposed) {
+        unlisten();
+        return null;
+      }
+      return unlisten;
+    };
     let prelaunchedMpvPid: number | null = null;
     let prelaunchMpvPromise: Promise<number | null> | null = null;
     let prelaunchedMpvLoaded = false;
@@ -1914,6 +1956,11 @@ const Player: React.FC = () => {
     initInProgress.current = true;
     const playbackLaunchId = ++playbackLaunchIdRef.current;
     lastSvpPlaylistPosRef.current = null;
+    // Each launch starts from a clean startup display instead of inheriting
+    // the previous launch's message, error, or finished loading state.
+    setStartupState(null);
+    setStartupError(null);
+    setIsLoading(true);
     const directFailoverMediaKey = [
       selectedMeta?.id || '',
       selectedStream.preferredSeason ?? 0,
@@ -1954,6 +2001,9 @@ const Player: React.FC = () => {
       if (failedSessionId) {
         await window.electronAPI.releaseAddonStream(failedSessionId).catch(() => {});
       }
+      // Stopping the player can take seconds. If this launch was replaced or
+      // closed meantime, its failover attempt and messages belong to nobody.
+      if (disposed || playbackLaunchIdRef.current !== playbackLaunchId) return;
 
       const currentAddonInstallationId = selectedStream.torrent.addonInstallationId;
       const imdbId = selectedMeta?.imdbId;
@@ -2004,6 +2054,7 @@ const Player: React.FC = () => {
             message: failoverError instanceof Error ? failoverError.message : 'Unknown error',
           });
         }
+        if (disposed || playbackLaunchIdRef.current !== playbackLaunchId) return;
       }
       setStartupState({
         session_id: 0,
@@ -2142,6 +2193,7 @@ const Player: React.FC = () => {
           !pending
           || currentMpvPid == null
           || currentMpvPid === pending.previousMpvPid
+          || currentMpvPid === pending.restoredMpvPid
           || smartNextWindowRestoreInFlightRef.current
         ) {
           return;
@@ -2155,7 +2207,14 @@ const Player: React.FC = () => {
         )
           .then(() => {
             if (smartNextWindowRestoreRef.current === pending) {
-              smartNextWindowRestoreRef.current = null;
+              if (selectedStream.sourceType === 'addon' && !addonPlaybackStarted) {
+                // The add-on source can still fail before playback starts and
+                // be replaced by a backup player. Keep the state for that one.
+                pending.restoredMpvPid = currentMpvPid;
+                pending.attempts = 0;
+              } else {
+                smartNextWindowRestoreRef.current = null;
+              }
             }
             console.log('[Smart Next] Restored MPV window state', {
               fullscreen: pending.fullscreen,
@@ -2171,6 +2230,14 @@ const Player: React.FC = () => {
           .finally(() => {
             smartNextWindowRestoreInFlightRef.current = false;
           });
+      };
+      const settleSmartNextWindowRestore = () => {
+        // Playback started, so no backup player can replace this one. A
+        // restore still in flight clears the state itself when it finishes.
+        const pending = smartNextWindowRestoreRef.current;
+        if (pending && pending.restoredMpvPid === mpvPidRef.current) {
+          smartNextWindowRestoreRef.current = null;
+        }
       };
       const setCurrentMpvPid = (pid: number | null) => {
         if (!isCurrentPlaybackLaunch()) {
@@ -2603,12 +2670,21 @@ const Player: React.FC = () => {
           console.warn('[Smart Next Autoload] Trigger skipped:', error);
         }
       };
+      // MPV's next key, the outro auto-next and segment feedback can all ask for
+      // the next episode; only one transition may run at a time.
+      let smartNextRequestInFlight = false;
       const handleSmartNextRequest = async (
         filename: string,
         allowUnwarmedFallback = false,
         direction: SmartEpisodeDirection = 'next',
       ) => {
         if (!isCurrentPlaybackLaunch()) return false;
+        if (smartNextRequestInFlight) {
+          console.log('[Smart Next] Ignoring request while another transition is running');
+          return false;
+        }
+        smartNextRequestInFlight = true;
+        let currentPlayerClosing = false;
 
         try {
           const store = useStore.getState();
@@ -2705,8 +2781,20 @@ const Player: React.FC = () => {
             smartNextWindowRestoreRef.current = {
               fullscreen: livePlayer?.fullscreen ?? null,
               previousMpvPid: currentMpvPid,
+              restoredMpvPid: null,
               attempts: 0,
             };
+            // The player window closes now and stopping can take seconds; show
+            // the switch in the app until the next episode's player opens.
+            currentPlayerClosing = true;
+            setStartupError(null);
+            setStartupState({
+              session_id: 0,
+              attempt: 0,
+              phase: 'switching_episode',
+              message: `Switching to ${episodeLabel}…`,
+            });
+            setIsLoading(true);
             await window.electronAPI.stopMpvProcess(currentMpvPid);
           }
           if (!isCurrentPlaybackLaunch()) {
@@ -2771,11 +2859,19 @@ const Player: React.FC = () => {
           smartNextWindowRestoreRef.current = null;
           const message = error instanceof Error ? error.message : String(error);
           console.error('[Smart Next] Failed:', error);
-          showSmartNextMessage(
-            `${direction === 'next' ? 'Smart Next' : 'Previous episode'}: ${message}`,
-            5000,
-          );
+          const failureMessage = `${direction === 'next' ? 'Smart Next' : 'Previous episode'}: ${message}`;
+          if (currentPlayerClosing && isCurrentPlaybackLaunch()) {
+            // The player was already closing, so a message shown in it would
+            // never be seen. Report the failure in the app with Retry instead.
+            setStartupState({ session_id: 0, attempt: 0, phase: 'failed', message: failureMessage });
+            setStartupError(failureMessage);
+            setIsLoading(false);
+          } else {
+            showSmartNextMessage(failureMessage, 5000);
+          }
           return false;
+        } finally {
+          smartNextRequestInFlight = false;
         }
       };
       const resolvePlaybackQueueIndex = (
@@ -4722,7 +4818,7 @@ const Player: React.FC = () => {
         setSubtitleMessage('Subtitles disabled');
         clearSubtitleAssist();
   
-        subtitleProgressUnlisten = await window.electronAPI.subtitles.onProgress((event: SubtitleProgressEvent) => {
+        subtitleProgressUnlisten = keepListener(await window.electronAPI.subtitles.onProgress((event: SubtitleProgressEvent) => {
           if (disposed) return;
           if (event.session_id !== activeWhisperSessionIdRef.current) return;
           if (event.phase === 'complete' && event.reason === 'session_rollover') {
@@ -4750,16 +4846,16 @@ const Player: React.FC = () => {
             message: nextMessage,
             progress: progressPercent,
           });
-        });
+        }));
 
-        subtitleSegmentUnlisten = await window.electronAPI.subtitles.onSegment((seg: SubtitleSegment) => {
+        subtitleSegmentUnlisten = keepListener(await window.electronAPI.subtitles.onSegment((seg: SubtitleSegment) => {
           if (disposed) return;
           if (seg.session_id !== activeWhisperSessionIdRef.current) return;
           console.log(`%c[WhisperLive]%c [${seg.start.toFixed(2)}-${seg.end.toFixed(2)}] ${seg.text}`, 'color: #a78bfa; font-weight: bold', 'color: inherit');
           setWhisperProcessedSeconds(seg.end);
-        });
+        }));
 
-        addonStreamErrorUnlisten = await window.electronAPI.addonEvents.onStreamError((event) => {
+        addonStreamErrorUnlisten = keepListener(await window.electronAPI.addonEvents.onStreamError((event) => {
           if (
             disposed
             || addonPlaybackStarted
@@ -4769,9 +4865,9 @@ const Player: React.FC = () => {
             return;
           }
           void handleAddonStartupFailure(event.message);
-        });
+        }));
 
-        playerProgressUnlisten = await window.electronAPI.playerEvents.onProgress((data) => {
+        playerProgressUnlisten = keepListener(await window.electronAPI.playerEvents.onProgress((data) => {
           if (disposed) return;
           // Keep segment detection on the primary playback event path as well
           // as the stable recovery listener. maybeHandleIntroDbProgress
@@ -4810,10 +4906,11 @@ const Player: React.FC = () => {
             addonPlaybackStarted = true;
             addonLoadRequested = false;
             addonMpvPid = null;
+            settleSmartNextWindowRestore();
           }
-        });
+        }));
 
-        playerPauseUnlisten = await window.electronAPI.playerEvents.onPause((data) => {
+        playerPauseUnlisten = keepListener(await window.electronAPI.playerEvents.onPause((data) => {
           if (disposed) return;
           cancelSegmentBoundaryTimer('pause-event');
           playbackPausedRef.current = true;
@@ -4836,9 +4933,9 @@ const Player: React.FC = () => {
               data.playlist_pos ?? undefined,
             );
           }
-        });
+        }));
 
-        playerPlayUnlisten = await window.electronAPI.playerEvents.onPlay((data) => {
+        playerPlayUnlisten = keepListener(await window.electronAPI.playerEvents.onPlay((data) => {
           if (disposed) return;
           restoreSmartNextWindowState();
           syncSmartNextAvailability();
@@ -4897,11 +4994,12 @@ const Player: React.FC = () => {
             addonPlaybackStarted = true;
             addonLoadRequested = false;
             addonMpvPid = null;
+            settleSmartNextWindowRestore();
           }
 
-        });
+        }));
 
-        playerStopUnlisten = await window.electronAPI.playerEvents.onStop(() => {
+        playerStopUnlisten = keepListener(await window.electronAPI.playerEvents.onStop(() => {
           if (
             disposed
             || selectedStream.sourceType !== 'addon'
@@ -4911,9 +5009,9 @@ const Player: React.FC = () => {
             return;
           }
           void handleAddonStartupFailure('The configured source could not open this remote stream. Retry or choose another result.');
-        });
+        }));
 
-        playerPlaylistChangedUnlisten = await window.electronAPI.playerEvents.onPlaylistChanged((data) => {
+        playerPlaylistChangedUnlisten = keepListener(await window.electronAPI.playerEvents.onPlaylistChanged((data) => {
           if (disposed) return;
           cancelSegmentBoundaryTimer('playlist-changed');
           const store = useStore.getState();
@@ -4932,24 +5030,24 @@ const Player: React.FC = () => {
             void restartSvpAfterPlaybackChange('playlist change');
           }
           lastSvpPlaylistPosRef.current = nextPlaylistPos;
-        });
+        }));
 
-        playerSmartNextUnlisten = await window.electronAPI.playerEvents.onSmartNextRequested((data) => {
+        playerSmartNextUnlisten = keepListener(await window.electronAPI.playerEvents.onSmartNextRequested((data) => {
           if (disposed) return;
           void consumeSmartNextRequest(data, data.filename);
-        });
+        }));
 
-        playerSegmentFeedbackRenderedUnlisten = await window.electronAPI.playerEvents.onSegmentFeedbackRendered((data) => {
+        playerSegmentFeedbackRenderedUnlisten = keepListener(await window.electronAPI.playerEvents.onSegmentFeedbackRendered((data) => {
           if (disposed) return;
           handleSegmentFeedbackRendered(data);
-        });
+        }));
 
-        playerSegmentFeedbackUnlisten = await window.electronAPI.playerEvents.onSegmentFeedback((data) => {
+        playerSegmentFeedbackUnlisten = keepListener(await window.electronAPI.playerEvents.onSegmentFeedback((data) => {
           if (disposed) return;
           void handleSegmentFeedback(data);
-        });
+        }));
 
-        playerAudioTrackChangedUnlisten = await window.electronAPI.playerEvents.onAudioTrackChanged(async ({ track_id }) => {
+        playerAudioTrackChangedUnlisten = keepListener(await window.electronAPI.playerEvents.onAudioTrackChanged(async ({ track_id }) => {
           if (disposed) return;
 
           const previousTrackId = lastWhisperAudioTrackId;
@@ -5041,9 +5139,9 @@ const Player: React.FC = () => {
               progress: 0,
             });
           }
-        });
+        }));
 
-        playerSeekUnlisten = await window.electronAPI.playerEvents.onSeek(async (data) => {
+        playerSeekUnlisten = keepListener(await window.electronAPI.playerEvents.onSeek(async (data) => {
           if (disposed) return;
 
           cancelSegmentBoundaryTimer('seek-event');
@@ -5129,9 +5227,9 @@ const Player: React.FC = () => {
 
           await stopSubtitleTranscription('seek');
           await scheduleWhisperSeekRestart();
-        });
+        }));
 
-        playerClosedUnlisten = await window.electronAPI.playerEvents.onClosed(async (data) => {
+        playerClosedUnlisten = keepListener(await window.electronAPI.playerEvents.onClosed(async (data) => {
           if (disposed) return;
           if (smartNextTransitionRef.current) {
             console.log('[Smart Next] Ignoring player close during provider-neutral transition:', data);
@@ -5139,6 +5237,10 @@ const Player: React.FC = () => {
           }
           if (mpvPidRef.current == null) {
             console.log('[WhisperLive] Ignoring player closed event before current MPV launch:', data);
+            return;
+          }
+          if (data.mpv_pid && data.mpv_pid !== mpvPidRef.current) {
+            console.log('[Player] Ignoring close of a player this launch no longer uses:', data);
             return;
           }
           if (selectedStream.sourceType === 'qbittorrent' && lastKnownPlaybackTimeRef.current < 5) {
@@ -5160,9 +5262,9 @@ const Player: React.FC = () => {
           setAudioNormalizerConnected(false);
           setAudioNormalizerReason('no_data');
           exitToMetaDetails();
-        });
+        }));
 
-        playerEofUnlisten = await window.electronAPI.playerEvents.onEof(async (data) => {
+        playerEofUnlisten = keepListener(await window.electronAPI.playerEvents.onEof(async (data) => {
           if (disposed) return;
           if (smartNextTransitionRef.current) {
             console.log('[Smart Next] Ignoring player EOF during provider-neutral transition:', data);
@@ -5170,6 +5272,10 @@ const Player: React.FC = () => {
           }
           if (mpvPidRef.current == null) {
             console.log('[WhisperLive] Ignoring player EOF event before current MPV launch:', data);
+            return;
+          }
+          if (data.mpv_pid && data.mpv_pid !== mpvPidRef.current) {
+            console.log('[Player] Ignoring EOF of a player this launch no longer uses:', data);
             return;
           }
           if (selectedStream.sourceType === 'qbittorrent' && lastKnownPlaybackTimeRef.current < 5) {
@@ -5188,21 +5294,28 @@ const Player: React.FC = () => {
           setAudioNormalizerActive(false);
           setAudioNormalizerConnected(false);
           setAudioNormalizerReason('no_data');
-          if (!useStore.getState().playlistActive) {
+          const playlist = useStore.getState();
+          // Within a playlist MPV moves on by itself. After its last item nothing
+          // else leaves the player, and closing the idle player is not reported
+          // once its end was, so leave here.
+          if (
+            !playlist.playlistActive
+            || playlist.playlistCurrentIndex >= playlist.playlistFiles.length - 1
+          ) {
             exitToMetaDetails();
           }
-        });
+        }));
 
-        playerReconnectedUnlisten = await window.electronAPI.playerEvents.onReconnected(() => {
+        playerReconnectedUnlisten = keepListener(await window.electronAPI.playerEvents.onReconnected(() => {
           const store = useStore.getState();
           if (!store.playlistActive) return;
           const currentFile = store.playlistFiles[store.playlistCurrentIndex];
           if (currentFile?.name) {
             syncPlaylistTitle(currentFile.name);
           }
-        });
+        }));
 
-        startupStateUnlisten = await window.electronAPI.torrent.onStartupState((state) => {
+        startupStateUnlisten = keepListener(await window.electronAPI.torrent.onStartupState((state) => {
           if (!isCurrentPlaybackLaunch()) return;
           const activeSessionId = activeStartupSessionRef.current;
           // An older MPV launch can finish after a replacement source starts.
@@ -5222,9 +5335,9 @@ const Player: React.FC = () => {
           } else {
             setStartupError(null);
           }
-        });
+        }));
 
-        playerHdrRestartUnlisten = await window.electronAPI.playerEvents.onHdrRestartRequired(async (data) => {
+        playerHdrRestartUnlisten = keepListener(await window.electronAPI.playerEvents.onHdrRestartRequired(async (data) => {
           if (disposed || mpvPidRef.current == null || data.pid !== mpvPidRef.current) {
             return;
           }
@@ -5253,7 +5366,14 @@ const Player: React.FC = () => {
             resumeDuration: data.duration,
             resumeSourceFilename: currentStore.currentPlayingTitle || currentStream.resumeSourceFilename,
           });
-        });
+        }));
+
+        // Registering the listeners above awaits many times. A newer launch may
+        // have started meanwhile and reset the shared launch guards; this stale
+        // run must not claim them or start a player.
+        if (!isCurrentPlaybackLaunch()) {
+          return;
+        }
 
         type RendererPlaylistFile = {
           name: string;
@@ -5664,6 +5784,9 @@ const Player: React.FC = () => {
 
           restartSubtitlePipelineRef.current = restartSubtitlePipeline;
           await restartSubtitlePipeline();
+          // Cleanup may already have run during the await; a timer created now
+          // would never be cleared.
+          if (disposed) return;
 
           interval = setInterval(() => {
             timeRef.current += 1;
@@ -5888,9 +6011,11 @@ const Player: React.FC = () => {
                 prelaunchedMpvPid = null;
               } catch (loadError) {
                 console.warn(`[${streamProviderLabel}] Failed to load prepared file into prelaunched MPV, falling back to direct launch:`, loadError);
-                await window.electronAPI.stopMpvProcess(qbitMpvPid).catch(() => {});
+                // Release the PID first so this deliberate stop is not taken as
+                // the user closing the player.
                 prelaunchedMpvPid = null;
                 setCurrentMpvPid(null);
+                await window.electronAPI.stopMpvProcess(qbitMpvPid).catch(() => {});
               }
             }
 
@@ -6180,6 +6305,9 @@ const Player: React.FC = () => {
 
           restartSubtitlePipelineRef.current = restartSubtitlePipeline;
           await restartSubtitlePipeline();
+          // Cleanup may already have run during the await; a timer created now
+          // would never be cleared.
+          if (disposed) return;
 
           interval = setInterval(() => {
             timeRef.current += 1;
@@ -6191,7 +6319,7 @@ const Player: React.FC = () => {
           return;
         }
 
-        readyUnlisten = await window.electronAPI.torrent.onReady(async ({ session_id, files }) => {
+        readyUnlisten = keepListener(await window.electronAPI.torrent.onReady(async ({ session_id, files }) => {
           if (!isCurrentPlaybackLaunch()) return;
           if (activeStartupSessionRef.current && session_id !== activeStartupSessionRef.current) return;
           activeStartupSessionRef.current = session_id;
@@ -6215,7 +6343,9 @@ const Player: React.FC = () => {
             storedResumeSourceMeta,
           );
           
-          const videoFiles = files.filter(f => /\.(mp4|mkv|avi|mov|webm)$/i.test(f.name));
+          // Same video formats as the rest of the app (it also accepts wmv, m4v, flv).
+          const playableNames = new Set(filterVideoFiles(files.map(f => f.name)));
+          const videoFiles = files.filter(f => playableNames.has(f.name));
           const sortedVideoFileNames = sortEpisodes(filterVideoFiles(videoFiles.map(f => f.name)));
           const sortedVideoFiles = sortedVideoFileNames
             .map((name) => videoFiles.find((file) => file.name === name))
@@ -6241,7 +6371,9 @@ const Player: React.FC = () => {
 
           if (!videoFile) {
             console.error('%c[Stream]%c No playable video file found in the remote source', 'color: #4ade80; font-weight: bold', 'color: inherit');
-            setIsLoading(false);
+            // Report it with Retry and close the prelaunched player, instead of
+            // leaving an empty screen under an idle player window.
+            await handleStartupFailure('This source has no playable video file.');
             return;
           }
           const displayFileName = getPathBaseName(videoFile.name);
@@ -6335,9 +6467,11 @@ const Player: React.FC = () => {
                 }
               } catch (loadError) {
                 console.warn('[Stream] Failed to load stream into prelaunched MPV, falling back to direct launch:', loadError);
+                // Release the PID first so this deliberate stop is not taken as
+                // the user closing the player.
                 prelaunchedMpvPid = null;
-                await window.electronAPI.stopMpvProcess(existingMpvPid).catch(() => {});
                 setCurrentMpvPid(null);
+                await window.electronAPI.stopMpvProcess(existingMpvPid).catch(() => {});
               }
             }
 
@@ -6584,9 +6718,9 @@ const Player: React.FC = () => {
             console.error('%c[Stream]%c Failed to prepare or launch stream:', 'color: #4ade80; font-weight: bold', 'color: inherit', e);
             await handleStartupFailure(e instanceof Error ? e.message : String(e));
           }
-        });
+        }));
 
-        progressUnlisten = await window.electronAPI.torrent.onProgress((progress) => {
+        progressUnlisten = keepListener(await window.electronAPI.torrent.onProgress((progress) => {
           if (disposed) return;
           if (activeStartupSessionRef.current && progress.session_id !== activeStartupSessionRef.current) return;
           activeStartupSessionRef.current = progress.session_id;
@@ -6642,7 +6776,7 @@ const Player: React.FC = () => {
             pieces: { ready: progress.downloaded_pieces || 0, total: progress.pieces || 0 },
             bitfield: progress.bitfield || []
           });
-        });
+        }));
 
         setStartupState({
           session_id: 0,
@@ -6700,6 +6834,9 @@ const Player: React.FC = () => {
         }
 
         await window.electronAPI.torrent.add(selectedStream.url, selectedStream.torrent.size);
+        // Cleanup may already have run during the await; a timer created now
+        // would never be cleared.
+        if (disposed) return;
 
         interval = setInterval(() => {
           timeRef.current += 1;
@@ -6747,6 +6884,9 @@ const Player: React.FC = () => {
     return () => {
       disposed = true;
       disposedRef.current = true;
+      if (mergeSelectedMetaDetailsRef.current === mergeSelectedMetaDetails) {
+        mergeSelectedMetaDetailsRef.current = null;
+      }
       const streamStillSelected = !!useStore.getState().selectedStream;
       const pendingSmartNextWarmup = smartNextPreparationRef.current?.result?.warmup;
       const preserveSmartNextWarmup = smartNextTransitionRef.current
@@ -6855,9 +6995,7 @@ const Player: React.FC = () => {
         cleanupPlaylist();
       }
     };
-      setStartupState(null);
-      setStartupError(null);
-  }, [selectedStream, selectedMeta, setDownloadStats, startupNonce]);
+  }, [selectedStream, selectedMetaIdentity, setDownloadStats, startupNonce]);
 
   const handleBack = async () => {
     if (selectedStream) {

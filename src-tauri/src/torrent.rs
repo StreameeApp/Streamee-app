@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
@@ -26,7 +26,8 @@ static LAST_PROGRESS: Lazy<std::sync::Mutex<Option<DownloadProgress>>> =
     Lazy::new(|| std::sync::Mutex::new(None));
 static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle<tauri::Wry>> = std::sync::OnceLock::new();
 static PORT_WAITERS: Lazy<Mutex<Vec<oneshot::Sender<u16>>>> = Lazy::new(|| Mutex::new(Vec::new()));
-static TORRENT_STARTING: AtomicBool = AtomicBool::new(false);
+// The source whose startup is in progress; a different source replaces it.
+static STARTING_SOURCE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static STARTUP_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // Request-response correlation: pending requests awaiting responses from Node.js
@@ -79,6 +80,9 @@ pub struct TorrentHealth {
     pub file_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Why the sidecar's current source failed to start or stopped working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -469,7 +473,7 @@ async fn shutdown_webtorrent_process() {
 
     *WEBTORRENT_PORT.lock().await = None;
     *LAST_PROGRESS.lock().unwrap() = None;
-    TORRENT_STARTING.store(false, Ordering::SeqCst);
+    release_startup_source(&STARTING_SOURCE);
 
     {
         let mut waiters = PORT_WAITERS.lock().await;
@@ -922,6 +926,7 @@ pub async fn get_health() -> Result<TorrentHealth, String> {
     let has_torrent = msg.status.as_deref() != Some("idle");
     let metadata_ready = msg.metadata_ready.unwrap_or(false);
     let file_count = msg.file_count.unwrap_or(0);
+    let source_error = source_error_from_health(msg.status.as_deref(), msg.message.as_deref());
 
     Ok(TorrentHealth {
         session_id: session.session_id,
@@ -933,26 +938,65 @@ pub async fn get_health() -> Result<TorrentHealth, String> {
         port: msg.port.or(port),
         file_count,
         last_error: session.last_error,
+        source_error,
     })
+}
+
+fn source_error_from_health(status: Option<&str>, message: Option<&str>) -> Option<String> {
+    (status == Some("failed")).then(|| {
+        message
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or("The source failed")
+            .to_string()
+    })
+}
+
+struct MetadataWaitFailure {
+    message: String,
+    error_code: &'static str,
+}
+
+impl MetadataWaitFailure {
+    fn new(message: impl Into<String>, error_code: &'static str) -> Self {
+        Self {
+            message: message.into(),
+            error_code,
+        }
+    }
 }
 
 async fn wait_for_metadata_ready(
     session_id: u64,
     attempt: u32,
     timeout: Duration,
-) -> Result<DownloadProgress, String> {
+) -> Result<DownloadProgress, MetadataWaitFailure> {
     let started = time::Instant::now();
     let poll_interval = Duration::from_millis(500);
 
     while started.elapsed() < timeout {
         let session = current_startup_session();
         if session.session_id != session_id {
-            return Err("Startup session replaced".to_string());
+            return Err(MetadataWaitFailure::new(
+                "Startup session replaced",
+                "session_replaced",
+            ));
         }
 
-        let health = get_health().await?;
+        let health = get_health()
+            .await
+            .map_err(|err| MetadataWaitFailure::new(err, "sidecar_unavailable"))?;
         if !health.sidecar_running {
-            return Err("WebTorrent sidecar stopped during startup".to_string());
+            return Err(MetadataWaitFailure::new(
+                "WebTorrent sidecar stopped during startup",
+                "sidecar_unavailable",
+            ));
+        }
+        // A failed start never reports metadata; stop waiting instead of timing out.
+        if let Some(source_error) = health.source_error {
+            return Err(MetadataWaitFailure::new(
+                format!("Source failed: {source_error}"),
+                "source_failed",
+            ));
         }
 
         if health.metadata_ready && health.file_count > 0 {
@@ -965,7 +1009,10 @@ async fn wait_for_metadata_ready(
                 None,
             );
 
-            if let Some(progress) = get_progress().await? {
+            if let Some(progress) = get_progress()
+                .await
+                .map_err(|err| MetadataWaitFailure::new(err, "sidecar_unavailable"))?
+            {
                 if progress.metadata_ready || !progress.files.is_empty() {
                     return Ok(progress);
                 }
@@ -975,7 +1022,25 @@ async fn wait_for_metadata_ready(
         time::sleep(poll_interval).await;
     }
 
-    Err("Timed out waiting for metadata".to_string())
+    Err(MetadataWaitFailure::new(
+        "Timed out waiting for metadata",
+        "metadata_timeout",
+    ))
+}
+
+/// Records `source` as the startup in progress. Returns true when that same
+/// source is already starting; a different source replaces the recorded one.
+fn claim_startup_source(slot: &std::sync::Mutex<Option<String>>, source: &str) -> bool {
+    let mut starting = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if starting.as_deref() == Some(source) {
+        return true;
+    }
+    *starting = Some(source.to_string());
+    false
+}
+
+fn release_startup_source(slot: &std::sync::Mutex<Option<String>>) {
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 pub async fn start_download(
@@ -984,8 +1049,11 @@ pub async fn start_download(
     expected_size: Option<u64>,
     persistent_cache: Option<(PathBuf, u64)>,
 ) -> Result<DownloadProgress, String> {
-    if TORRENT_STARTING.swap(true, Ordering::SeqCst) {
-        info!("Torrent start already in progress, returning existing state");
+    // Only a repeat request for the same source shares the startup in progress.
+    // A different source begins a new session below, which makes the older
+    // startup loop stop at its next ownership check.
+    if claim_startup_source(&STARTING_SOURCE, &magnet_uri) {
+        info!("Startup for this source is already in progress, returning existing state");
         return get_progress().await.map(|p| {
             p.unwrap_or(DownloadProgress {
                 status: "starting".to_string(),
@@ -1019,7 +1087,7 @@ pub async fn start_download(
     .await;
 
     if current_startup_session().session_id == session_id {
-        TORRENT_STARTING.store(false, Ordering::SeqCst);
+        release_startup_source(&STARTING_SOURCE);
     }
 
     result
@@ -1125,19 +1193,27 @@ async fn start_download_internal(
         // Allow discovery and WebTorrent's 25-second peer handshake to finish.
         match wait_for_metadata_ready(session_id, attempt, Duration::from_secs(60)).await {
             Ok(progress) => return Ok(progress),
-            Err(err) => {
+            Err(failure) => {
                 ensure_startup_session(session_id)?;
-                warn!("Metadata wait failed on attempt {}: {}", attempt, err);
+                warn!(
+                    "Metadata wait failed on attempt {}: {}",
+                    attempt, failure.message
+                );
                 if attempt == retry_backoffs_ms.len() as u32 {
+                    let message = if failure.error_code == "metadata_timeout" {
+                        "Torrent metadata did not become ready".to_string()
+                    } else {
+                        failure.message.clone()
+                    };
                     emit_startup_state(
                         session_id,
                         attempt,
                         "failed",
-                        "Torrent metadata did not become ready",
+                        message,
                         None,
-                        Some("metadata_timeout"),
+                        Some(failure.error_code),
                     );
-                    return Err(err);
+                    return Err(failure.message);
                 }
             }
         }
@@ -1249,28 +1325,26 @@ pub async fn resume_download() -> Result<(), String> {
     Ok(())
 }
 
-pub async fn get_stream_url(file_index: usize) -> Result<String, String> {
-    send_command(&serde_json::json!({
-        "action": "get_stream_url",
-        "fileIndex": file_index
-    }))
+/// The sidecar builds stream URLs: they carry the current source's id, so a
+/// player that reconnects after a source switch is refused instead of being
+/// served the new source's bytes.
+async fn request_sidecar_stream_url(action: &str, file_index: usize) -> Result<String, String> {
+    let msg = send_command_and_wait(
+        &serde_json::json!({ "action": action, "fileIndex": file_index }),
+        2_000,
+    )
     .await?;
+    msg.url
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| format!("File {file_index} is not available in the current source"))
+}
 
-    let port = ensure_port().await?;
-
-    Ok(format!("http://127.0.0.1:{}/stream/{}", port, file_index))
+pub async fn get_stream_url(file_index: usize) -> Result<String, String> {
+    request_sidecar_stream_url("get_stream_url", file_index).await
 }
 
 pub async fn get_whisper_stream_url(file_index: usize) -> Result<String, String> {
-    send_command(&serde_json::json!({
-        "action": "get_whisper_stream_url",
-        "fileIndex": file_index
-    }))
-    .await?;
-
-    let port = ensure_port().await?;
-
-    Ok(format!("http://127.0.0.1:{}/whisper/{}", port, file_index))
+    request_sidecar_stream_url("get_whisper_stream_url", file_index).await
 }
 
 pub async fn prepare_stream(
@@ -1385,23 +1459,20 @@ pub async fn get_file_path_from_state(filename: &str) -> Result<Option<(String, 
         .await?
         .or_else(|| LAST_PROGRESS.lock().ok().and_then(|g| g.clone()));
 
-    if let Some(progress) = progress {
-        for file in &progress.files {
-            if file.name == filename {
-                if let Some(path) = &file.path {
-                    return Ok(Some((file.name.clone(), PathBuf::from(path))));
-                }
-            }
-        }
+    Ok(progress.and_then(|progress| find_file_path(&progress.files, filename)))
+}
 
-        for file in &progress.files {
-            if let Some(path) = &file.path {
-                return Ok(Some((file.name.clone(), PathBuf::from(path))));
-            }
-        }
+/// Finds the stored path of the file named `filename`. Returns None when no file
+/// matches or several do (for example in different folders), rather than
+/// handing the caller some other file.
+fn find_file_path(files: &[TorrentFile], filename: &str) -> Option<(String, PathBuf)> {
+    let mut matches = files.iter().filter(|file| file.name == filename);
+    let file = matches.next()?;
+    if matches.next().is_some() {
+        return None;
     }
-
-    Ok(None)
+    let path = file.path.as_ref()?;
+    Some((file.name.clone(), PathBuf::from(path)))
 }
 
 #[cfg(test)]
@@ -1418,5 +1489,64 @@ mod tests {
             "Startup session replaced"
         );
         assert!(ensure_startup_session(replacement).is_ok());
+    }
+
+    #[test]
+    fn a_different_source_replaces_a_startup_in_progress() {
+        let slot = std::sync::Mutex::new(None);
+        assert!(!claim_startup_source(&slot, "magnet:?xt=urn:btih:first"));
+        assert!(claim_startup_source(&slot, "magnet:?xt=urn:btih:first"));
+        assert!(!claim_startup_source(&slot, "magnet:?xt=urn:btih:second"));
+        assert_eq!(
+            slot.lock().unwrap().as_deref(),
+            Some("magnet:?xt=urn:btih:second")
+        );
+        release_startup_source(&slot);
+        assert!(!claim_startup_source(&slot, "magnet:?xt=urn:btih:first"));
+    }
+
+    #[test]
+    fn only_a_failed_health_status_reports_a_source_error() {
+        assert_eq!(
+            source_error_from_health(Some("failed"), Some("disk is full")).as_deref(),
+            Some("disk is full")
+        );
+        assert_eq!(
+            source_error_from_health(Some("failed"), None).as_deref(),
+            Some("The source failed")
+        );
+        assert_eq!(
+            source_error_from_health(Some("waiting_for_metadata"), None),
+            None
+        );
+        assert_eq!(
+            source_error_from_health(Some("idle"), Some("old error")),
+            None
+        );
+    }
+
+    #[test]
+    fn file_paths_resolve_only_for_one_exact_name() {
+        let file = |name: &str, path: &str| TorrentFile {
+            name: name.to_string(),
+            size: 1,
+            path: Some(path.to_string()),
+            index: None,
+        };
+        let files = vec![
+            file("Extras.mkv", r"C:\cache\Show\Extras.mkv"),
+            file("Episode.mkv", r"C:\cache\Show\S1\Episode.mkv"),
+            file("Bonus.mkv", r"C:\cache\Show\S1\Bonus.mkv"),
+            file("Bonus.mkv", r"C:\cache\Show\S2\Bonus.mkv"),
+        ];
+        assert_eq!(
+            find_file_path(&files, "Episode.mkv"),
+            Some((
+                "Episode.mkv".to_string(),
+                PathBuf::from(r"C:\cache\Show\S1\Episode.mkv")
+            ))
+        );
+        assert_eq!(find_file_path(&files, "Missing.mkv"), None);
+        assert_eq!(find_file_path(&files, "Bonus.mkv"), None);
     }
 }

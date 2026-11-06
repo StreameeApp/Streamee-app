@@ -262,6 +262,8 @@ interface TorrentHealth {
   port?: number | null;
   file_count: number;
   last_error?: string | null;
+  /** Why the current source failed to start or stopped working. */
+  source_error?: string | null;
 }
 
 interface TorrentPortTestResult {
@@ -511,6 +513,23 @@ export interface SmartNextWarmupResult {
   requested_bytes: number;
   cached_bytes: number;
   total_bytes: number;
+}
+
+// Players the app stopped itself (failover, HDR restart, retries, Smart Next).
+// Their close events are not the user quitting playback.
+const intentionallyStoppedPlayers = new Set<number>();
+const INTENTIONALLY_STOPPED_PLAYER_LIMIT = 32;
+
+function rememberIntentionallyStoppedPlayer(pid: number) {
+  intentionallyStoppedPlayers.add(pid);
+  if (intentionallyStoppedPlayers.size > INTENTIONALLY_STOPPED_PLAYER_LIMIT) {
+    const oldest = intentionallyStoppedPlayers.values().next().value;
+    if (oldest !== undefined) intentionallyStoppedPlayers.delete(oldest);
+  }
+}
+
+export function wasPlayerStoppedIntentionally(pid: number | null | undefined): boolean {
+  return pid != null && intentionallyStoppedPlayers.has(pid);
 }
 
 let onReadyUnlisten: UnlistenFn | null = null;
@@ -1159,7 +1178,10 @@ const tauriAPI = {
     }),
   moveMpvWindow: (pid: number, x: number, y: number, width?: number, height?: number) => 
     invoke<void>('move_mpv_window', { pid, x, y, width: width ?? 1280, height: height ?? 720 }),
-  stopMpvProcess: (pid: number) => invoke<void>('stop_mpv_process', { pid }),
+  stopMpvProcess: (pid: number) => {
+    rememberIntentionallyStoppedPlayer(pid);
+    return invoke<void>('stop_mpv_process', { pid });
+  },
   getMpvWindowPos: () => invoke<[number, number, number, number]>('get_mpv_window_pos'),
   openMagnet: (magnetUri: string) => invoke<void>('open_magnet', { magnetUri }),
   selectSvpExecutable: () => invoke<string | null>('select_svp_executable'),
@@ -1265,7 +1287,8 @@ const tauriAPI = {
         callback(event.payload);
       });
     },
-    onClosed: async (callback: (data: { percent_pos: number; playback_time: number; duration: number; filename: string; playlist_pos?: number }) => void) => {
+    // mpv_pid names the player that ended; reason says how it was detected.
+    onClosed: async (callback: (data: { percent_pos: number; playback_time: number; duration: number; filename: string; playlist_pos?: number; mpv_pid?: number; reason?: string }) => void) => {
       const unlisten = await listen<any>('player://closed', (event) => {
         callback(event.payload);
       });
@@ -1273,7 +1296,7 @@ const tauriAPI = {
         unlisten();
       };
     },
-    onEof: async (callback: (data: { percent_pos: number; playback_time: number; duration: number; filename: string; playlist_pos?: number }) => void) => {
+    onEof: async (callback: (data: { percent_pos: number; playback_time: number; duration: number; filename: string; playlist_pos?: number; mpv_pid?: number; reason?: string }) => void) => {
       const unlisten = await listen<any>('player://eof', (event) => {
         callback(event.payload);
       });

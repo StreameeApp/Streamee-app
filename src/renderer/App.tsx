@@ -25,6 +25,7 @@ import {
   recordTransferredBytes,
 } from './services/statistics';
 import { openAudioNormalizerWindow } from './services/audio-normalizer-window';
+import { wasPlayerStoppedIntentionally } from './services/tauri';
 import {
   checkForUpdates,
   downloadAndInstallUpdate,
@@ -751,6 +752,7 @@ const App: React.FC = () => {
     let audioNormalizerTelemetryUnlisten: (() => void) | null = null;
     let statisticsTransferUnlisten: (() => void) | null = null;
     let torrentProgressUnlisten: (() => void) | null = null;
+    let torrentErrorUnlisten: (() => void) | null = null;
     let closeTimeout: NodeJS.Timeout | null = null;
     let traktSyncTimeout: number | null = null;
 
@@ -954,9 +956,19 @@ const App: React.FC = () => {
           console.log('%c[Smart Next]%c Ignoring MPV close during playback transition', 'color: #ff6b35; font-weight: bold', 'color: inherit');
           return;
         }
+        // The player screen stopped this player itself (failover, HDR restart,
+        // retry) and decides what happens next; leaving would cut that short.
+        if (wasPlayerStoppedIntentionally(data.mpv_pid)) {
+          console.log('%c[Player]%c Ignoring close of a player the app stopped itself', 'color: #a78bfa; font-weight: bold', 'color: inherit', data.mpv_pid);
+          return;
+        }
 
         console.log('%c[Player]%c Player closed', 'color: #a78bfa; font-weight: bold', 'color: inherit');
-         
+        // Save the final position now. The player screen clears the playing
+        // title as it leaves, which happens before the grace period below ends,
+        // and the last progress event before a close is throttled.
+        flushCurrentPlayingProgress(undefined, data);
+
         if (closeTimeout) {
           clearTimeout(closeTimeout);
         }
@@ -1044,6 +1056,23 @@ const App: React.FC = () => {
           bitfield: progress.bitfield || [],
         });
       });
+
+      // The stream sidecar reports many transient errors (a peer or tracker
+      // failing). Only a failed source matters to the viewer, and sidecar
+      // health says whether that happened. Startup failures already surface
+      // through the startup state; this covers a source failing mid-playback.
+      let lastReportedSourceError: string | null = null;
+      torrentErrorUnlisten = await window.electronAPI.torrent.onError(async () => {
+        if (isDisposed) return;
+        const health = await window.electronAPI.torrent.getHealth();
+        const sourceError = health?.source_error ?? null;
+        if (isDisposed || !sourceError || sourceError === lastReportedSourceError) return;
+        lastReportedSourceError = sourceError;
+        console.warn('[Stream] The stream source failed during playback:', sourceError);
+        await window.electronAPI.player
+          .showMessage(`The stream source stopped working: ${sourceError}`, 8000)
+          .catch(() => {});
+      });
     };
 
     initApp();
@@ -1106,6 +1135,7 @@ const App: React.FC = () => {
       audioNormalizerTelemetryUnlisten?.();
       statisticsTransferUnlisten?.();
       torrentProgressUnlisten?.();
+      torrentErrorUnlisten?.();
       endPlaybackSession();
       if (closeTimeout) {
         clearTimeout(closeTimeout);

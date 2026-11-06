@@ -8,6 +8,8 @@ mod intro_skipper;
 mod introdb;
 mod logging;
 mod mpv_ipc;
+#[cfg(target_os = "windows")]
+mod mpv_shutdown;
 mod optiflow_clocks;
 mod optiflow_runtime;
 mod process_lifecycle;
@@ -2719,6 +2721,30 @@ fn persistent_stream_cache_resident_bytes(total_size: u64, resident_blocks: &[u6
     })
 }
 
+/// The app and the stream sidecar share the persistent cache folder and each
+/// prunes it. An entry in use holds this file with its owner's process id;
+/// neither pruner removes an entry whose owner is still running.
+const PERSISTENT_STREAM_CACHE_IN_USE_FILE: &str = "in-use.lock";
+
+fn process_id_running(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        check_process(pid).running
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Without a cheap check, keep the entry rather than risk deleting it.
+        pid != 0
+    }
+}
+
+fn persistent_entry_in_use_elsewhere(entry_dir: &Path) -> bool {
+    fs::read_to_string(entry_dir.join(PERSISTENT_STREAM_CACHE_IN_USE_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .is_some_and(|pid| pid != std::process::id() && process_id_running(pid))
+}
+
 fn active_persistent_stream_cache_dirs() -> HashSet<PathBuf> {
     let Ok(active) = ACTIVE_PERSISTENT_STREAM_CACHES.lock() else {
         return HashSet::new();
@@ -2742,22 +2768,29 @@ fn prune_persistent_stream_cache(root: &Path, limit_bytes: u64) {
             continue;
         }
         let manifest_path = entry_dir.join("manifest.json");
+        // Counted toward the limit, but never removed while its owner runs.
+        let in_use = active.contains(&entry_dir) || persistent_entry_in_use_elsewhere(&entry_dir);
         let Some(manifest) = persistent_stream_cache_manifest(&manifest_path) else {
-            if !active.contains(&entry_dir) {
+            if !in_use {
                 let _ = fs::remove_dir_all(&entry_dir);
             }
             continue;
         };
         resident_total = resident_total.saturating_add(manifest.resident_bytes);
-        entries.push((manifest.last_access_ms, manifest.resident_bytes, entry_dir));
+        entries.push((
+            manifest.last_access_ms,
+            manifest.resident_bytes,
+            entry_dir,
+            in_use,
+        ));
     }
-    entries.sort_by_key(|(last_access_ms, _, _)| *last_access_ms);
-    let newest_entry_dir = entries.last().map(|(_, _, entry_dir)| entry_dir.clone());
-    for (_, resident_bytes, entry_dir) in entries {
+    entries.sort_by_key(|(last_access_ms, _, _, _)| *last_access_ms);
+    let newest_entry_dir = entries.last().map(|(_, _, entry_dir, _)| entry_dir.clone());
+    for (_, resident_bytes, entry_dir, in_use) in entries {
         if resident_total <= limit_bytes {
             break;
         }
-        if active.contains(&entry_dir) || newest_entry_dir.as_ref() == Some(&entry_dir) {
+        if in_use || newest_entry_dir.as_ref() == Some(&entry_dir) {
             continue;
         }
         match fs::remove_dir_all(&entry_dir) {
@@ -2794,7 +2827,10 @@ fn prepare_persistent_stream_cache_for_item(
     };
     for child in children.flatten() {
         let candidate_dir = child.path();
-        if !candidate_dir.is_dir() || candidate_dir == entry_dir || active.contains(&candidate_dir)
+        if !candidate_dir.is_dir()
+            || candidate_dir == entry_dir
+            || active.contains(&candidate_dir)
+            || persistent_entry_in_use_elsewhere(&candidate_dir)
         {
             continue;
         }
@@ -2919,6 +2955,11 @@ impl SingleFileRangeCache {
         }
         fs::create_dir_all(&entry_dir)
             .map_err(|error| format!("Failed to create persistent cache item folder: {error}"))?;
+        fs::write(
+            entry_dir.join(PERSISTENT_STREAM_CACHE_IN_USE_FILE),
+            std::process::id().to_string(),
+        )
+        .map_err(|error| format!("Failed to mark persistent cache item in use: {error}"))?;
         let file = fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -3031,10 +3072,9 @@ impl SingleFileRangeCache {
         let temporary_path = persistent.manifest_path.with_extension("json.tmp");
         fs::write(&temporary_path, encoded)
             .map_err(|error| format!("Failed to write persistent cache index: {error}"))?;
-        if persistent.manifest_path.exists() {
-            fs::remove_file(&persistent.manifest_path)
-                .map_err(|error| format!("Failed to replace persistent cache index: {error}"))?;
-        }
+        // rename replaces an existing index atomically (MoveFileEx with
+        // MOVEFILE_REPLACE_EXISTING on Windows); deleting it first would leave a
+        // moment with no index, which a pruner could take as abandoned.
         fs::rename(&temporary_path, &persistent.manifest_path)
             .map_err(|error| format!("Failed to publish persistent cache index: {error}"))?;
         Ok(())
@@ -3515,6 +3555,13 @@ impl Drop for SingleFileRangeCache {
                 .is_some_and(|cache| std::ptr::eq(cache.as_ptr(), self));
             if owns_registration {
                 active.remove(&persistent.entry_dir);
+                // A marker left by a crash names an exited process, which
+                // pruners treat as unused.
+                let _ = fs::remove_file(
+                    persistent
+                        .entry_dir
+                        .join(PERSISTENT_STREAM_CACHE_IN_USE_FILE),
+                );
             }
         }
         prune_persistent_stream_cache(&persistent.root, persistent.limit_bytes);
@@ -5584,6 +5631,8 @@ async fn prepare_and_open_qbittorrent_stream(
     #[cfg(target_os = "windows")]
     {
         let cache_whole_file_enabled = cache_whole_file_enabled.unwrap_or(false);
+        // Before auto HDR: stopping an earlier player restores SDR on its exit.
+        free_player_pipe_for_launch().await?;
         maybe_auto_enable_hdr_before_mpv(&app, Some(&prepared.file_name))?;
         let canonical_display_title = if prepared.file_name.trim().is_empty() {
             display_title.clone()
@@ -5756,7 +5805,20 @@ async fn load_prepared_mpv_stream(
     playlist_files: Option<Vec<StreamPlaylistItem>>,
     display_title: Option<String>,
 ) -> Result<StreamLaunchResult, String> {
-    load_file_replace_with_title(&file_url, display_title.as_deref(), start_position)?;
+    // The control pipe has one fixed name; load only into the player that was
+    // prepared, never into whichever process serves the name now.
+    #[cfg(target_os = "windows")]
+    if player_pipe_owner_async().await? != Some(pid) {
+        return Err(format!(
+            "The prepared player ({pid}) no longer owns the control channel"
+        ));
+    }
+    let url = file_url.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        load_file_replace_with_title(&url, display_title.as_deref(), start_position)
+    })
+    .await
+    .map_err(|error| format!("Loading into the prepared player failed: {error}"))??;
 
     Ok(StreamLaunchResult {
         session_id: 0,
@@ -6147,7 +6209,9 @@ async fn get_file_path(filename: String) -> Result<String, String> {
                 Err("File not found on disk (torrent may be in-memory)".to_string())
             }
         }
-        None => Err("No active torrent".to_string()),
+        None => Err(format!(
+            "No single file named {filename:?} in the current source"
+        )),
     }
 }
 
@@ -6213,7 +6277,138 @@ async fn resume_torrent() -> Result<(), String> {
 #[tauri::command]
 async fn stop_player() -> Result<(), String> {
     info!("Stopping player");
+    #[cfg(target_os = "windows")]
+    {
+        // Wait for the player to exit, so a relaunch cannot race it for the
+        // shared control pipe.
+        let pid = mpv_ipc::active_player_pid();
+        if pid == 0 {
+            return Ok(());
+        }
+        stop_mpv_process(pid).await
+    }
+
+    #[cfg(not(target_os = "windows"))]
     mpv_ipc::stop_player_session()
+}
+
+#[cfg(target_os = "windows")]
+struct ProcessCheck {
+    running: bool,
+    launched_by_streamee: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn check_process(pid: u32) -> ProcessCheck {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+    match unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
+        )
+    } {
+        Ok(handle) => {
+            let running = unsafe { WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT;
+            let launched_by_streamee = process_lifecycle::owns_process(handle).unwrap_or(false);
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            ProcessCheck {
+                running,
+                launched_by_streamee,
+            }
+        }
+        Err(error) => ProcessCheck {
+            // Any failure other than "no such process" (for example access
+            // denied) means some other program's process is running.
+            running: error.code() != ERROR_INVALID_PARAMETER.to_hresult(),
+            launched_by_streamee: false,
+        },
+    }
+}
+
+/// The process serving the player control pipe, if the pipe exists.
+#[cfg(target_os = "windows")]
+fn player_pipe_owner() -> Option<u32> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    let pipe = mpv_ipc::connect_to_mpv_pipe_with_logging(false)?;
+    let mut owner = 0u32;
+    let identified = unsafe { GetNamedPipeServerProcessId(pipe, &mut owner) }.is_ok();
+    unsafe {
+        let _ = CloseHandle(pipe);
+    }
+    (identified && owner != 0).then_some(owner)
+}
+
+#[cfg(target_os = "windows")]
+async fn player_pipe_owner_async() -> Result<Option<u32>, String> {
+    tauri::async_runtime::spawn_blocking(player_pipe_owner)
+        .await
+        .map_err(|error| format!("Could not check the player control channel: {error}"))
+}
+
+/// MPV cannot create its control pipe while another process still serves the
+/// same name, and would then play with no way for Streamee to control it.
+/// Stops an earlier Streamee player that still owns the pipe; refuses when
+/// another program owns it. Call before anything a player exit would undo,
+/// such as automatic HDR.
+#[cfg(target_os = "windows")]
+async fn free_player_pipe_for_launch() -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let Some(owner) = player_pipe_owner_async().await? else {
+            return Ok(());
+        };
+        let process = check_process(owner);
+        if process.running && !process.launched_by_streamee {
+            return Err(
+                "Another program is using the player control channel (mpvpipe). Close it and try again."
+                    .to_string(),
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "The previous player ({owner}) did not release the control channel in time"
+            ));
+        }
+        if process.running {
+            warn!(
+                event = "mpv.launch.previous_player_running",
+                pid = owner,
+                "An earlier player still owns the control channel; stopping it before launch"
+            );
+            stop_mpv_process(owner).await?;
+        } else {
+            // The player exited; a connection may hold the name for a moment.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
+/// Confirms the newly launched player serves the control pipe.
+#[cfg(target_os = "windows")]
+async fn wait_for_player_pipe_owner(pid: u32) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let owner = player_pipe_owner_async().await?;
+        if owner == Some(pid) {
+            return Ok(());
+        }
+        if !check_process(pid).running {
+            return Err("The player exited during startup".to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "The player started without its control channel (owned by {owner:?})"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 #[tauri::command]
@@ -6222,24 +6417,13 @@ async fn stop_mpv_process(pid: u32) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let pid_arg = pid.to_string();
-        let mut command = std::process::Command::new("taskkill");
-        hide_console_std(&mut command);
-        let status = command
-            .args(["/PID", pid_arg.as_str(), "/T", "/F"])
-            .status()
-            .map_err(|err| format!("Failed to stop MPV process {}: {}", pid, err))?;
-
-        if status.success() {
-            mpv_ipc::wait_for_player_pipe_release(pid, std::time::Duration::from_secs(8)).await?;
-            info!(
-                "MPV process {} and its IPC watcher session have stopped",
-                pid
-            );
-            Ok(())
-        } else {
-            Err(format!("taskkill failed for MPV process {}", pid))
-        }
+        mpv_shutdown::stop_process(pid, mpv_ipc::get_mpv_pipe_name()).await?;
+        mpv_ipc::wait_for_player_pipe_release(pid, std::time::Duration::from_secs(8)).await?;
+        info!(
+            event = "mpv.shutdown.completed",
+            pid, "MPV process and its IPC watcher session have stopped"
+        );
+        Ok(())
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -6758,6 +6942,7 @@ async fn launch_mpv_process(
     preferred_audio_language: Option<String>,
     prefer_sdh_subtitles: bool,
 ) -> Result<u32, String> {
+    free_player_pipe_for_launch().await?;
     let optiflow_requested =
         get_store_setting(app, "mpvOptiflowEnabled").as_deref() == Some("true");
     let native_optiflow_assets = optiflow_requested
@@ -7311,6 +7496,19 @@ async fn launch_mpv_process(
     }
     if let Err(err) = attach_mpv_to_main_window(app, pid).await {
         warn!("Failed to attach MPV window to app owner: {}", err);
+        if !check_process(pid).running {
+            return Err(format!("MPV exited during startup: {err}"));
+        }
+    }
+    if let Err(err) = wait_for_player_pipe_owner(pid).await {
+        warn!(
+            event = "mpv.launch.control_channel_missing",
+            pid,
+            %err,
+            "Stopping a player Streamee cannot control"
+        );
+        let _ = stop_mpv_process(pid).await;
+        return Err(err);
     }
     Ok(pid)
 }
@@ -7740,6 +7938,7 @@ async fn attach_mpv_to_main_window(app: &AppHandle, pid: u32) -> Result<(), Stri
 
         let start = std::time::Instant::now();
         let mut msg: MSG = unsafe { std::mem::zeroed() };
+        let mut last_liveness_check = start;
 
         let found = loop {
             let f = TL_ATTACH_FOUND.with(|c| c.get());
@@ -7752,6 +7951,20 @@ async fn attach_mpv_to_main_window(app: &AppHandle, pid: u32) -> Result<(), Stri
                     let _ = UnhookWinEvent(hook);
                 }
                 return Err(format!("Timed out waiting for MPV window {}", pid));
+            }
+
+            // A player that fails to load can exit without ever showing a window.
+            if last_liveness_check.elapsed() >= std::time::Duration::from_millis(100) {
+                last_liveness_check = std::time::Instant::now();
+                if !check_process(pid).running {
+                    unsafe {
+                        let _ = UnhookWinEvent(hook);
+                    }
+                    return Err(format!(
+                        "MPV process {} exited before showing its window",
+                        pid
+                    ));
+                }
             }
 
             unsafe {
@@ -7866,8 +8079,21 @@ async fn move_mpv_window(pid: u32, x: i32, y: i32, width: u32, height: u32) -> R
     Ok(())
 }
 
+/// Async so its IPC round trips run off the UI thread; synchronous Tauri
+/// commands run on the main thread and a busy player would freeze the app.
 #[tauri::command]
-fn restore_smart_next_window_state(pid: u32, fullscreen: Option<bool>) -> Result<(), String> {
+async fn restore_smart_next_window_state(pid: u32, fullscreen: Option<bool>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        restore_smart_next_window_state_blocking(pid, fullscreen)
+    })
+    .await
+    .map_err(|error| format!("Smart Next window restore failed: {error}"))?
+}
+
+fn restore_smart_next_window_state_blocking(
+    pid: u32,
+    fullscreen: Option<bool>,
+) -> Result<(), String> {
     let active_pid = mpv_ipc::current_player_pid()?;
     if active_pid != pid {
         return Err(format!(
@@ -8855,6 +9081,12 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+                // Let the stream sidecar remove this session's disposable cache
+                // before its process is terminated with the other helpers.
+                let _ = tauri::async_runtime::block_on(tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    torrent::stop_download(),
+                ));
                 if let Err(error) = process_lifecycle::shutdown(std::time::Duration::from_secs(8)) {
                     warn!(event = "app.helper_shutdown_failed", %error, "Could not finish helper shutdown");
                 }
@@ -9866,5 +10098,123 @@ mod stream_cache_tests {
         ));
         drop(cache);
         let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod player_launch_tests {
+    use super::*;
+
+    fn sleeper() -> std::process::Command {
+        let mut command = std::process::Command::new("cmd.exe");
+        command
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .creation_flags(0x08000000);
+        command
+    }
+
+    #[test]
+    fn launch_guard_tells_streamee_players_from_other_programs() {
+        let mut other = sleeper().spawn().unwrap();
+        let mut owned = process_lifecycle::spawn_std(&mut sleeper()).unwrap();
+
+        let other_check = check_process(other.id());
+        let owned_check = check_process(owned.id());
+        for child in [&mut other, &mut owned] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        assert!(other_check.running && !other_check.launched_by_streamee);
+        assert!(owned_check.running && owned_check.launched_by_streamee);
+    }
+
+    #[test]
+    fn launch_guard_sees_an_exited_player_as_gone() {
+        let mut child = sleeper().spawn().unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // The Child handle is still open, so the PID cannot be reused yet.
+        assert!(!check_process(pid).running);
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod persistent_cache_sharing_tests {
+    use super::*;
+
+    fn sleeper() -> std::process::Child {
+        std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .creation_flags(0x08000000)
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn entries_another_running_process_uses_are_never_pruned() {
+        let root =
+            std::env::temp_dir().join(format!("streamee-cache-share-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let entry = |name: &str, last_access_ms: u64, owner: Option<u32>| {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            let manifest = PersistentStreamCacheManifest {
+                version: PERSISTENT_STREAM_CACHE_VERSION,
+                cache_key: name.to_string(),
+                provider: "test".to_string(),
+                total_size: 100,
+                resident_bytes: 100,
+                last_access_ms,
+                covered_ranges: vec![],
+                resident_blocks: vec![],
+            };
+            fs::write(
+                dir.join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            if let Some(pid) = owner {
+                fs::write(
+                    dir.join(PERSISTENT_STREAM_CACHE_IN_USE_FILE),
+                    pid.to_string(),
+                )
+                .unwrap();
+            }
+            dir
+        };
+
+        let mut other = sleeper();
+        let mut exited = sleeper();
+        exited.kill().unwrap();
+        exited.wait().unwrap();
+
+        let in_use = entry("in-use", 1, Some(other.id()));
+        let stale_marker = entry("stale-marker", 2, Some(exited.id()));
+        let newest = entry("newest", 3, None);
+        let pending = root.join("pending-without-manifest");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(
+            pending.join(PERSISTENT_STREAM_CACHE_IN_USE_FILE),
+            other.id().to_string(),
+        )
+        .unwrap();
+
+        prune_persistent_stream_cache(&root, 150);
+        let _ = other.kill();
+        let _ = other.wait();
+
+        assert!(in_use.exists(), "an entry another process uses was pruned");
+        assert!(
+            pending.exists(),
+            "an entry still being prepared elsewhere was pruned"
+        );
+        assert!(
+            !stale_marker.exists(),
+            "a marker from an exited process protected its entry"
+        );
+        assert!(newest.exists());
+        let _ = fs::remove_dir_all(&root);
     }
 }

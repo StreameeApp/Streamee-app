@@ -118,6 +118,22 @@ pub fn shutdown(timeout: Duration) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `process` (opened with query access) belongs to the helper job, meaning
+/// Streamee or one of its helpers launched it. A recycled PID never does.
+#[cfg(windows)]
+pub fn owns_process(process: windows::Win32::Foundation::HANDLE) -> Result<bool, String> {
+    let guard = JOB.lock().map_err(|e| e.to_string())?;
+    let Some(job) = guard.as_ref() else {
+        return Ok(false);
+    };
+    let mut in_job = windows::core::BOOL::default();
+    unsafe {
+        windows::Win32::System::JobObjects::IsProcessInJob(process, Some(job.handle()), &mut in_job)
+    }
+    .map_err(|e| format!("Could not check helper ownership: {e}"))?;
+    Ok(in_job.as_bool())
+}
+
 pub fn resume() -> Result<(), String> {
     let mut guard = JOB.lock().map_err(|e| e.to_string())?;
     if !guard
@@ -348,6 +364,40 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    #[test]
+    fn only_helpers_launched_through_the_job_are_owned() {
+        use std::os::windows::process::CommandExt;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        let mut command = std::process::Command::new("cmd.exe");
+        command.args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"]);
+        let mut owned = spawn_std(&mut command).unwrap();
+        let mut unowned = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .creation_flags(0x08000000)
+            .spawn()
+            .unwrap();
+        let is_owned = |pid: u32| unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).unwrap();
+            let result = owns_process(handle);
+            let _ = CloseHandle(handle);
+            result.unwrap()
+        };
+        let (owned_result, unowned_result) = (is_owned(owned.id()), is_owned(unowned.id()));
+        for child in [&mut owned, &mut unowned] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            owned_result,
+            "a helper launched through the job was not recognised"
+        );
+        assert!(
+            !unowned_result,
+            "an unrelated process was treated as a helper"
+        );
     }
 
     #[test]

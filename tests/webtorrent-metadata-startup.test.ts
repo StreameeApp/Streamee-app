@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
+import path from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
 import parseTorrent from 'parse-torrent';
@@ -28,6 +31,8 @@ async function sidecar(platform = 'linux') {
       this.announce = owner.options.tracker.announce;
     }
     destroy(_options: unknown, callback: () => void) {
+      // Like WebTorrent, a second destroy returns without calling back.
+      if (this.destroyed) return;
       this.destroyed = true;
       this.owner.torrents = this.owner.torrents.filter((torrent) => torrent !== this);
       this.emit('close');
@@ -42,21 +47,30 @@ async function sidecar(platform = 'linux') {
     torrents: Torrent[] = [];
     listening = true;
     options: any;
+    addOptions: any[] = [];
     constructor(options: any) { super(); this.options = options; }
-    add(_source: unknown, _options: unknown, callback: (torrent: Torrent) => void) {
+    add(_source: unknown, options: unknown, callback: (torrent: Torrent) => void) {
+      this.addOptions.push(options);
       const torrent = new Torrent(this, callback);
       this.torrents.push(torrent);
       setImmediate(() => torrent.emit('infoHash'));
       return torrent;
     }
   }
+  class FakeChunkStore {
+    opts: any;
+    constructor(_chunkLength: number, opts: any) { this.opts = opts; }
+  }
+  let stdinHandler: (data: string) => Promise<void> = async () => {};
   const source = originalSource
     .replace("import('webtorrent')", 'Promise.resolve({ default: FakeClient })')
     .replace("import('parse-torrent')", 'Promise.resolve({ default: fakeParse })')
+    .replace("import('fs-chunk-store')", 'Promise.resolve({ default: FakeChunkStore })')
     .replace(/^main\(\);\r?$/m, '')
-    + '\n globalThis.api = { startTorrent, stopTorrent, getHealth, getProgress, normalizeMagnetUri, ready: clientReady, getClient: () => client, setParse: (parse) => { parseTorrentSource = parse; } };';
+    + '\n globalThis.api = { startTorrent, stopTorrent, getHealth, getProgress, normalizeMagnetUri, resolveTorrentSource, toSafeStorePath, ready: clientReady, getClient: () => client, setParse: (parse) => { parseTorrentSource = parse; } };';
   const context: any = {
     FakeClient: Client,
+    FakeChunkStore,
     fakeParse: () => ({ infoHash: '0123456789012345678901234567890123456789' }),
     require: (name: string) => {
       if (name === 'dns') return { setDefaultResultOrder: (order: string) => { dnsOrder = order; } };
@@ -68,14 +82,29 @@ async function sidecar(platform = 'linux') {
       platform, env: {}, pid: 1, on() {},
       stderr: { write() {} },
       stdout: { on() {}, write: (line: string) => messages.push(JSON.parse(line)) },
-      stdin: { setEncoding() {}, on() {}, once() {} },
+      stdin: {
+        setEncoding() {},
+        on(event: string, handler: (data: string) => Promise<void>) {
+          if (event === 'data') stdinHandler = handler;
+        },
+        once() {},
+      },
     },
     Buffer, URL, setImmediate, clearInterval, clearTimeout,
     setTimeout: (callback: () => void) => setTimeout(callback, 0),
   };
   vm.runInNewContext(source, context, { filename: 'webtorrent-server.cjs' });
   await context.api.ready;
-  return { ...context.api, dnsOrder, messages };
+  const send = (command: unknown) => stdinHandler(`${JSON.stringify(command)}\n`);
+  return { ...context.api, dnsOrder, messages, send };
+}
+
+// WebTorrent destroys and unregisters a source before it reports the error.
+function failLikeWebTorrent(torrent: any, error: Error) {
+  torrent.destroyed = true;
+  torrent.owner.torrents = torrent.owner.torrents.filter((entry: unknown) => entry !== torrent);
+  torrent.emit('error', error);
+  torrent.emit('close');
 }
 
 test('metadata discovery is active immediately and stop destroys the pending torrent', async () => {
@@ -194,5 +223,137 @@ test('magnet recovery leaves invalid identities, binary sources and remote URLs 
     Buffer.from('example'),
   ]) {
     assert.equal(api.normalizeMagnetUri(source), source);
+  }
+});
+
+test('a source closed by an error reports failure and does not block the next start', async () => {
+  const api = await sidecar();
+  const first = api.startTorrent('magnet:?xt=urn:btih:example');
+  await flush();
+  const failed = api.getClient().torrents[0];
+  failed.makeReady();
+  await first;
+  failLikeWebTorrent(failed, new Error('disk is full'));
+  assert.equal(api.getHealth().status, 'failed');
+  assert.equal(api.getHealth().message, 'disk is full');
+
+  const next = api.startTorrent('magnet:?xt=urn:btih:example');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(api.getHealth().status, 'waiting_for_metadata');
+  api.getClient().torrents[0].makeReady();
+  assert.equal((await next).files.length, 1);
+  await api.stopTorrent();
+  assert.equal(api.getHealth().status, 'idle');
+});
+
+test('a new start never reports the previous source as ready', async () => {
+  const api = await sidecar();
+  const first = api.startTorrent('magnet:?xt=urn:btih:example');
+  await flush();
+  api.getClient().torrents[0].makeReady();
+  await first;
+  assert.equal(api.getHealth().metadata_ready, true);
+
+  // The app checks health right after the start command replies.
+  const next = api.startTorrent('magnet:?xt=urn:btih:example');
+  assert.equal(api.getHealth().metadata_ready, false);
+  assert.equal(api.getProgress().metadata_ready, false);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  api.getClient().torrents[0].makeReady();
+  assert.equal((await next).files.length, 1);
+  assert.equal(api.getHealth().metadata_ready, true);
+  await api.stopTorrent();
+});
+
+test('replacing a source is not reported as a failure', async () => {
+  const api = await sidecar();
+  const first = api.startTorrent('magnet:?xt=urn:btih:example');
+  await flush();
+  const previous = api.getClient().torrents[0];
+  previous.makeReady();
+  await first;
+  // Like WebTorrent: marked destroyed and unregistered at once, closed later.
+  let healthWhileClosing: any = null;
+  previous.destroy = (_options: unknown, callback: () => void) => {
+    previous.destroyed = true;
+    previous.owner.torrents = previous.owner.torrents.filter((torrent: unknown) => torrent !== previous);
+    healthWhileClosing = api.getHealth();
+    setTimeout(() => {
+      previous.emit('close');
+      callback();
+    }, 30);
+  };
+  const next = api.startTorrent('magnet:?xt=urn:btih:example');
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.ok(healthWhileClosing, 'the previous source was not closed');
+  assert.notEqual(healthWhileClosing.status, 'failed');
+  api.getClient().torrents[0].makeReady();
+  assert.equal((await next).files.length, 1);
+  await api.stopTorrent();
+});
+
+test('a start that fails before metadata is reported by health', async () => {
+  const api = await sidecar();
+  api.setParse(() => Promise.reject(new Error('Invalid torrent identifier')));
+  await api.send({ action: 'start', magnet: 'magnet:?xt=urn:btih:invalid', requestId: 7 });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(api.messages.find((message: any) => message.requestId === 7).type, 'started');
+  assert.equal(api.getHealth().status, 'failed');
+  assert.match(api.getHealth().message, /Invalid torrent identifier/);
+  await api.stopTorrent();
+  assert.equal(api.getHealth().status, 'idle');
+});
+
+test('a destroyed client is rebuilt so later starts can add sources', async () => {
+  const api = await sidecar();
+  const original = api.getClient();
+  original.destroyed = true;
+  original.emit('error', Object.assign(new Error('listen EADDRINUSE'), { code: 'EADDRINUSE' }));
+  assert.notEqual(api.getClient(), original);
+  const starting = api.startTorrent('magnet:?xt=urn:btih:example');
+  await flush();
+  assert.equal(api.getClient().torrents.length, 1);
+  await api.stopTorrent();
+  assert.equal(await starting, null);
+});
+
+test('stored folder and file names are valid on Windows', async () => {
+  const api = await sidecar();
+  assert.equal(
+    api.toSafeStorePath('Title: Part 1/CON/Episode?.mkv'),
+    ['Title Part 1', '_CON', 'Episode.mkv'].join(path.sep),
+  );
+  assert.equal(api.toSafeStorePath('Trailing. /name '), ['Trailing', 'name'].join(path.sep));
+
+  const starting = api.startTorrent('magnet:?xt=urn:btih:example');
+  await flush();
+  const Store = api.getClient().addOptions[0].store;
+  const store = new Store(16384, { files: [{ path: 'Show: S1/E1?.mkv', length: 4, offset: 0 }] });
+  assert.equal(store.opts.files[0].path, ['Show S1', 'E1.mkv'].join(path.sep));
+  await api.stopTorrent();
+  assert.equal(await starting, null);
+});
+
+test('remote metadata must be a bencoded file within the size limit', async () => {
+  const api = await sidecar();
+  const server = http.createServer((req, res) => {
+    if (req.url === '/media') {
+      res.end(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+    } else if (req.url === '/huge') {
+      res.writeHead(200, { 'Content-Length': String(64 * 1024 * 1024) });
+      res.flushHeaders();
+    } else {
+      res.end('d4:infod4:name4:testee');
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    await assert.rejects(api.resolveTorrentSource(`${base}/media`), /did not return torrent metadata/);
+    await assert.rejects(api.resolveTorrentSource(`${base}/huge`), /too large/);
+    assert.equal(String(await api.resolveTorrentSource(`${base}/source.torrent`)), 'd4:infod4:name4:testee');
+  } finally {
+    server.closeAllConnections();
+    server.close();
   }
 });

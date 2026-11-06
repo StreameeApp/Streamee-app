@@ -53,9 +53,11 @@ const cleanup = player.slice(player.indexOf('    const handleStartupFailure ='),
 const prelaunchStart = player.lastIndexOf('          prelaunchMpvPromise = (async () => {');
 const prelaunchEnd = player.indexOf('\n        }', prelaunchStart);
 const prelaunch = player.slice(prelaunchStart, prelaunchEnd);
-const listenerStart = player.indexOf('        startupStateUnlisten = await');
+const listenerStart = player.indexOf('        startupStateUnlisten = keepListener(await');
+// The registration is wrapped as keepListener(await on...(callback)); the extra
+// opening parenthesis balances the wrapper's closing one.
 const startupListener = player.slice(listenerStart, player.indexOf('        playerHdrRestartUnlisten =', listenerStart))
-  .replace('startupStateUnlisten = await window.electronAPI.torrent.onStartupState(', 'const onStartupState = (');
+  .replace('startupStateUnlisten = keepListener(await window.electronAPI.torrent.onStartupState(', 'const onStartupState = ((');
 
 function harness({ disposed = false, generation = 1, pid = 42 as number | null, prelaunchPid = null as number | null,
   session = 9 as number | null } = {}) {
@@ -156,4 +158,86 @@ test('prelaunch finishing after startup failure closes its late process', async 
     assert.deepEqual(h.stopped, pid == null ? [73] : [pid, 73]);
     assert.equal(h.mpvPidRef.current, null);
   }
+});
+
+// Execute the component's actual player-closed handler.
+const closedStart = player.indexOf('        playerClosedUnlisten = keepListener(await');
+const closedListener = player.slice(closedStart, player.indexOf('        playerEofUnlisten =', closedStart))
+  .replace('playerClosedUnlisten = keepListener(await window.electronAPI.playerEvents.onClosed(', 'const onClosed = ((');
+
+function closedHarness(currentPid: number | null) {
+  const exits: string[] = [];
+  const noop = () => {};
+  const env = {
+    disposed: false, smartNextTransitionRef: { current: false }, mpvPidRef: { current: currentPid },
+    selectedStream: { sourceType: 'webtorrent' }, lastKnownPlaybackTimeRef: { current: 600 },
+    stopSubtitleTranscription: async () => {}, stopSvpAfterMpvClose: async () => {},
+    scheduleQbitRetry: noop, setSubtitleStatus: noop, setSubtitleMessage: noop, clearSubtitleAssist: noop,
+    setRetryWhisperAction: noop, setRetryAudioNormalizerAction: noop, setAudioNormalizerActive: noop,
+    setAudioNormalizerConnected: noop, setAudioNormalizerReason: noop,
+    exitToMetaDetails: () => exits.push('exit'),
+  };
+  const source = `
+    const { disposed, smartNextTransitionRef, mpvPidRef, selectedStream, lastKnownPlaybackTimeRef,
+      stopSubtitleTranscription, stopSvpAfterMpvClose, scheduleQbitRetry, setSubtitleStatus,
+      setSubtitleMessage, clearSubtitleAssist, setRetryWhisperAction, setRetryAudioNormalizerAction,
+      setAudioNormalizerActive, setAudioNormalizerConnected, setAudioNormalizerReason,
+      exitToMetaDetails } = env;
+    ${closedListener}
+    return onClosed;
+  `;
+  const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  return { onClosed: new Function('env', compiled)(env), exits };
+}
+
+test('closing a player this launch no longer uses does not end playback', async () => {
+  const h = closedHarness(42);
+  const payload = { percent_pos: 40, playback_time: 600, duration: 1500, filename: 'Example.mkv' };
+  await h.onClosed({ ...payload, mpv_pid: 17 });
+  assert.deepEqual(h.exits, []);
+  await h.onClosed({ ...payload, mpv_pid: 42 });
+  assert.deepEqual(h.exits, ['exit']);
+});
+
+// Execute the component's actual end-of-file handler.
+const eofStart = player.indexOf('        playerEofUnlisten = keepListener(await');
+const eofListener = player.slice(eofStart, player.indexOf('        playerReconnectedUnlisten =', eofStart))
+  .replace('playerEofUnlisten = keepListener(await window.electronAPI.playerEvents.onEof(', 'const onEof = ((');
+
+function eofHarness(playlist: { playlistActive: boolean; playlistCurrentIndex: number; playlistFiles: unknown[] }) {
+  const exits: string[] = [];
+  const noop = () => {};
+  const env = {
+    disposed: false, smartNextTransitionRef: { current: false }, mpvPidRef: { current: 42 },
+    selectedStream: { sourceType: 'webtorrent' }, lastKnownPlaybackTimeRef: { current: 600 },
+    stopSubtitleTranscription: async () => {}, scheduleQbitRetry: noop, setSubtitleStatus: noop,
+    setSubtitleMessage: noop, clearSubtitleAssist: noop, setRetryWhisperAction: noop,
+    setRetryAudioNormalizerAction: noop, setAudioNormalizerActive: noop, setAudioNormalizerConnected: noop,
+    setAudioNormalizerReason: noop, exitToMetaDetails: () => exits.push('exit'),
+    useStore: { getState: () => playlist },
+  };
+  const source = `
+    const { disposed, smartNextTransitionRef, mpvPidRef, selectedStream, lastKnownPlaybackTimeRef,
+      stopSubtitleTranscription, scheduleQbitRetry, setSubtitleStatus, setSubtitleMessage,
+      clearSubtitleAssist, setRetryWhisperAction, setRetryAudioNormalizerAction, setAudioNormalizerActive,
+      setAudioNormalizerConnected, setAudioNormalizerReason, exitToMetaDetails, useStore } = env;
+    ${eofListener}
+    return onEof;
+  `;
+  const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  return { onEof: new Function('env', compiled)(env), exits };
+}
+
+test('end of file leaves the player only after the last playlist item', async () => {
+  const payload = { percent_pos: 99, playback_time: 1490, duration: 1500, filename: 'Episode.mkv', mpv_pid: 42 };
+  const files = [{}, {}, {}];
+  const middle = eofHarness({ playlistActive: true, playlistCurrentIndex: 1, playlistFiles: files });
+  await middle.onEof(payload);
+  assert.deepEqual(middle.exits, []);
+  const last = eofHarness({ playlistActive: true, playlistCurrentIndex: 2, playlistFiles: files });
+  await last.onEof(payload);
+  assert.deepEqual(last.exits, ['exit']);
+  const single = eofHarness({ playlistActive: false, playlistCurrentIndex: 0, playlistFiles: [] });
+  await single.onEof(payload);
+  assert.deepEqual(single.exits, ['exit']);
 });

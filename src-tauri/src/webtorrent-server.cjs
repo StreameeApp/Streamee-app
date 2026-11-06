@@ -32,7 +32,35 @@ function cleanupStreamCacheDirectory(cacheDirectory = STREAM_CACHE_ROOT) {
   }
 }
 
-cleanupStreamCacheDirectory();
+function processIsRunning(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: the process exists but belongs to someone else.
+    return err?.code === 'EPERM';
+  }
+}
+
+// Session folders are named "<sidecar pid>-<sequence>-<time>". Another Streamee
+// window's sidecar may be streaming from its folder right now, so only remove
+// sessions whose sidecar has exited.
+function cleanupStaleSessionCaches() {
+  let children;
+  try {
+    children = fs.readdirSync(STREAM_CACHE_ROOT, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const child of children) {
+    const ownerPid = Number.parseInt(child.name.split('-')[0], 10);
+    if (child.isDirectory() && ownerPid !== process.pid && processIsRunning(ownerPid)) continue;
+    cleanupStreamCacheDirectory(path.join(STREAM_CACHE_ROOT, child.name));
+  }
+}
+
+cleanupStaleSessionCaches();
 fs.mkdirSync(STREAM_CACHE_ROOT, { recursive: true });
 
 function writeLog(level, event, message, fields = {}) {
@@ -51,6 +79,7 @@ const CLIENT_NUMWANT = 82;
 const FORWARD_SEGMENT_BYTES = 128 * 1024 * 1024;
 const TAIL_SEGMENT_BYTES = 64 * 1024 * 1024;
 const FULL_CACHE_SEEK_TOLERANCE_BYTES = 8 * 1024 * 1024;
+const TORRENT_DESTROY_TIMEOUT_MS = 10_000;
 const CACHE_ONLY_POLL_MS = 250;
 const CACHE_ONLY_IDLE_TIMEOUT_MS = 15_000;
 const configuredTorrentPort = (() => {
@@ -81,46 +110,129 @@ process.on('unhandledRejection', (reason, promise) => {
 let client = null;
 let parentClosing = false;
 let parseTorrentSource = null;
+let WebTorrentClient = null;
+let SafePathChunkStore = null;
+let lastClientRebuildAt = 0;
+const CLIENT_REBUILD_MIN_INTERVAL_MS = 5_000;
+
+// Windows cannot create these characters, trailing dots/spaces, or device names.
+const UNSAFE_PATH_CHARACTERS = /[<>:"|?*\u0000-\u001F]/g;
+const RESERVED_DEVICE_NAME = /^(con|prn|aux|nul|com\d|lpt\d)(\..*)?$/i;
+
+function toSafePathSegment(segment) {
+  let safe = segment.replace(UNSAFE_PATH_CHARACTERS, '').replace(/[. ]+$/, '');
+  if (!safe) safe = '_';
+  if (RESERVED_DEVICE_NAME.test(safe)) safe = `_${safe}`;
+  return safe;
+}
+
+function toSafeStorePath(relativePath) {
+  return String(relativePath)
+    .split(/[\\/]+/)
+    .filter(Boolean)
+    .map(toSafePathSegment)
+    .join(path.sep);
+}
+
+// fs-chunk-store only cleans the file name, so a folder such as "Title: Part 1"
+// fails to open on Windows. Clean every path segment before the store sees it.
+async function loadSafePathChunkStore() {
+  try {
+    const storeModule = await import('fs-chunk-store');
+    const BaseStore = storeModule.default || storeModule;
+    return class extends BaseStore {
+      constructor(chunkLength, opts = {}) {
+        super(chunkLength, Array.isArray(opts.files)
+          ? {
+            ...opts,
+            files: opts.files.map((file) => ({
+              path: toSafeStorePath(file.path),
+              length: file.length,
+              offset: file.offset,
+            })),
+          }
+          : opts);
+      }
+    };
+  } catch (err) {
+    writeLog('warn', 'cache.safe_store_unavailable', 'Using default stream storage paths', {
+      error: err.message,
+    });
+    return null;
+  }
+}
+
+function createClient(useConfiguredPort) {
+  const nextClient = new WebTorrentClient({
+    tracker: {
+      announce: ['udp://tracker.opentrackr.org:1337/announce'],
+      rtcConfig: null,
+      wrtc: false,
+      getAnnounceOpts: () => ({
+        numwant: CLIENT_NUMWANT,
+      }),
+    },
+    dht: true,
+    lsd: true,
+    utp: true,
+    natUpnp: true,
+    natPmp: true,
+    webSeeds: true,
+    downloadLimit: -1,
+    uploadLimit: -1,
+    uploads: 16,
+    maxConns: CLIENT_MAX_CONNS,
+    ...(useConfiguredPort ? { torrentPort: configuredTorrentPort, dhtPort: configuredTorrentPort } : {}),
+  });
+
+  if (useConfiguredPort) {
+    writeLog('debug', 'client.listen_port_configured', 'Using configured BT listening port', {
+      port: configuredTorrentPort,
+    });
+  }
+
+  nextClient.on('error', (err) => {
+    writeLog('error', 'client.error', 'WebTorrent client error', { error: err.message });
+    sendMessage({ type: 'error', message: err.message });
+    if (nextClient === client && nextClient.destroyed) rebuildDestroyedClient(err);
+  });
+
+  return nextClient;
+}
+
+// A listener failure (for example, the configured port is taken) destroys the
+// WebTorrent client, and every later add would throw. Replace it so the next
+// start works, falling back to a random port when the configured one is busy.
+function rebuildDestroyedClient(err) {
+  const now = Date.now();
+  if (now - lastClientRebuildAt < CLIENT_REBUILD_MIN_INTERVAL_MS) {
+    writeLog('error', 'client.rebuild_skipped', 'WebTorrent client failed again; not rebuilding yet', {
+      error: err.message,
+    });
+    return;
+  }
+  lastClientRebuildAt = now;
+  // The destroyed client closed the current source with it.
+  if (currentTorrent) sourceFailure = err.message;
+  const portBusy = err?.code === 'EADDRINUSE' || err?.code === 'EACCES';
+  writeLog('warn', 'client.rebuilding', 'Rebuilding destroyed WebTorrent client', {
+    error: err.message,
+    configured_port: configuredTorrentPort,
+    using_random_port: !!configuredTorrentPort && portBusy,
+  });
+  client = createClient(!!configuredTorrentPort && !portBusy);
+}
+
 const clientReady = Promise.all([
   import('webtorrent'),
   import('parse-torrent'),
+  loadSafePathChunkStore(),
 ])
-  .then(([webTorrentModule, parseTorrentModule]) => {
-    const WebTorrent = webTorrentModule.default || webTorrentModule;
+  .then(([webTorrentModule, parseTorrentModule, safeStore]) => {
+    WebTorrentClient = webTorrentModule.default || webTorrentModule;
     parseTorrentSource = parseTorrentModule.default || parseTorrentModule;
-    client = new WebTorrent({
-      tracker: {
-        announce: ['udp://tracker.opentrackr.org:1337/announce'],
-        rtcConfig: null,
-        wrtc: false,
-        getAnnounceOpts: () => ({
-          numwant: CLIENT_NUMWANT,
-        }),
-      },
-      dht: true,
-      lsd: true,
-      utp: true,
-      natUpnp: true,
-      natPmp: true,
-      webSeeds: true,
-      downloadLimit: -1,
-      uploadLimit: -1,
-      uploads: 16,
-      maxConns: CLIENT_MAX_CONNS,
-      ...(configuredTorrentPort ? { torrentPort: configuredTorrentPort, dhtPort: configuredTorrentPort } : {}),
-    });
-
-    if (configuredTorrentPort) {
-      writeLog('debug', 'client.listen_port_configured', 'Using configured BT listening port', {
-        port: configuredTorrentPort,
-      });
-    }
-
-    client.on('error', (err) => {
-      writeLog('error', 'client.error', 'WebTorrent client error', { error: err.message });
-      sendMessage({ type: 'error', message: err.message });
-    });
-
+    SafePathChunkStore = safeStore;
+    client = createClient(!!configuredTorrentPort);
     return client;
   })
   .catch((err) => {
@@ -149,6 +261,11 @@ let httpServer = null;
 let httpPort = null;
 let currentTorrent = null;
 let torrentSessionGeneration = 0;
+// Identifies the source behind currentTorrent. Stream URLs carry it, so a
+// player reconnecting after a source switch cannot read the new source's bytes.
+let currentSourceId = 0;
+// Why the current start or source failed; reported by health until the next start.
+let sourceFailure = null;
 let fullCacheEnabled = false;
 let fullCacheFileIndex = null;
 let fullCacheGeneration = 0;
@@ -195,6 +312,23 @@ function attachTrackerStats(torrent) {
   trackerClient.on('update', updateTrackerStatsFromResponse);
 }
 
+// The app's own cache and this sidecar share the persistent cache folder and
+// each prunes it. An entry in use holds this file with its owner's process id;
+// neither pruner removes an entry whose owner is still running.
+const PERSISTENT_CACHE_IN_USE_FILE = 'in-use.lock';
+
+function persistentEntryInUseElsewhere(entryDirectory) {
+  try {
+    const ownerPid = Number.parseInt(
+      fs.readFileSync(path.join(entryDirectory, PERSISTENT_CACHE_IN_USE_FILE), 'utf8'),
+      10,
+    );
+    return ownerPid !== process.pid && processIsRunning(ownerPid);
+  } catch {
+    return false;
+  }
+}
+
 function persistentCacheKey(identity) {
   return crypto.createHash('sha1').update(identity).digest('hex');
 }
@@ -219,9 +353,11 @@ function prunePersistentStreamCache(
   for (const child of fs.readdirSync(root, { withFileTypes: true })) {
     if (!child.isDirectory()) continue;
     const entryDirectory = path.join(root, child.name);
+    // Counted toward the limit, but never removed while its owner runs.
+    const inUse = entryDirectory === excludedDirectory || persistentEntryInUseElsewhere(entryDirectory);
     const manifest = readPersistentCacheManifest(path.join(entryDirectory, 'manifest.json'));
     if (!manifest) {
-      if (entryDirectory !== excludedDirectory) cleanupStreamCacheDirectory(entryDirectory);
+      if (!inUse) cleanupStreamCacheDirectory(entryDirectory);
       continue;
     }
     const residentBytes = Number.isSafeInteger(manifest.resident_bytes)
@@ -230,6 +366,7 @@ function prunePersistentStreamCache(
     residentTotal += residentBytes;
     entries.push({
       entryDirectory,
+      inUse,
       residentBytes,
       totalSize: Number.isSafeInteger(manifest.total_size) ? Math.max(0, manifest.total_size) : 0,
       lastAccessMs: Number.isSafeInteger(manifest.last_access_ms) ? manifest.last_access_ms : 0,
@@ -238,7 +375,7 @@ function prunePersistentStreamCache(
   if (Number.isSafeInteger(replacementTotalSize) && replacementTotalSize > 0) {
     const replacementIsOversized = replacementTotalSize > limitBytes;
     for (const entry of entries) {
-      if (entry.entryDirectory === excludedDirectory) continue;
+      if (entry.inUse) continue;
       if (!replacementIsOversized && entry.totalSize <= limitBytes) continue;
       if (!cleanupStreamCacheDirectory(entry.entryDirectory)) continue;
       residentTotal = Math.max(0, residentTotal - entry.residentBytes);
@@ -254,7 +391,7 @@ function prunePersistentStreamCache(
   for (const entry of entries) {
     if (residentTotal <= limitBytes) break;
     if (entry.removed) continue;
-    if (entry.entryDirectory === excludedDirectory) continue;
+    if (entry.inUse) continue;
     if (!cleanupStreamCacheDirectory(entry.entryDirectory)) continue;
     residentTotal = Math.max(0, residentTotal - entry.residentBytes);
     writeLog('debug', 'cache.persistent_item_evicted', 'Evicted persistent stream cache item', {
@@ -280,6 +417,8 @@ function persistActiveStreamCache(force = false) {
     covered_ranges: [],
     resident_blocks: [],
   };
+  const bitfield = getBitfieldBuffer(currentTorrent.bitfield);
+  if (bitfield) manifest.bitfield = Buffer.from(bitfield).toString('base64');
   const temporaryPath = `${activeStreamCacheManifestPath}.tmp`;
   try {
     fs.writeFileSync(temporaryPath, JSON.stringify(manifest));
@@ -297,11 +436,18 @@ function persistActiveStreamCache(force = false) {
   }
 }
 
+const TORRENT_SOURCE_TIMEOUT_MS = 20_000;
+const TORRENT_SOURCE_MAX_BYTES = 32 * 1024 * 1024;
+
 function requestTorrentSource(url) {
   return new Promise((resolve, reject) => {
-    const client = url.startsWith('https:') ? https : http;
-    const req = client.get(url, (res) => {
+    const transport = url.startsWith('https:') ? https : http;
+    const req = transport.get(url, (res) => {
       resolve(res);
+    });
+    // Covers both connecting and a server that stops sending mid-body.
+    req.setTimeout(TORRENT_SOURCE_TIMEOUT_MS, () => {
+      req.destroy(new Error('Torrent source request timed out'));
     });
     req.on('error', reject);
   });
@@ -364,9 +510,33 @@ async function resolveTorrentSource(source, redirectCount = 0) {
     throw new Error(`Torrent source request failed with status ${statusCode}`);
   }
 
+  const declaredLength = Number(response.headers['content-length']);
+  if (Number.isFinite(declaredLength) && declaredLength > TORRENT_SOURCE_MAX_BYTES) {
+    response.destroy();
+    throw new Error(`Torrent source is too large (${declaredLength} bytes)`);
+  }
+
   return await new Promise((resolve, reject) => {
     const chunks = [];
-    response.on('data', (chunk) => chunks.push(chunk));
+    let receivedBytes = 0;
+    const fail = (err) => {
+      response.destroy();
+      reject(err);
+    };
+    response.on('data', (chunk) => {
+      // A .torrent file is a bencoded dictionary; anything else (for example a
+      // direct media link) is rejected before it is buffered into memory.
+      if (receivedBytes === 0 && chunk.length > 0 && chunk[0] !== 0x64) {
+        fail(new Error('Torrent source did not return torrent metadata'));
+        return;
+      }
+      receivedBytes += chunk.length;
+      if (receivedBytes > TORRENT_SOURCE_MAX_BYTES) {
+        fail(new Error('Torrent source exceeded the metadata size limit'));
+        return;
+      }
+      chunks.push(chunk);
+    });
     response.on('end', () => {
       const torrentBuffer = Buffer.concat(chunks);
       if (!torrentBuffer.length) {
@@ -414,6 +584,12 @@ function getOnDemandChunkEnd(fileLength, start, requestedEnd) {
   return Math.min(requestedEnd, segmentEnd);
 }
 
+// A body shorter than its Content-Length must not idle on a keep-alive socket;
+// closing it lets the client notice at once and request the remaining range.
+function abortIncompleteResponse(res) {
+  if (!res.destroyed) res.destroy();
+}
+
 function pipeRangeOnDemand(res, file, start, end, logTag) {
   let nextStart = start;
   let activeStream = null;
@@ -450,7 +626,18 @@ function pipeRangeOnDemand(res, file, start, end, logTag) {
         error: err.message,
       });
       stop();
-      if (!res.writableEnded) res.end();
+      abortIncompleteResponse(res);
+    });
+    // File streams are streamx Readables, whose pipe() ignores { end: false }
+    // and would end the response after the first segment. Write manually.
+    stream.on('data', (chunk) => {
+      if (stopped || activeStream !== stream) return;
+      if (!res.write(chunk)) {
+        stream.pause();
+        res.once('drain', () => {
+          if (!stopped && activeStream === stream) stream.resume();
+        });
+      }
     });
     stream.on('end', () => {
       if (stopped || activeStream !== stream) return;
@@ -458,7 +645,6 @@ function pipeRangeOnDemand(res, file, start, end, logTag) {
       nextStart = chunkEnd + 1;
       pipeNext();
     });
-    stream.pipe(res, { end: false });
   };
 
   pipeNext();
@@ -563,9 +749,21 @@ function prioritizeFullCache(file, fileIndex, start) {
     }
   }
 
+  // Start at the first missing byte. After a pass has finished, a seek must not
+  // re-read the already cached remainder of the file from disk.
+  const forwardStart = firstUncachedFileByte(file, start, file.length - 1);
+  const backfillStart = forwardStart == null && start > 0
+    ? firstUncachedFileByte(file, 0, start - 1)
+    : null;
+  if (forwardStart == null && backfillStart == null) return;
+
   stopFullCacheWorker(false);
   const generation = fullCacheGeneration;
-  runFullCachePass(file, start, file.length - 1, generation, 'forward', start);
+  if (forwardStart != null) {
+    runFullCachePass(file, forwardStart, file.length - 1, generation, 'forward', start);
+  } else {
+    runFullCachePass(file, backfillStart, start - 1, generation, 'backfill', start);
+  }
 }
 
 function isTorrentPieceCached(torrent, pieceIndex) {
@@ -615,8 +813,13 @@ function serveCacheOnlyRange(req, res, file, start, end, statusCode, logTag) {
 
   const pipeNextCachedPiece = () => {
     if (stopped) return;
-    if (nextStart > end || currentTorrent !== torrent) {
+    if (nextStart > end) {
       res.end();
+      return;
+    }
+    if (currentTorrent !== torrent) {
+      stop();
+      abortIncompleteResponse(res);
       return;
     }
 
@@ -629,7 +832,8 @@ function serveCacheOnlyRange(req, res, file, start, end, statusCode, logTag) {
           pieceIndex,
           nextStart,
         });
-        res.end();
+        stop();
+        abortIncompleteResponse(res);
         return;
       }
       pollTimer = setTimeout(pipeNextCachedPiece, CACHE_ONLY_POLL_MS);
@@ -653,7 +857,7 @@ function serveCacheOnlyRange(req, res, file, start, end, statusCode, logTag) {
           error: err?.message || 'empty piece',
         });
         stop();
-        if (!res.writableEnded) res.end();
+        abortIncompleteResponse(res);
         return;
       }
       nextStart = chunkEnd + 1;
@@ -712,8 +916,29 @@ function handleRangeRequest(req, res, file, fileIndex, logTag, cacheOnly = false
   return true;
 }
 
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+// MPV and the transcription client connect directly. Reject a non-loopback Host
+// (DNS rebinding) and any request a web page issued (browser fetch metadata).
+function isTrustedLocalRequest(req) {
+  const host = String(req.headers.host || '').toLowerCase();
+  if (host && !LOOPBACK_HOSTNAMES.has(host.replace(/:\d+$/, ''))) return false;
+  const fetchSite = req.headers['sec-fetch-site'];
+  return !fetchSite || fetchSite === 'none' || fetchSite === 'same-origin';
+}
+
 function createHttpServer() {
   return http.createServer((req, res) => {
+    if (!isTrustedLocalRequest(req)) {
+      writeLog('warn', 'stream.request_rejected', 'Rejected non-local stream request', {
+        host: req.headers.host || null,
+        fetchSite: req.headers['sec-fetch-site'] || null,
+      });
+      res.writeHead(403, { 'Content-Type': 'text/plain', 'Connection': 'close' });
+      res.end('Forbidden');
+      return;
+    }
+
     if (!currentTorrent) {
       res.writeHead(404, { 'Content-Type': 'text/plain', 'Accept-Ranges': 'bytes' });
       res.end('No torrent loaded');
@@ -722,6 +947,12 @@ function createHttpServer() {
 
     const requestUrl = new URL(req.url, 'http://127.0.0.1');
     const requestPath = requestUrl.pathname;
+    const requestedSource = requestUrl.searchParams.get('source');
+    if (requestedSource != null && requestedSource !== String(currentSourceId)) {
+      res.writeHead(410, { 'Content-Type': 'text/plain', 'Connection': 'close' });
+      res.end('This stream belongs to a source that was replaced');
+      return;
+    }
     const cacheOnly = req.headers['x-streamee-cache-only'] === '1'
       || requestUrl.searchParams.get('streamee-cache-only') === '1';
 
@@ -845,7 +1076,9 @@ function sendMessage(msg) {
 let currentTorrentMetadataReady = false;
 
 function mapTorrentFile(f, i) {
-  const relativePath = f.path || f.name;
+  const sourcePath = f.path || f.name;
+  // Report the path the store actually wrote to.
+  const relativePath = SafePathChunkStore ? toSafeStorePath(sourcePath) : sourcePath;
   return {
     name: f.name,
     size: f.length,
@@ -906,13 +1139,31 @@ async function markTorrentStoreSparse(torrent) {
 async function destroyCurrentTorrent() {
   stopFullCacheWorker(true);
   if (currentTorrent) {
+    const torrent = currentTorrent;
     persistActiveStreamCache(true);
-    await new Promise(resolve => currentTorrent.destroy({ destroyStore: !activeStreamCachePersistent }, resolve));
-    currentTorrent = null;
+    // WebTorrent never calls back for a source it already destroyed after an
+    // error, so only wait for sources that are still alive.
+    if (!torrent.destroyed) {
+      const destroyed = new Promise((resolve) => {
+        torrent.destroy({ destroyStore: !activeStreamCachePersistent }, () => resolve(true));
+      });
+      if (!await Promise.race([destroyed, waitForTick(TORRENT_DESTROY_TIMEOUT_MS).then(() => false)])) {
+        writeLog('warn', 'torrent.destroy_timeout', 'Source did not finish closing; continuing', {
+          timeout_ms: TORRENT_DESTROY_TIMEOUT_MS,
+        });
+      }
+    }
+    if (currentTorrent === torrent) currentTorrent = null;
   }
 
   if (activeStreamCacheDir && !activeStreamCachePersistent) {
     cleanupStreamCacheDirectory(activeStreamCacheDir);
+  } else if (activeStreamCacheDir) {
+    try {
+      fs.rmSync(path.join(activeStreamCacheDir, PERSISTENT_CACHE_IN_USE_FILE), { force: true });
+    } catch {
+      // A stale marker names an exited process, which pruners treat as unused.
+    }
   }
   activeStreamCacheDir = null;
   activeStreamCachePersistent = false;
@@ -1051,6 +1302,11 @@ function recordDownloadedBytes(bytes) {
 
 async function startTorrent(magnetUri, cacheOptions = {}) {
   const generation = ++torrentSessionGeneration;
+  sourceFailure = null;
+  // The start command replies before the previous source is replaced. Until
+  // then health and progress must not report that source as ready, or the app
+  // would take its file list for the new source's.
+  currentTorrentMetadataReady = false;
   await ensureClientReady();
   if (generation !== torrentSessionGeneration) return null;
 
@@ -1077,6 +1333,7 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
       info_hash: infoHash,
     });
     currentTorrent = existingTorrent;
+    currentSourceId = generation;
     resetDownloadTransferTelemetry();
     if (existingTorrent.pieces?.length) {
       existingTorrent.deselect(0, existingTorrent.pieces.length - 1);
@@ -1107,6 +1364,7 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
     && Number.isSafeInteger(persistentLimitBytes)
     && persistentLimitBytes > 0;
 
+  let startupBitfield = null;
   if (usePersistentCache) {
     activeStreamCacheRoot = persistentRoot;
     activeStreamCacheLimitBytes = persistentLimitBytes;
@@ -1124,6 +1382,10 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
       if (!cleanupStreamCacheDirectory(activeStreamCacheDir)) {
         throw new Error('Failed to reset an incompatible persistent WebTorrent cache');
       }
+    } else if (typeof existingManifest?.bitfield === 'string') {
+      // WebTorrent then spot-checks one piece per file instead of hashing the
+      // whole cached title, and fully re-checks any file that fails.
+      startupBitfield = Buffer.from(existingManifest.bitfield, 'base64');
     }
     prunePersistentStreamCache(
       activeStreamCacheRoot,
@@ -1138,6 +1400,9 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
     );
   }
   fs.mkdirSync(activeStreamCacheDir, { recursive: true });
+  if (activeStreamCachePersistent) {
+    fs.writeFileSync(path.join(activeStreamCacheDir, PERSISTENT_CACHE_IN_USE_FILE), String(process.pid));
+  }
 
   return new Promise((resolve, reject) => {
     let startupComplete = false;
@@ -1145,6 +1410,8 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
       path: activeStreamCacheDir,
       deselect: true,
       destroyStoreOnDestroy: !activeStreamCachePersistent,
+      ...(SafePathChunkStore ? { store: SafePathChunkStore } : {}),
+      ...(startupBitfield ? { bitfield: startupBitfield } : {}),
     };
     const torrent = client.add(resolvedTorrentSource, addOptions, async (torrent) => {
       if (generation !== torrentSessionGeneration || currentTorrent !== torrent) {
@@ -1197,12 +1464,18 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
 
     // Track the returned torrent immediately, including during metadata discovery.
     currentTorrent = torrent;
+    currentSourceId = generation;
     currentTorrentMetadataReady = false;
     resetDownloadTransferTelemetry();
     torrent.on('download', recordDownloadedBytes);
     torrent.on('error', (err) => {
-      if (startupComplete) sendMessage({ type: 'error', message: err.message });
-      else reject(err);
+      if (startupComplete) {
+        // WebTorrent destroys the source on error; report it through health too.
+        if (currentTorrent === torrent) sourceFailure = err.message;
+        sendMessage({ type: 'error', message: err.message });
+      } else {
+        reject(err);
+      }
     });
     torrent.once('close', () => resolve(null));
     torrent.once('infoHash', () => {
@@ -1235,6 +1508,7 @@ async function startTorrent(magnetUri, cacheOptions = {}) {
 
 async function stopTorrent() {
   torrentSessionGeneration += 1;
+  sourceFailure = null;
   await clientReady.catch(() => {});
   if (currentTorrent) {
     emitDownloadTransferProgress(true);
@@ -1271,7 +1545,7 @@ function getStreamUrl(fileIndex) {
   const file = currentTorrent.files[fileIndex];
   if (!file) return null;
 
-  return `http://127.0.0.1:${httpPort}/stream/${fileIndex}`;
+  return `http://127.0.0.1:${httpPort}/stream/${fileIndex}?source=${currentSourceId}`;
 }
 
 function getWhisperStreamUrl(fileIndex) {
@@ -1279,10 +1553,22 @@ function getWhisperStreamUrl(fileIndex) {
   const file = currentTorrent.files[fileIndex];
   if (!file) return null;
 
-  return `http://127.0.0.1:${httpPort}/whisper/${fileIndex}`;
+  return `http://127.0.0.1:${httpPort}/whisper/${fileIndex}?source=${currentSourceId}`;
 }
 
 function getHealth() {
+  // Every failure path records a reason: source errors, failed starts and a
+  // destroyed client. A destroyed source alone is not one; the sidecar destroys
+  // the previous source itself while replacing it.
+  if (sourceFailure) {
+    return {
+      status: 'failed',
+      message: sourceFailure,
+      metadata_ready: false,
+      file_count: 0,
+      port: httpPort,
+    };
+  }
   return {
     status: currentTorrent ? (currentTorrentMetadataReady ? 'active' : 'waiting_for_metadata') : 'idle',
     metadata_ready: !!currentTorrentMetadataReady,
@@ -1342,13 +1628,19 @@ process.stdin.on('data', async (data) => {
         case 'start': {
           try {
             await ensureClientReady();
-            startTorrent(msg.magnet, {
+            const starting = startTorrent(msg.magnet, {
               persistentCacheEnabled: msg.persistentCacheEnabled,
               persistentCacheRoot: msg.persistentCacheRoot,
               persistentCacheLimitBytes: msg.persistentCacheLimitBytes,
               expectedSize: msg.expectedSize,
-            }).catch((err) => {
-              sendMessage({ type: 'error', message: err.message || String(err) });
+            });
+            // startTorrent advances the generation synchronously.
+            const startGeneration = torrentSessionGeneration;
+            starting.catch((err) => {
+              const message = err?.message || String(err);
+              // Health reports the failure so startup stops waiting for metadata.
+              if (startGeneration === torrentSessionGeneration) sourceFailure = message;
+              sendMessage({ type: 'error', message });
             });
             reply({ type: 'started', status: 'starting', metadata_ready: false, file_count: 0 });
           } catch (err) {
