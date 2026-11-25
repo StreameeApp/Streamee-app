@@ -205,6 +205,10 @@ local allow_fast_seek = true
 local fast_preview = false
 local helper_decoder_resize
 local decoder_resize_disabled = false
+-- Set while a copy-back helper is retrying a failed CUVID resize helper. A
+-- cache-only miss also exits non-zero, so CUVID is only blamed once the
+-- copy-back retry actually renders a frame.
+local decoder_resize_suspect = false
 local request_timer
 local start_request_timer
 local request_seek
@@ -768,17 +772,30 @@ local function spawn(time)
             end
             if not success or not result or (result.status ~= 0 and result.status ~= -2) then
                 local retry_without_resize = helper_decoder_resize ~= nil and retry_time ~= nil
-                thumbfast_log("error", string.format(
+                -- A positive exit code is the helper's own: the process was
+                -- created, so this is a decode or cache-only miss (mpv exits
+                -- with 2 when the local proxy answers 425), never a setup error.
+                local helper_ran = result ~= nil and type(result.status) == "number" and result.status > 0
+                if helper_ran then spawn_working = true end
+                thumbfast_log(helper_ran and "warn" or "error", string.format(
                     "helper failed: generation=%d status=failed result_status=%s",
                     generation,
                     tostring(result and result.status)
                 ))
                 if retry_without_resize then
                     decoder_resize_disabled = true
+                    decoder_resize_suspect = true
                     helper_decoder_resize = nil
-                    thumbfast_log("warn", "CUVID thumbnail resize unavailable; retrying with copy-back scaling")
+                    thumbfast_log("warn", "CUVID thumbnail resize failed; retrying with copy-back scaling")
                     retry_request(retry_time)
                     return
+                end
+                if decoder_resize_suspect then
+                    -- Copy-back failed too, so CUVID was not the cause (usually
+                    -- the hovered range is not cached yet). Keep the fast path.
+                    decoder_resize_suspect = false
+                    decoder_resize_disabled = false
+                    thumbfast_log("info", "copy-back retry also failed; keeping CUVID thumbnail resize enabled")
                 end
                 -- A missing cached range or decoder error does not change
                 -- the source's color space. Keep HDR conversion enabled.
@@ -786,7 +803,15 @@ local function spawn(time)
                     retry_request(queued)
                     return
                 end
-                mp.msg.error("mpv thumbnail subprocess failed")
+                if helper_ran then
+                    thumbfast_log("info", string.format(
+                        "preview unavailable: request_time=%s result_status=%d status=helper_exit",
+                        pending_time and string.format("%.3f", pending_time) or "none",
+                        result.status
+                    ))
+                else
+                    mp.msg.error("mpv thumbnail subprocess failed")
+                end
                 if result then
                     if result.stderr and result.stderr ~= "" then
                         mp.msg.error("thumbfast helper stderr: " .. string.gsub(result.stderr, "[\r\n]+$", ""))
@@ -1083,6 +1108,8 @@ check_new_thumb = function()
 
     spawn_waiting = false
     spawn_working = true
+    -- Copy-back rendered where CUVID resize failed: the decoder was the cause.
+    decoder_resize_suspect = false
     move_file(tmp, options.thumbnail..".bgra")
 
     failed_time = nil
@@ -1338,6 +1365,7 @@ end
 local function file_load()
     shutting_down = false
     decoder_resize_disabled = false
+    decoder_resize_suspect = false
     helper_decoder_resize = nil
     terminate_helper()
     clear()

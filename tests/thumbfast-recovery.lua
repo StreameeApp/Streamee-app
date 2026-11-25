@@ -4,7 +4,7 @@ local native_utils = require "mp.utils"
 local script = assert(os.getenv("STREAMEE_THUMBFAST_TEST_SCRIPT"))
 
 local function session(hdr, color)
-    local messages, events, observers, timers, helpers, logs, seeks = {}, {}, {}, {}, {}, {}, {}
+    local messages, events, observers, timers, helpers, logs, seeks, osd = {}, {}, {}, {}, {}, {}, {}, {}
     local clock = 0
     local properties = {platform="windows", vid=1, path="http://127.0.0.1:1234/addon/local",
         ["demuxer-via-network"]=true, ["current-vo"]="gpu-next",
@@ -43,7 +43,9 @@ local function session(hdr, color)
         get_property_number=function(name, default) return properties[name] or default end,
         command_native=function(command)
             if command[1]=="expand-path" then return command[2] end
-        end, commandv=function() end,
+        end, commandv=function(name, text)
+            if name=="show-text" then osd[#osd+1]=text end
+        end,
         command_native_async=function(command, callback)
             helpers[#helpers+1]={args=command.args, callback=callback}
             return #helpers
@@ -89,7 +91,7 @@ local function session(hdr, color)
             if t.period==1/60 and t.enabled then t.callback() end
         end
     end
-    return {hover=hover, render=render, write_frame=write_frame, helpers=helpers, logs=logs, seeks=seeks,
+    return {hover=hover, render=render, write_frame=write_frame, helpers=helpers, logs=logs, seeks=seeks, osd=osd,
         advance=function() clock=clock+2 end,
         cleanup=function()
             events.shutdown()
@@ -154,6 +156,33 @@ local function tests()
         if arg:sub(1,5)=="--vf=" then filter=arg end
     end
     assert(filter and filter:find("eq=gamma=", 1, true), "transient failure must preserve HDR conversion")
+    s.cleanup()
+
+    -- A cache-only miss (local proxy 425) makes the helper exit with 2 for
+    -- every decoder. It must not disable CUVID resize or show a setup error.
+    s=session()
+    s.hover(10)
+    assert(has_arg(s.helpers[1], "--vd=hevc_cuvid"), "4K HEVC must start with CUVID resize")
+    s.helpers[1].callback(true, {status=2})
+    assert(#s.helpers==2 and has_arg(s.helpers[2], "--hwdec=auto-copy"), "first failure retries copy-back")
+    s.helpers[2].callback(true, {status=2})
+    s.advance(); s.hover(10)
+    assert(#s.helpers==3 and has_arg(s.helpers[3], "--vd=hevc_cuvid"),
+        "a cache miss on both decoders must keep CUVID resize enabled")
+    assert(#s.osd==0, "a helper that ran must never show a setup error: "..tostring(s.osd[1]))
+    for _, message in ipairs(s.logs) do
+        assert(not message:find("subprocess failed", 1, true), "cache miss must not be logged as a spawn failure")
+    end
+    s.cleanup()
+
+    -- Copy-back rendering after a CUVID failure confirms the decoder fault.
+    s=session()
+    s.hover(10)
+    s.helpers[1].callback(true, {status=2})
+    s.render()
+    s.helpers[2].callback(true, {status=0})
+    s.advance(); s.hover(40)
+    assert(not has_arg(s.helpers[#s.helpers], "--vd=hevc_cuvid"), "confirmed CUVID failure stays on copy-back")
     s.cleanup()
 
     s=session()
