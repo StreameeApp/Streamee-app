@@ -151,6 +151,13 @@ pub(crate) fn configure(
         while !loop_shutdown.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // Windows hands accepted sockets the listener's
+                    // non-blocking mode, so reads would fail with WouldBlock
+                    // before the request arrives.
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        warn!("Remote control could not configure connection: {error}");
+                        continue;
+                    }
                     let request_app = app.clone();
                     std::thread::spawn(move || {
                         if let Err(error) = handle_connection(stream, request_app) {

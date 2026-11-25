@@ -18,6 +18,7 @@ import {
   removeWatchlistBatch,
   getTraktRateLimitRetryAt,
   getTraktErrorDiagnostics,
+  getTraktSyncNotFound,
   isTraktRateLimitError,
   TraktHistorySyncPayload,
   TraktWatchlistSyncPayload,
@@ -1185,7 +1186,11 @@ async function verifyTraktPushState(): Promise<boolean> {
       .filter((metaId): metaId is string => !!metaId)
   );
 
+  const notFoundOnTrakt = getTraktSyncNotFound();
   const missingWatched = store.watched.filter((item) => {
+    if (notFoundOnTrakt.has(item.id)) {
+      return false;
+    }
     if (item.type === 'movie') {
       return !remoteMovieIds.has(item.id);
     }
@@ -1196,7 +1201,7 @@ async function verifyTraktPushState(): Promise<boolean> {
   const missingEpisodes = Object.keys(store.watchedEpisodes)
     .filter((episodeKey) => !remoteEpisodeKeys.has(episodeKey));
   const missingWatchlist = store.watchlist
-    .filter((item) => !remoteWatchlistIds.has(item.id));
+    .filter((item) => !remoteWatchlistIds.has(item.id) && !notFoundOnTrakt.has(item.id));
   const pendingActions =
     store.pendingTraktHistory.length +
     store.pendingTraktWatchlist.length;
@@ -1208,7 +1213,12 @@ async function verifyTraktPushState(): Promise<boolean> {
 
   if (!verified) {
     console.warn(
-      `[Sync] Push verification failed: watched=${missingWatched.length}, episodes=${missingEpisodes.length}, watchlist=${missingWatchlist.length}, pending=${pendingActions}`
+      `[Sync] Push verification failed: watched=${missingWatched.length}, episodes=${missingEpisodes.length}, watchlist=${missingWatchlist.length}, pending=${pendingActions}`,
+      {
+        watched: missingWatched.slice(0, 10).map((item) => item.id),
+        episodes: missingEpisodes.slice(0, 10),
+        watchlist: missingWatchlist.slice(0, 10).map((item) => item.id),
+      }
     );
   }
   return verified;

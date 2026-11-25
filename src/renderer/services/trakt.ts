@@ -956,6 +956,38 @@ export interface TraktWatchlistSyncPayload {
   shows?: Array<{ ids: { tmdb: number } }>;
 }
 
+// Items Trakt could not match during this app session ("movie:<tmdb>" or
+// "tv:<tmdb>"). Pushing them again can never succeed, so sync verification
+// skips them instead of failing on every start.
+const traktSyncNotFound = new Set<string>();
+
+export function getTraktSyncNotFound(): ReadonlySet<string> {
+  return traktSyncNotFound;
+}
+
+function recordTraktSyncNotFound(path: string, data: unknown): void {
+  const notFound = (data as { not_found?: Record<string, unknown> } | null)?.not_found;
+  if (!notFound || typeof notFound !== 'object') return;
+  const ids: string[] = [];
+  let otherCount = 0;
+  for (const [kind, items] of Object.entries(notFound)) {
+    if (!Array.isArray(items)) continue;
+    for (const item of items) {
+      const tmdbId = (item as { ids?: { tmdb?: unknown } })?.ids?.tmdb;
+      if (typeof tmdbId === 'number' && (kind === 'movies' || kind === 'shows')) {
+        const id = `${kind === 'movies' ? 'movie' : 'tv'}:${tmdbId}`;
+        traktSyncNotFound.add(id);
+        ids.push(id);
+      } else {
+        otherCount += 1;
+      }
+    }
+  }
+  if (ids.length > 0 || otherCount > 0) {
+    console.warn(`[Trakt] ${path} items not found on Trakt:`, { ids, otherCount });
+  }
+}
+
 async function postTraktSyncBatch(path: string, payload: object): Promise<boolean> {
   const accessToken = await ensureValidToken();
   if (!accessToken) return false;
@@ -963,6 +995,7 @@ async function postTraktSyncBatch(path: string, payload: object): Promise<boolea
   try {
     const client = await createApiClient(accessToken);
     const response = await client.post(path, payload);
+    recordTraktSyncNotFound(path, response.data);
     return response.status >= 200 && response.status < 300;
   } catch (error) {
     rethrowTraktRateLimit(error);

@@ -3934,9 +3934,25 @@ fn probe_addon_stream_size(source_url: &str) -> Result<u64, String> {
     ))
 }
 
+/// Largest probe result treated as a provider placeholder clip rather than the
+/// requested file. Observed placeholders are 0.1-7 MB; real episodes, even
+/// single files from a season pack, are far larger.
+const ADDON_PLACEHOLDER_PROBE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Some sources answer with a short "file is being prepared" clip until the
+/// real file is ready. Trusting that size breaks later range reads once the
+/// real file is served, so a tiny probe against a much larger supplied size
+/// is ignored.
+fn addon_probe_looks_like_placeholder(provided_size: u64, probed_size: u64) -> bool {
+    probed_size > 0
+        && probed_size <= ADDON_PLACEHOLDER_PROBE_MAX_BYTES
+        && provided_size / 4 > probed_size
+}
+
 fn choose_addon_total_size(provided_size: u64, probed_size: Option<u64>) -> u64 {
     probed_size
         .filter(|size| *size > 0)
+        .filter(|size| !addon_probe_looks_like_placeholder(provided_size, *size))
         .or((provided_size > 0).then_some(provided_size))
         .unwrap_or(0)
 }
@@ -5083,7 +5099,12 @@ async fn prepare_addon_stream_url(
     .await
     {
         Ok(Ok(resolved_size)) => {
-            if provided_total_size > 0 && provided_total_size != resolved_size {
+            if addon_probe_looks_like_placeholder(provided_total_size, resolved_size) {
+                warn!(
+                    "Addon size probe returned a placeholder-sized response: supplied_size={} upstream_size={}; using supplied size",
+                    provided_total_size, resolved_size
+                );
+            } else if provided_total_size > 0 && provided_total_size != resolved_size {
                 warn!(
                     "Addon supplied size differs from upstream Content-Range: supplied_size={} upstream_size={}; using upstream size",
                     provided_total_size, resolved_size
@@ -8130,12 +8151,62 @@ fn restore_smart_next_window_state_blocking(
                 warn!("Could not bring the Smart Next MPV window to the top: {error}");
             }
             if !SetForegroundWindow(hwnd).as_bool() {
-                warn!("Windows declined to foreground the Smart Next MPV window");
+                if force_foreground_window(hwnd) {
+                    info!("Foregrounded the Smart Next MPV window through attached input");
+                } else {
+                    warn!("Windows declined to foreground the Smart Next MPV window");
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Windows only lets the foreground process hand the foreground to another
+/// window. During Smart Next the previous MPV owned the foreground and has
+/// exited, so Streamee is refused. Sharing input state with the current
+/// foreground thread (and the MPV thread) for the duration of the call lifts
+/// that lock.
+#[cfg(target_os = "windows")]
+fn force_foreground_window(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+
+    unsafe {
+        let current_tid = GetCurrentThreadId();
+        let target_tid = GetWindowThreadProcessId(hwnd, None);
+        let foreground = GetForegroundWindow();
+        let foreground_tid = if foreground.is_invalid() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, None)
+        };
+
+        let mut attached = Vec::with_capacity(2);
+        for tid in [foreground_tid, target_tid] {
+            if tid != 0
+                && tid != current_tid
+                && !attached.contains(&tid)
+                && AttachThreadInput(current_tid, tid, true).as_bool()
+            {
+                attached.push(tid);
+            }
+        }
+
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+
+        for tid in attached {
+            let _ = AttachThreadInput(current_tid, tid, false);
+        }
+
+        GetForegroundWindow() == hwnd
+    }
 }
 
 #[tauri::command]
@@ -10052,6 +10123,27 @@ mod stream_cache_tests {
             redact_sensitive_url("https://api.example.test/search?apikey=secret&query=test"),
             "https://api.example.test/search?apikey=<redacted>&query=test"
         );
+    }
+
+    #[test]
+    fn addon_total_size_ignores_placeholder_probe() {
+        // Placeholder clip while the provider prepares the real file.
+        assert_eq!(
+            choose_addon_total_size(6_039_382_975, Some(6_592_098)),
+            6_039_382_975
+        );
+        // Small upstream corrections are trusted.
+        assert_eq!(
+            choose_addon_total_size(5_583_457_485, Some(5_633_868_796)),
+            5_633_868_796
+        );
+        // A single episode from a season-pack size is trusted.
+        assert_eq!(
+            choose_addon_total_size(10_899_284_632, Some(935_019_143)),
+            935_019_143
+        );
+        // A small file with no supplied size is trusted.
+        assert_eq!(choose_addon_total_size(0, Some(6_592_098)), 6_592_098);
     }
 
     #[test]

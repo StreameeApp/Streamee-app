@@ -61,7 +61,9 @@ struct IntroDbApiResponse {
 
 #[derive(Clone, Debug, Deserialize)]
 struct TheIntroDbApiSegment {
-    start_ms: u64,
+    /// `null` marks a segment that begins at the start of the episode.
+    #[serde(default)]
+    start_ms: Option<u64>,
     end_ms: Option<u64>,
 }
 
@@ -294,10 +296,11 @@ fn from_theintrodb_segment(
     let end_ms = segment
         .end_ms
         .or((duration_ms > 0).then_some(duration_ms))?;
+    let start_ms = segment.start_ms.unwrap_or(0);
     let converted = IntroDbSegment {
-        start_ms: segment.start_ms,
+        start_ms,
         end_ms,
-        start_sec: segment.start_ms as f64 / 1_000.0,
+        start_sec: start_ms as f64 / 1_000.0,
         end_sec: end_ms as f64 / 1_000.0,
         confidence: None,
         submission_count: None,
@@ -613,6 +616,18 @@ mod tests {
             .expect("duration should close an open-ended credits segment");
         assert_eq!(credits.start_ms, 3_632_730);
         assert_eq!(credits.end_ms, 3_720_000);
+    }
+
+    #[test]
+    fn parses_theintrodb_intro_with_open_start() {
+        let response = serde_json::from_str::<TheIntroDbApiResponse>(
+            r#"{"tmdb_id":113962,"season":3,"episode":3,"intro":[{"start_ms":null,"end_ms":30000}]}"#,
+        )
+        .expect("a null segment start should parse");
+        let intro = from_theintrodb_segment(response.intro[0].clone(), 3_000_000)
+            .expect("an open-start intro should convert");
+        assert_eq!(intro.start_ms, 0);
+        assert_eq!(intro.end_ms, 30_000);
     }
 
     #[test]
